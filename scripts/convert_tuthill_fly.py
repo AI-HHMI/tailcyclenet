@@ -292,10 +292,7 @@ def make_multiview(src: Path, out: Path, prefix: str, folders: list[Path], rejec
 
 def nominal_rig(size: tuple[int, int]) -> fmt.Rig:
     """Build the required one-camera nominal calibration for an uncalibrated 2D folder."""
-    from aniposelib.cameras import CameraGroup
-    cam = fmt.nominal_camera('A', size, None)
-    return fmt.Rig(CameraGroup([cam]), offset={'A': (0.0, 0.0)},
-                   moving={'A': False}, calibrated={'A': False})
+    return fmt.nominal_rig('A', size)
 
 
 def make_single(src: Path, out: Path, folder: Path, clean: bool) -> dict:

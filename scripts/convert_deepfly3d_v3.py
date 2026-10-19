@@ -42,10 +42,10 @@ import pyarrow.parquet as pq
 
 from tailcyclenet import format as fmt
 
-# Import the family convention from v1.  The v1 module is deliberately used only for the
-# condition names and split rule; v3 has its own HDF5 and pixel path handling.
+# The condition names and family split rule are shared conventions; v3 has its own HDF5 and
+# pixel path handling.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from convert_deepfly3d_v1 import SOURCE_CONDITIONS, family_id, split_map  # noqa: E402
+from deepfly3d_common import SOURCE_CONDITIONS, family_id, split_map  # noqa: E402
 
 N_CAMERAS = 7
 N_KEYPOINTS = 38
@@ -968,7 +968,7 @@ def convert_command(args) -> int:
         _atomic_json(root / 'split_manifest.json', {
             'dataset': 'deepfly3d-v3',
             'policy': 'family grouped; condition + acquisition date + FlyN stays in one split',
-            'source_family_split': 'convert_deepfly3d_v1.split_map (v2 family policy)',
+            'source_family_split': 'deepfly3d_common.split_map (v2 family policy)',
             'assignment': splits,
         })
         inventory = []

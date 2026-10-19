@@ -3,8 +3,8 @@
 
     pixi run python scripts/infer.py ...
 
-The program itself is `tailcyclenet.infer` (cli/driver/window); this file is the documented
-invocation, so the half of the program that used to live here can be imported and tested.
+The program itself is `tailcyclenet.infer` (cli/driver/window); this file is the
+documented invocation.
 """
 import sys
 from pathlib import Path

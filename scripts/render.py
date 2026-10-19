@@ -3,9 +3,8 @@
 
     pixi run python scripts/render.py --pred pred/ --out clips/
 
-The program itself is `tailcyclenet.render`; this file is the documented invocation, so the half
-of the program that used to live here can be imported and tested. `tailcyclenet render` runs the
-same `main()`.
+The program itself is `tailcyclenet.render`; this file is the documented invocation.
+`tailcyclenet render` runs the same `main()`.
 """
 import sys
 from pathlib import Path

@@ -16,7 +16,7 @@ FULL, UN-AUGMENTED frames and owns the whole geometry chain itself, whereas this
 `PoseDataset` returns already-cropped, already-resized, already-augmented uint8 with the rotation
 baked into the decode. Nothing about that ordering is recoverable by an adapter shim.
 
-The seam (`PoseDataset._select` / `_realise`) is what makes the rewrite possible: ONE selection,
+The seam (`PoseDataset.select` / `realise`) is what makes the rewrite possible: ONE selection,
 TWO independent realisations. Calling `__getitem__` twice would select a DIFFERENT sample -- `_pick`
 re-draws the pool entry and `_frames` re-draws the anchor and stride.
 """
@@ -433,23 +433,10 @@ def _visible_points_mask(coords, cgroup, mode, cam_thresh):
 
     Inputs: coords -- [t,k,R] for ONE member; cgroup -- its cameras; mode -- '2d' or '3d';
             cam_thresh -- how many cameras must see it.
-    Outputs: [k] bool.
+    Outputs: [k] bool, the any-frame reduction of `_frame_visibility`.
     Side effects: none.
     """
-    t, k, _ = coords.shape
-    if mode == '3d':
-        flat = rearrange(coords, 't k r -> (t k) r')
-        vis = torch.stack([is_point_visible(cam, flat) for cam in cgroup])
-        vis = rearrange(vis, 'cams (t k) -> t k cams', t=t, k=k)
-        n_cams_vis = vis.sum(dim=-1)
-    else:
-        size = cgroup[0]['size']
-        c = torch.nan_to_num(coords, nan=-1e9)
-        w, h = float(size[0]), float(size[1])
-        inside = ((c[..., 0] >= 0) & (c[..., 0] < w) & (c[..., 1] >= 0) & (c[..., 1] < h))
-        n_cams_vis = inside.to(torch.int64)
-    return (n_cams_vis >= cam_thresh).any(dim=0)
-
+    return _frame_visibility(coords[None], cgroup, mode, cam_thresh)[0][0].any(dim=0)
 
 
 def _frame_visibility(coords, camera_group, mode, cam_thresh=1):
@@ -759,10 +746,10 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
     (which would discard most mocap windows with marker dropouts); legacy sequence mode raises.
     """
     dense_3d, dense_2d, sparse_3d, sparse_2d = corruptors
-    view_a = dataset._realise(sel, rng, world_gauge=False)
+    view_a = dataset.realise(sel, rng, world_gauge=False)
     if view_a is None:
         return None
-    view_b = dataset._realise(sel, rng, world_gauge=False)
+    view_b = dataset.realise(sel, rng, world_gauge=False)
     if view_b is None:
         return None
 

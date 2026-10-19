@@ -1,25 +1,11 @@
-"""Gate A.1: the `_select`/`_realise`/`_targets` split is BYTE-IDENTICAL to the old `_item`.
+"""The `select`/`realise`/`targets` seam of `PoseDataset`, the one the scorer builds on.
 
 The split exists so a track-quality triplet can realise ONE selection into two independent views
-(`tailcyclenet/scorer/`). It is approved only on the condition that the pose loader does not move,
-and that condition is not self-evident: the three parts share one RNG stream, so a draw that
-changed order -- or a helper that started consuming entropy it did not before -- would silently
-reshape the training distribution while every shape stayed correct.
-
-The comparison is against the REAL pre-refactor function, frozen in `tests/legacy_item.py`.
-Asserting that `_item` agrees with `_select`+`_realise`+`_targets` would prove nothing: `_item` only
-delegates to them.
-
-Three things this file is deliberate about, each learned from an earlier version of it failing:
-
-  * **Every RNG that the loader touches is seeded and its POST-CALL STATE compared**, not just the
-    output. Matching outputs alone cannot establish that the draw CONSUMPTION is unchanged -- a
-    reordering that happens to commute would pass.
-  * **Old-vs-old reproducibility is established first.** If the oracle cannot reproduce itself,
-    every old-vs-new comparison below it is meaningless.
-  * **The oracle's imports are repaired, not its algorithm.** The frozen copy still needs
-    `get_camera_scale` and the real `box_prompt` module to RUN; a `NameError` there would show up
-    as a passing test if the config never reached that branch.
+(`tailcyclenet/scorer/`). The three parts share one RNG stream, so a draw that changed order would
+silently reshape the training distribution while every shape stayed correct; byte-identity of the
+loader's output is guarded by the golden-output harness, and this file checks the seam's
+structural properties: each case reaches its branch, selections are deterministic, the stored
+labels are not written through, and two realisations of one selection are independent.
 """
 import random
 from pathlib import Path
@@ -29,16 +15,6 @@ import pytest
 import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
-
-from .legacy_item import LegacyItemMixin
-
-
-class _Legacy(LegacyItemMixin, PoseDataset):
-    """`PoseDataset` whose `_item` is the pre-refactor implementation (the mixin wins the MRO).
-
-    `PoseDataset.__getitem__`'s retry loop calls `self._item`, so this drives the OLD code through
-    the SAME entry point the new one uses.
-    """
 
 
 def _same(a, b, path='item'):
@@ -118,35 +94,10 @@ def _states(rng):
     }
 
 
-def _same_state(a, b, path):
-    """Recursive equality over whatever a RNG state snapshot happens to contain.
-
-    The containers are not uniform -- `np.random.get_state()` is a tuple holding an ndarray, the
-    item generator's state is a nested dict, imgaug's is a bare ndarray -- so a hand-written
-    two-level comparison gets it wrong. Written recursively so a new snapshot key cannot silently
-    be skipped.
-    """
-    if isinstance(a, dict):
-        assert isinstance(b, dict) and set(a) == set(b), f'{path}: state keys differ'
-        for k in a:
-            _same_state(a[k], b[k], f'{path}.{k}')
-    elif isinstance(a, (tuple, list)):
-        assert type(a) is type(b) and len(a) == len(b), f'{path}: state arity differs'
-        for i, (x, y) in enumerate(zip(a, b)):
-            _same_state(x, y, f'{path}[{i}]')
-    elif isinstance(a, np.ndarray):
-        assert isinstance(b, np.ndarray), f'{path}: ndarray vs {type(b)}'
-        assert np.array_equal(a, b), f'{path}: RNG state array differs'
-    elif isinstance(a, torch.Tensor):
-        assert torch.equal(a, b), f'{path}: RNG state tensor differs'
-    else:
-        assert a == b, f'{path}: RNG state differs ({a!r} vs {b!r})'
-
-
 def _run(ds, idx, seed=0, shape_seed=0x5AFE, aug_seed=0xA06, rot_seed=0xB07):
     """One `_item` plus the RNG state it left behind."""
     rng, shape_rng = _seed_all(seed, shape_seed, aug_seed, rot_seed)
-    shape = ds._shape(shape_rng)
+    shape = ds.shape(shape_rng)
     out = ds._item(idx, rng, shape)
     return out, _states(rng)
 
@@ -233,113 +184,6 @@ def test_prob_2d_only_projects_a_3d_session(seam_root):
     assert item[8] is not None
 
 
-@pytest.mark.parametrize('case', sorted(_CASES))
-def test_split_is_byte_identical_to_the_old_item(seam_root, case):
-    """Same seeds, same index, same shape -> identical item AND identical RNG consumption."""
-    cfg = _CASES[case]
-    for root_name, split, train in _cases_for(case):
-        root = seam_root / root_name
-        new = PoseDataset(root, split, cfg, train=train)
-        old = _Legacy(root, split, cfg, train=train)
-        assert len(new) == len(old) > 0, f'{case}/{root_name}/{split}: fixture holds no windows'
-
-        compared = 0
-        for idx in range(min(len(new), 4)):
-            for seed in (0, 1, 12345):
-                a, sa = _run(old, idx, seed)
-                b, sb = _run(new, idx, seed)
-                assert (a is None) == (b is None), \
-                    f'{case}/{root_name}/{split} idx={idx} seed={seed}: None mismatch'
-                if a is None:
-                    continue
-                assert len(a) == len(b), 'tuple arity changed'
-                _same(a, b, f'[{case} {root_name}/{split} idx={idx} seed={seed}]')
-                # Outputs matching is NOT sufficient: a reordering that commutes would pass.
-                _same_state(sa, sb, f'[{case} {root_name}/{split} idx={idx} seed={seed}]')
-                compared += 1
-        assert compared > 0, f'{case}/{root_name}/{split}: nothing built -- vacuous'
-
-
-def test_the_oracle_reproduces_itself(seam_root):
-    """Old-vs-old must match before any old-vs-new comparison means anything.
-
-    If the frozen oracle could not reproduce its own output, every byte-identity assertion above
-    would be measuring the harness's RNG control rather than the refactor.
-    """
-    cfg = _CASES['prompt-swaps']
-    old = _Legacy(seam_root / 'mouselike', 'train', cfg, train=True)
-    a, sa = _run(old, 0, 7)
-    b, sb = _run(old, 0, 7)
-    assert a is not None and b is not None
-    _same(a, b, '[oracle self-check]')
-    _same_state(sa, sb, '[oracle self-check]')
-
-
-def test_the_unseeded_globals_are_the_reason_a_naive_version_fails(seam_root):
-    """A NEGATIVE control for the seeding: without controlling `np.random`/imgaug the oracle does
-    NOT reproduce itself.
-
-    This is what makes `_seed_all` load-bearing rather than cargo-culted -- and it is the exact
-    trap an earlier version of this file fell into, reporting a refactor failure that was its own.
-    """
-    import imgaug.random
-
-    cfg = _CASES['augmented']
-    old = _Legacy(seam_root / 'ratlike', 'train', cfg, train=True)
-
-    # Deliberately NOT seeded: two runs in a row.
-    a = old._item(0, np.random.default_rng(0), old._shape(np.random.default_rng(1)))
-    imgaug.random.seed(999)          # perturb imgaug between the two
-    b = old._item(0, np.random.default_rng(0), old._shape(np.random.default_rng(1)))
-    assert a is not None and b is not None
-    try:
-        _same(a, b, '[unseeded control]')
-        differs = False
-    except AssertionError:
-        differs = True
-    assert differs, ('the unseeded control did NOT differ -- the appearance/rotation draws are '
-                     'apparently deterministic here, so this test cannot demonstrate anything and '
-                     'the seeding in _seed_all is not justified by it')
-
-
-def test_rejection_paths_agree(tmp_path):
-    """Windows that FAIL to build must fail identically, and consume the same RNG doing it.
-
-    A rejection is a draw too: `__getitem__` retries with `idx = int(rng.integers(len(index)))`, so
-    a rejection that moved changes which sample the NEXT attempt sees. The rejection is produced
-    deterministically by DELETING one frame file -- `read_frames` returns None and `_realise` bails
-    -- which is the `_realise`-level failure the seam introduces.
-
-    (A too-long `n_frames` does NOT reject: `_frames` clamp-pads, so a 4-frame group asked for 8
-    frames repeats frames instead of failing. An earlier version of this test asserted otherwise.)
-    """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as C
-
-    root = tmp_path / 'ds'
-    C._session_2d(root / 'ratlike' / 'train' / 'sess_a')
-    (root / 'ratlike' / 'train' / 'sess_a' / 'groups' / 'g000' / 'cam0' / '000001.png').unlink()
-
-    cfg = _L(prob_2d_only=0.0, aug_prob=0.5, crop_jitter=0.0)
-    new = PoseDataset(root / 'ratlike', 'train', cfg, train=True)
-    old = _Legacy(root / 'ratlike', 'train', cfg, train=True)
-
-    rejected = built = 0
-    for idx in range(len(new)):
-        for seed in (0, 3):
-            a, sa = _run(old, idx, seed)
-            b, sb = _run(new, idx, seed)
-            assert (a is None) == (b is None), f'idx={idx} seed={seed}: rejection mismatch'
-            if a is None:
-                rejected += 1
-            else:
-                built += 1
-                _same(a, b, f'[reject-case idx={idx} seed={seed}]')
-            _same_state(sa, sb, f'[reject-case idx={idx} seed={seed}]')
-    assert rejected > 0, 'nothing was rejected -- this case does not exercise the path'
-
-
 def test_the_covered_cases_actually_reach_their_branches(seam_root):
     """Each case must OBSERVABLY reach the branch it exists to cover.
 
@@ -370,14 +214,14 @@ def test_the_covered_cases_actually_reach_their_branches(seam_root):
     tr = PoseDataset(seam_root / 'mouselike', 'train', _CASES['ranged-inflate'], train=True)
     seen = set()
     for seed in (0, 1, 2, 3, 4, 5):
-        sel = tr._select(0, np.random.default_rng(seed), tr._shape(np.random.default_rng(1)))
+        sel = tr.select(0, np.random.default_rng(seed), tr.shape(np.random.default_rng(1)))
         assert sel is not None
         assert 0.9 <= sel.inflate <= 1.5, f'inflate {sel.inflate} outside the configured range'
         seen.add(round(sel.inflate, 6))
     assert len(seen) > 1, 'train crop-inflate did not vary -- the ranged draw is not running'
 
     va = PoseDataset(seam_root / 'mouselike', 'val', _CASES['val-geometry'], train=False)
-    vsel = va._select(0, np.random.default_rng(0), va._shape(np.random.default_rng(1)))
+    vsel = va.select(0, np.random.default_rng(0), va.shape(np.random.default_rng(1)))
     assert vsel is not None
     assert vsel.inflate == pytest.approx(1.2), \
         f'val crop-inflate must be the range MIDPOINT (1.2), got {vsel.inflate}'
@@ -395,21 +239,21 @@ def _same_or_false(a, b):
 
 
 def test_the_ground_truth_arrays_are_not_written_through(seam_root):
-    """`_select` hands out the stored coordinates; nothing may write through them.
+    """`select` hands out the stored coordinates; nothing may write through them.
 
-    `torch.as_tensor` on the label array SHARES storage, so an in-place op after `_select` would
+    `torch.as_tensor` on the label array SHARES storage, so an in-place op after `select` would
     corrupt the session for every later item. The old fused `_item` had the same exposure but
     could not be asked this question; the split makes it load-bearing, because the scorer realises
     one selection TWICE.
     """
     cfg = _CASES['augmented']
     ds = PoseDataset(seam_root / 'mouselike', 'train', cfg, train=True)
-    sel = ds._select(0, np.random.default_rng(7), ds._shape(np.random.default_rng(1)))
+    sel = ds.select(0, np.random.default_rng(7), ds.shape(np.random.default_rng(1)))
     assert sel is not None
     before3d = sel.lab.points3d.copy()
     before2d = None if sel.lab.points2d is None else sel.lab.points2d.copy()
 
-    ds._realise(sel, np.random.default_rng(11))
+    ds.realise(sel, np.random.default_rng(11))
     np.testing.assert_array_equal(sel.lab.points3d, before3d)
     if before2d is not None:
         np.testing.assert_array_equal(sel.lab.points2d, before2d)
@@ -425,16 +269,16 @@ def test_two_realisations_of_one_selection_are_independent(seam_root, case):
     cfg = _CASES[case]
     for root_name in (('ratlike', 'mouselike') if case == 'box-prompt' else ('mouselike',)):
         ds = PoseDataset(seam_root / root_name, 'train', cfg, train=True)
-        sel_a = ds._select(0, np.random.default_rng(3), ds._shape(np.random.default_rng(1)))
+        sel_a = ds.select(0, np.random.default_rng(3), ds.shape(np.random.default_rng(1)))
         assert sel_a is not None
 
         _, first = _seed_all(100, 1, 0xA06, 0xB07), None
         rng, _ = _seed_all(100, 1, 0xA06, 0xB07)
-        first = ds._realise(sel_a, rng)
+        first = ds.realise(sel_a, rng)
         rng, _ = _seed_all(200, 1, 0xA06, 0xB07)          # a DIFFERENT view of the same selection
-        ds._realise(sel_a, rng)
+        ds.realise(sel_a, rng)
         rng, _ = _seed_all(100, 1, 0xA06, 0xB07)
-        replay = ds._realise(sel_a, rng)                   # the same view again
+        replay = ds.realise(sel_a, rng)                   # the same view again
 
         assert first is not None and replay is not None, f'{case}/{root_name}: realise returned None'
         _same(first.coords, replay.coords, 'coords')
@@ -450,9 +294,9 @@ def test_select_is_deterministic_given_idx_rng_and_shape(seam_root):
     """One selection per `(idx, rng, shape)` -- the scorer realises one, so it cannot re-draw."""
     cfg = _CASES['prompt-swaps']
     ds = PoseDataset(seam_root / 'mouselike', 'train', cfg, train=True)
-    shape = ds._shape(np.random.default_rng(5))
-    a = ds._select(0, np.random.default_rng(9), shape)
-    b = ds._select(0, np.random.default_rng(9), shape)
+    shape = ds.shape(np.random.default_rng(5))
+    a = ds.select(0, np.random.default_rng(9), shape)
+    b = ds.select(0, np.random.default_rng(9), shape)
     assert a is not None and b is not None
     _same(a.frames, b.frames, 'frames')
     _same(a.coords, b.coords, 'coords')

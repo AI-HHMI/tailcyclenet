@@ -119,7 +119,7 @@ def test_get_once_does_not_retry_a_failed_index():
     ds.train = False
     ds.seed = 23
     calls = []
-    ds._shape = lambda rng: {'n_cams': 1, 'single_view_draw': 0.0}
+    ds.shape = lambda rng: {'n_cams': 1, 'single_view_draw': 0.0}
     ds._item = lambda idx, rng, shape: calls.append(idx) or None
 
     assert ds.get_once(7) is None

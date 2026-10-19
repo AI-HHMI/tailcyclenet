@@ -21,7 +21,7 @@ from tracktail.model.cube import project_points_torch
 
 from .. import crop as cropmod
 from .. import memory
-from ..dataset import _crop_affine, _resize_camera, prior_out_of_bounds
+from ..dataset import crop_affine, resize_camera, prior_out_of_bounds
 from ..format import Labels, Session
 from ..model import share_scene
 from .store import FrameStore
@@ -235,13 +235,13 @@ def _crop_views(imgs, box, target_size):
     b = np.asarray(box)
     src_wh = (imgs[0].shape[1], imgs[0].shape[0])
     if b.ndim == 1:
-        aff = _crop_affine(src_wh, box, target_size, None)
+        aff = crop_affine(src_wh, box, target_size, None)
         out = [im if aff is None else cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR)
                for im in imgs]
     else:
         out = []
         for t, im in enumerate(imgs):
-            aff = _crop_affine(src_wh, b[min(t, len(b) - 1)], target_size, None)
+            aff = crop_affine(src_wh, b[min(t, len(b) - 1)], target_size, None)
             out.append(im if aff is None else
                        cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
     return torch.from_numpy(np.asarray(out))[None]
@@ -593,7 +593,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         (a near-square union only grows); results are int32 and clamped. Stored (instances.pq)
         boxes ARE squared through the rule (`pad=0`); under `crop_source = 'keypoints'` the
         detector keypoints are unioned then squared once. The camera must describe the box the
-        pixels were cut with: `apply_crop` sets `size`, `_resize_camera` makes it `scales`,
+        pixels were cut with: `apply_crop` sets `size`, `resize_camera` makes it `scales`,
         and `forward` divides by that -- a mismatch scales every keypoint.
 
         Wide-crop deployment (`crop_inflate != 1.0`) inflates each crop about its centre before
@@ -675,7 +675,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             scales = []
             uncropped = list(cgroup)
             for i, cam in enumerate(cgroup):
-                cgroup[i], s = _resize_camera(cam, pass1_res)
+                cgroup[i], s = resize_camera(cam, pass1_res)
                 scales.append(s)
             for i, ci in enumerate(use):
                 crop[a, wl, ci] = np.asarray(boxes[i], np.float32)
@@ -883,7 +883,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     return plan
                 cg, sc = [], []
                 for cam in uncropped:
-                    c, s = _resize_camera(cam, cfg.image_size)
+                    c, s = resize_camera(cam, cfg.image_size)
                     cg.append(c)
                     sc.append(s)
                 return WindowPlan(a, use, boxes, cg, sc, uncropped)
@@ -906,7 +906,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     continue
                 uncropped2, sc2 = list(cg2), []
                 for i, cam in enumerate(cg2):
-                    cg2[i], s = _resize_camera(cam, cfg.image_size)
+                    cg2[i], s = resize_camera(cam, cfg.image_size)
                     sc2.append(s)
                 for i, ci in enumerate(use):
                     crop_refined[a, wi - w0, ci] = np.asarray(b2[i], np.float32)

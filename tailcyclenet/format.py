@@ -33,11 +33,6 @@ class FormatError(Exception):
     """A dataset on disk does not satisfy docs/annotation_format.md."""
 
 
-# ``None`` means an explicitly requested omission for round-trip callers, while this sentinel
-# keeps an omitted argument distinct from an explicitly empty declaration.
-_FLIP_PAIRS_UNSET = object()
-
-
 # cameras
 
 def nominal_camera(name: str, size, dist=None):
@@ -55,6 +50,14 @@ def nominal_camera(name: str, size, dist=None):
                  rvec=np.zeros(3), tvec=np.zeros(3), name=name)
     cam.set_size((w, h))
     return cam
+
+
+def nominal_rig(name: str, size, dist=None) -> Rig:
+    """The one-camera, uncalibrated, static `Rig` of a 2D session: `nominal_camera` at no offset."""
+    from aniposelib.cameras import CameraGroup
+
+    return Rig(cgroup=CameraGroup([nominal_camera(name, size, dist)]), offset={name: (0.0, 0.0)},
+               moving={name: False}, calibrated={name: False})
 
 
 @dataclass
@@ -867,7 +870,7 @@ class Session:
 
 def write_session(path: Path, *, mode: str, units: str, label_source: str, names: list[str],
                   rig: Rig, groups: dict[str, Group], labels: dict[str, Labels],
-                  skeleton=(), flip_pairs=_FLIP_PAIRS_UNSET, provenance=None,
+                  skeleton=(), flip_pairs=None, provenance=None,
                   assoc_res_max_px: float | None = None) -> None:
     """Write session.toml, calibration.toml and the label tables. Pixels are the caller's job.
 
@@ -898,7 +901,7 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
     cfg = {'mode': mode, 'units': units, 'labels': label_source, 'names': list(names)}
     if skeleton:
         cfg['skeleton'] = [list(p) for p in skeleton]
-    if flip_pairs is not _FLIP_PAIRS_UNSET and flip_pairs is not None:
+    if flip_pairs is not None:
         cfg['flip_pairs'] = [list(p) for p in flip_pairs]
     if assoc_res_max_px is not None:
         cfg['assoc_res_max_px'] = float(assoc_res_max_px)

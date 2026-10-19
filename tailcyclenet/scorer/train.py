@@ -34,7 +34,7 @@ from ..checkpoints import (SCORER_OUTPUT_GRANULARITIES, _SCORER_CONFIG,
                            save_checkpoint, save_run_meta, scorer_checkpoint_granularity,
                            scorer_contract_mismatches, scorer_output_granularity, warm_start,
                            prior_provenance)
-from ..dataset import LoaderConfig, PoseDataset, StepSampler
+from ..dataset import SCORER_PLUMBING, LoaderConfig, PoseDataset, StepSampler, loader_config_from
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
 from ..train import _gpu_peak_gb, build_optimizer, init_wandb, log
@@ -265,15 +265,7 @@ def loader_config(data_cfg: dict, model_cfg: dict) -> LoaderConfig:
     """
     data_cfg = dict(data_cfg)
     refuse_deleted_data_keys(data_cfg)
-    known = set(LoaderConfig.__dataclass_fields__) | {
-        'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(
-            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
-            f'train at the defaults and report as the arm it is not. Known keys: {sorted(known)}')
-    lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
-                         if k in LoaderConfig.__dataclass_fields__})
+    lc = loader_config_from(data_cfg, extra=SCORER_PLUMBING)
     return replace(lc, box_prompt=model_cfg.get('box_prompt', 'none'))
 
 

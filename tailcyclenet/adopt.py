@@ -180,12 +180,8 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
              f'(expanded non-recursively over {fmt.VIDEO_EXTS}).')
 
     if calibration is None:
-        from aniposelib.cameras import CameraGroup
-
         cal = None
-        rig = fmt.Rig(cgroup=CameraGroup([fmt.nominal_camera('cam0', (1, 1))]),
-                      offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
-                      calibrated={'cam0': False})
+        rig = fmt.nominal_rig('cam0', (1, 1))
         need_size = ['cam0']
     else:
         cal = Path(calibration).resolve()

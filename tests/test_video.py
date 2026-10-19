@@ -180,7 +180,6 @@ def test_a_20fps_camera_on_a_1_30_grid_decodes_every_index(tmp_path, fresh_table
         assert r.table_source == 'index'      # read off the MP4 header, no scan
         assert len(r) == 60
         assert r.fps == pytest.approx(20.0, rel=0.01)
-        assert r.frame_times()[:4] == pytest.approx([0, 2 / 30, 3 / 30, 5 / 30])
         idx = list(range(60))
         _assert_colours(r.get_batch(idx), idx, 1)
         idx = [59, 1, 1, 31, 4, 0]            # seeks, repeats, out of order

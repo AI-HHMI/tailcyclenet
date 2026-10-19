@@ -174,7 +174,6 @@ def convert(job: dict, out: Path, names: list[str], skeleton: list, dry_run: boo
     import cv2
     import scipy.io as sio
     import ufmf
-    from aniposelib.cameras import CameraGroup
 
     movie = job['movie']
     trx = sio.loadmat(str(Path(movie).parent / 'registered_trx.mat'), squeeze_me=True,
@@ -230,8 +229,7 @@ def convert(job: dict, out: Path, names: list[str], skeleton: list, dry_run: boo
                                 notes=f'{len(lframes)} labelled frame(s), {len(mine)} labelled fly-frames')
         labels[gid] = lab
     reader.close()
-    rig = fmt.Rig(CameraGroup([fmt.nominal_camera(CAM, wh)]), offset={CAM: (0.0, 0.0)},
-                  moving={CAM: False}, calibrated={CAM: False})
+    rig = fmt.nominal_rig(CAM, wh)
     occ = sum(a['occluded'] for a in job['anns'])
     fmt.write_session(
         dst, mode='2d', units='px', label_source='annotated', names=names, rig=rig,

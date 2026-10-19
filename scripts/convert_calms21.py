@@ -38,10 +38,7 @@ N_VAL = 7
 
 def rig() -> fmt.Rig:
     """One uncalibrated 1024x570 camera. Same shape as convert_v4.rig_from_pixels."""
-    from aniposelib.cameras import CameraGroup
-    cam = fmt.nominal_camera('cam0', (W, H))
-    return fmt.Rig(CameraGroup([cam]), offset={'cam0': (0.0, 0.0)},
-                   moving={'cam0': False}, calibrated={'cam0': False})
+    return fmt.nominal_rig('cam0', (W, H))
 
 
 def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:

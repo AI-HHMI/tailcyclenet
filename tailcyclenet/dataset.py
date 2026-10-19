@@ -27,7 +27,7 @@ from torch.utils.data import Dataset
 from tracktail.datasets.tracktail_dataset import (
     custom_collate, rotate_camera_image_plane_3d as _tracktail_rotate_camera_image_plane_3d,
 )
-from .geometry import _has_skew
+from .geometry import has_skew
 from tracktail.model.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
@@ -207,6 +207,31 @@ class LoaderConfig:
     crop_inflate: float | list = 1.0
 
 
+LOADER_PLUMBING = ('path', 'num_workers')
+SCORER_PLUMBING = LOADER_PLUMBING + ('val_num_workers', 'prefetch_factor', 'worker_cv_threads')
+
+
+def loader_config_from(data_cfg: dict, *, extra=LOADER_PLUMBING) -> LoaderConfig:
+    """`[data]` -> a `LoaderConfig`, refusing any key neither it nor the caller reads.
+
+    An unknown key would otherwise be ignored and the run would report as an arm it is not. The
+    ONE place pose training, scorer training and scorer QC turn a `[data]` block into a loader.
+
+    Inputs: data_cfg -- the `[data]` block; extra -- keys the caller reads itself (plumbing such
+            as `path`/`num_workers`), allowed but not passed to the dataclass.
+    Outputs: a `LoaderConfig`.
+    Side effects: none, or raises SystemExit naming the unknown keys.
+    """
+    fields = LoaderConfig.__dataclass_fields__
+    known = set(fields) | set(extra)
+    unknown = set(data_cfg) - known
+    if unknown:
+        raise SystemExit(
+            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
+            f'train at the defaults and report as the arm it is not. Known keys: {sorted(known)}')
+    return LoaderConfig(**{k: v for k, v in data_cfg.items() if k in fields})
+
+
 # pixels
 
 def _rotate_2d(cam, coords, angle_deg):
@@ -215,7 +240,7 @@ def _rotate_2d(cam, coords, angle_deg):
     The inscribed crop silently NaN'd the labels of items whose animal sat outside it (the 3D
     path stays on the library helper because it recomputes `vis_2d` after rotating, which 2D
     cannot). The full canvas costs nothing: the follow-on crop only meets the canvas edge for a
-    frame-edge animal, where `_crop_affine` already renders BORDER_CONSTANT zeros.
+    frame-edge animal, where `crop_affine` already renders BORDER_CONSTANT zeros.
 
     Only the principal point tracks the canvas expansion; `ext`/`ext_inv`/`center` stay
     untouched -- the 2D coords ARE the target, and moving them through the same affine is
@@ -292,17 +317,13 @@ def _flip_2d(cam, coords, mode, prior_rotation=None, perm=None):
     return out, transformed, (composed, (W, H))
 
 
-def _apply_affine(pts, rotation):
+def apply_affine(pts, rotation):
     """Move (...,2) pixel points through a rotation/reflection's own 2x3, or pass through untouched.
 
-    Shared so a stored box and the labels can never end up in different frames; a list is a
-    per-frame rotation over `pts`' leading (time) axis.
+    Shared so a stored box and the labels can never end up in different frames.
     """
     if pts is None or rotation is None:
         return pts
-    if isinstance(rotation, list):
-        return torch.stack([_apply_affine(pts[t], rotation[min(t, len(rotation) - 1)])
-                            for t in range(pts.shape[0])])
     M = torch.as_tensor(rotation[0], dtype=pts.dtype)
     return pts @ M[:, :2].T + M[:, 2]
 
@@ -330,7 +351,7 @@ def _needs_full_image_rotation(cam):
     K2 = cam['mat'][:2, :2]
     unequal_focal = not torch.isclose(K2[0, 0], K2[1, 1], rtol=1e-6, atol=1e-6)
     nonzero_distortion = bool(torch.count_nonzero(cam['dist']))
-    return _has_skew(cam) or unequal_focal or nonzero_distortion
+    return has_skew(cam) or unequal_focal or nonzero_distortion
 
 
 def rotate_camera_image_plane_3d(cam, angle_deg):
@@ -381,13 +402,13 @@ def _rotate_camera_group_with_neighbours(cgroup, coords, others):
     return cgroup, combined[:, :K], combined[:, K:]
 
 
-def _crop_affine(src_wh, crop_coords, target_size, rotation):
+def crop_affine(src_wh, crop_coords, target_size, rotation):
     """The one dst<-src affine for rotate -> crop -> resize. Returns (M_2x3, (w, h)) or None.
 
     None means all three are no-ops and the caller should not warp at all. Composition is not a
     micro-optimisation: sequential rotate-then-crop warps the whole frame and resamples twice.
     The CORNER convention (`x_dst = (x_src - x1) * sx`) matches `crop.apply_crop`'s offset and
-    `_resize_camera`'s mat scale, so the pixels agree with the intrinsics `project_points_torch`
+    `resize_camera`'s mat scale, so the pixels agree with the intrinsics `project_points_torch`
     reprojects through. Out-of-source pixels arrive as BORDER_CONSTANT zeros.
     """
     w, h = src_wh
@@ -430,7 +451,7 @@ def load_warps(path, specs, target_size=None, reduce=1):
     src_wh = (img.shape[1], img.shape[0])
     out = []
     for crop_coords, rotation in specs:
-        aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
+        aff = crop_affine(src_wh, crop_coords, target_size, rotation)
         warped = (img if aff is None
                   else cv2.warpAffine(img, aff[0], aff[1], flags=cv2.INTER_LINEAR))
         out.append(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
@@ -439,7 +460,7 @@ def load_warps(path, specs, target_size=None, reduce=1):
 
 # An OPEN reader retains about a gigabyte, so the cache size is a MEMORY BUDGET, not a hint:
 # 32 live readers across 8 workers is how the calms21 runs got OOM-killed. Sized per process by
-# `_reader_cache_size`; `TAILCYCLENET_READER_CACHE` only overrides it.
+# `_reader_cache_size` from the `--max-ram` budget, the only knob.
 
 
 # GB of retained memory per OPEN reader per megapixel of frame (PyAV, measured, rounded up).
@@ -484,10 +505,13 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     an explicit `--max-ram` must bind here or it means nothing. The per-reader price is rounded
     UP so the estimate errs toward a smaller cache: the safe direction, since an over-estimate
     costs gigabytes and, inside workers, the job.
+
+    `TAILCYCLENET_READER_CACHE` is deleted: a set value raises rather than being ignored.
     """
-    env = os.environ.get('TAILCYCLENET_READER_CACHE')
-    if env:
-        return max(1, int(env))
+    if os.environ.get('TAILCYCLENET_READER_CACHE'):
+        raise SystemExit('TAILCYCLENET_READER_CACHE is deleted: the reader cache is sized from '
+                         'the RAM budget only. Unset it and use --max-ram / '
+                         'TAILCYCLENET_MAX_RAM_GB instead.')
     if ram_gb is None:
         ram_gb = _memory.current().budget_gb
     if procs is None:
@@ -545,28 +569,14 @@ class _ReaderCache:
         self.misses += 1
         if len(self._d) >= self.maxsize:
             del self._d[self._rng.choice(list(self._d))]
-        got = self._d[path] = _open_reader(path)
+        from . import video
+
+        got = self._d[path] = video.open_reader(path)
         return got
 
 
-def _open_reader(path: str):
-    """One reader per file per process. Opening the container and building its frame index is not
-    per-window work, but `read_frames` is called once per window per camera -- so a windowed pass
-    over 3dpop's test videos paid it hundreds of times.
-
-    **THE BACKEND IS `tailcyclenet/video.py`, AND THAT IS A MEMORY FIX.** PyAV keeps decoded
-    frames bounded instead of loading whole containers into memory, which is survivable on a
-    600-frame clip but matters on a 21 GB recording -- a 16-camera `--videos` run peaked at
-    456 GB under `--max-ram 24`. PyAV is bit-identical on every video root here, so nothing
-    downstream moves.
-    """
-    from . import video
-
-    return video.open_reader(path)
-
-
 def _reader(path: str, group, cam: str):
-    """The cached `_open_reader`, sized on first use from the rig this group belongs to.
+    """The cached `video.open_reader`, sized on first use from the rig this group belongs to.
 
     `group.session` is not checked: `group.source(cam)` reached us through `Group.dir`, which
     already dereferences `self.session.path`, so a session-less Group cannot get this far.
@@ -589,8 +599,7 @@ def _reader(path: str, group, cam: str):
     cycle only pays off once the whole cycle fits (the old 2.5x figure came from a different
     decoder). A silently 5x slower run should say so rather than being diagnosed from a
     stopwatch, and the warning says what it would take -- the price is LINEAR, so it inverts
-    into an actual `--max-ram` figure -- while not blaming the budget when the env var forced
-    the size.
+    into an actual `--max-ram` figure.
     """
     global _readers
     with _cache_lock:
@@ -600,10 +609,7 @@ def _reader(path: str, group, cam: str):
             size = _reader_cache_size(
                 len(rig), rig.size(cam), None if info is None else info.num_workers)
             if info is None and size < len(rig):
-                forced = os.environ.get('TAILCYCLENET_READER_CACHE')
-                why = (f'TAILCYCLENET_READER_CACHE={forced} forced this; unset it to size from '
-                       'the RAM budget instead.' if forced else
-                       f'--max-ram {reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold '
+                why = (f'--max-ram {reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold '
                        f'all {len(rig)}. Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or accept the '
                        'slowdown.')
                 warnings.warn(
@@ -641,14 +647,12 @@ def _read_lock_for(path: str) -> threading.Lock:
 
 
 def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
-    """Frames from a video file. Only 3dpop's test split needs this.
+    """Frames from a video file, under one crop box and one rotation for the whole window.
 
-    Each DISTINCT index is decoded once: a clamp-padded window repeats its last frame, and a
-    synthetic-motion window is ONE index T times under T different crops -- handing `get_batch`
-    the repeats decodes them. A (T,4) `crop_coords` or a list of rotations is a MOVING crop: one
-    affine per frame rather than one for the window, with the same count of `warpAffine` calls.
-    A repeat gets a COPY, not a shared buffer: `_augment`'s cutout writes in place, and the
-    dedupe would otherwise make repeats alias one buffer (same rule as `read_frames`).
+    Each DISTINCT index is decoded once: a clamp-padded window repeats its last frame, and handing
+    `get_batch` the repeats would decode them. A repeat gets a COPY, not a shared buffer:
+    `_augment`'s cutout writes in place, and the dedupe would otherwise make repeats alias one
+    buffer (same rule as `read_frames`).
     """
     import cv2
 
@@ -659,15 +663,9 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
         dec = _reader(key, group, cam).get_batch(uniq)
     at = {i: dec[n] for n, i in enumerate(uniq)}
     src_wh = (dec.shape[2], dec.shape[1])
-    cc = None if crop_coords is None else np.asarray(crop_coords)
-    per_box = cc is not None and cc.ndim == 2
-    per_rot = isinstance(rotation, list)
+    aff = crop_affine(src_wh, crop_coords, target_size, rotation)
     out, seen = [], set()
-    for t, i in enumerate(want):
-        aff = _crop_affine(src_wh,
-                           cc[min(t, len(cc) - 1)] if per_box else crop_coords,
-                           target_size,
-                           rotation[min(t, len(rotation) - 1)] if per_rot else rotation)
+    for i in want:
         im = at[i]
         if aff is not None:
             out.append(cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
@@ -710,44 +708,27 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     §12) -- listing a directory to select T frames cost 0.90 s of a 1.06 s rat-city item. Each
     DISTINCT frame is decoded once: `_frames` clamp-pads a window that runs past its group's end,
     and a group shorter than `n_frames` pads entirely, so the dedupe turns 384 decodes into 16.
-
-    Per-frame crops move the dedupe key: a per-frame box is a function of the POSITION in the
-    window, not of the source index, so the key is (index, box, rotation slot) -- with one box
-    and one rotation those halves are constant and this is the old behaviour exactly. But the
-    dedupe key is not the decode key: a synthetic-motion window is ONE index under T distinct
-    crops, so keys group by source index and `load_warps` decodes once per group. A repeat gets a
-    COPY, not the same array object: `_augment`'s cutout writes in place, and an aliased list
-    would make every repeat share one buffer (the copy is ~20 us against the 27 ms decode).
+    One crop box and one rotation apply to the whole window. A repeat gets a COPY, not the same
+    array object: `_augment`'s cutout writes in place, and an aliased list would make every repeat
+    share one buffer (the copy is ~20 us against the 27 ms decode).
     """
     kind, src, ext = group.source(cam)
     if kind == 'video':
         return _read_video(src, group, cam, frames, crop_coords, target_size, rotation)
     want = [int(i) for i in frames]
     path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
-    cc = None if crop_coords is None else np.asarray(crop_coords)
-    per_box = cc is not None and cc.ndim == 2
-    per_rot = isinstance(rotation, list)
-    keys = [(w, tuple(int(v) for v in cc[min(t, len(cc) - 1)]) if per_box else None,
-             min(t, len(rotation) - 1) if per_rot else None)
-            for t, w in enumerate(want)]
-    uniq = list(dict.fromkeys(keys))
-    by_index = {}
-    for k in uniq:
-        by_index.setdefault(k[0], []).append(k)
-    spec = lambda k: (list(k[1]) if per_box else crop_coords,          # noqa: E731
-                      rotation[k[2]] if per_rot else rotation)
-    batch = lambda i, ks: load_warps(path(i), [spec(k) for k in ks],   # noqa: E731
-                                     target_size, reduce)
+    uniq = list(dict.fromkeys(want))
+    batch = lambda i: load_warps(path(i), [(crop_coords, rotation)],   # noqa: E731
+                                 target_size, reduce)[0]
     if pool is None:
-        res = {i: batch(i, ks) for i, ks in by_index.items()}
+        got = {i: batch(i) for i in uniq}
     else:
-        fs = {i: pool.submit(batch, i, ks) for i, ks in by_index.items()}
-        res = {i: f.result() for i, f in fs.items()}
-    got = {k: im for i, ks in by_index.items() for k, im in zip(ks, res[i])}
+        fs = {i: pool.submit(batch, i) for i in uniq}
+        got = {i: f.result() for i, f in fs.items()}
     if any(v is None for v in got.values()):
-        return [got[k] for k in keys]
+        return [got[i] for i in want]
     seen, out = set(), []
-    for i in keys:
+    for i in want:
         out.append(got[i].copy() if i in seen else got[i])
         seen.add(i)
     return out
@@ -986,6 +967,14 @@ def shard_sessions(sessions, rank: int = 0, world_size: int = 1):
 
 
 class PoseDataset(Dataset):
+    """The pose training loader: one item is `shape` -> `select` -> `realise` -> `_targets`.
+
+    `shape(rng)`, `select(idx, rng, shape)` and `realise(sel, rng, world_gauge=)` are the public
+    seam the scorer builds on (one selection realised into two views). `shape` draws from the
+    rank-shared stream; `select` then `realise` consume the item's own stream in that order, so a
+    caller must keep that order to reproduce `__getitem__`.
+    """
+
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
                  train: bool | None = None, seed: int = 23,
                  registry_base: Registry | None = None, rank: int = 0,
@@ -1237,7 +1226,7 @@ class PoseDataset(Dataset):
         rng = np.random.default_rng(None if self.train else (self.seed, idx))
         shape_rng = (rng if ordinal is None
                      else np.random.default_rng((self.seed, 0x5AFE, int(ordinal))))
-        shape = self._shape(shape_rng)
+        shape = self.shape(shape_rng)
         for _ in range(8):
             out = self._item(idx, rng, shape)
             if out is not None:
@@ -1260,9 +1249,9 @@ class PoseDataset(Dataset):
             raise TypeError('get_once expects an integer index, not an ordinal/index tuple')
         idx = int(idx)
         rng = np.random.default_rng(None if self.train else (self.seed, idx))
-        return self._item(idx, rng, self._shape(rng))
+        return self._item(idx, rng, self.shape(rng))
 
-    def _shape(self, rng) -> dict:
+    def shape(self, rng) -> dict:
         """The cost-determining draws, made from a stream every rank shares. See `__getitem__`.
 
         Exactly the two draws that change how much WORK an item is and nothing else: the camera
@@ -1360,7 +1349,7 @@ class PoseDataset(Dataset):
         return coords.masked_fill(missing, float('nan'))
 
     def _item(self, idx, rng, shape=None):
-        """One window, built as `_select` -> `_realise` -> `_targets`.
+        """One window, built as `select` -> `realise` -> `_targets`.
 
         The three-way split is a SEAM, not a tidy-up: a view-independent selection can be
         realised into more than one view (`tailcyclenet/scorer/`), which a fused `_item` cannot
@@ -1369,20 +1358,20 @@ class PoseDataset(Dataset):
         `tests/test_dataset_select_realise.py`, which is the condition the split was approved
         on, not a nicety.
         """
-        sel = self._select(idx, rng, shape)
+        sel = self.select(idx, rng, shape)
         if sel is None:
             return None
-        view = self._realise(sel, rng)
+        view = self.realise(sel, rng)
         if view is None:
             return None
         return self._targets(sel, view, rng)
 
-    def _select(self, idx, rng, shape=None) -> Selection | None:
+    def select(self, idx, rng, shape=None) -> Selection | None:
         """Draw the view-independent part of a window, or None when the item cannot be built.
 
         Inputs: idx -- the index to pick.
                 rng -- the item's RNG stream.
-                shape -- a pre-drawn cost-determining shape dict (see `_shape`).
+                shape -- a pre-drawn cost-determining shape dict (see `shape`).
         Outputs: the `Selection`, or None (an index that resolves to no labelled frames, or a
         track with fewer than 2 finite coordinates).
 
@@ -1398,7 +1387,7 @@ class PoseDataset(Dataset):
         `coords` here is the CLEAN track at the stored coordinates -- untransformed, NaN where
         unlabelled. Every view-dependent coordinate lives in the `View`.
         """
-        shape = shape or self._shape(rng)
+        shape = shape or self.shape(rng)
         item = self._pick(idx, rng)
         sess, group = item.session, item.session.groups[item.gid]
         lab = sess.labels(item.gid)
@@ -1474,7 +1463,7 @@ class PoseDataset(Dataset):
                          attempt_swap_animal=attempt_swap_animal, neighbour_row=neighbour_row,
                          inflate=inflate)
 
-    def _realise(self, sel, rng, world_gauge=True) -> View | None:
+    def realise(self, sel, rng, world_gauge=True) -> View | None:
         """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
 
         Applies per-camera rotation, optional 2D flip, crop jitter and appearance augmentation.
@@ -1542,14 +1531,14 @@ class PoseDataset(Dataset):
                 flipped = True
                 if vis_2d is not None:
                     vis_2d = vis_2d[:, kpt_perm]
-            cp = _apply_affine(cp, rotation_info[0])
+            cp = apply_affine(cp, rotation_info[0])
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
                                                          inflate=inflate)
             if cam is None:
                 return None
-            cam, scale = _resize_camera(cam, self.cfg.image_size)
+            cam, scale = resize_camera(cam, self.cfg.image_size)
             scales = [scale]
             coords = coords * scale
             coords = _mask_outside(coords, cam['size'])
@@ -1558,7 +1547,7 @@ class PoseDataset(Dataset):
             if attempt_swap_animal:
                 raw = self._hybrid_2d_coords(
                     lab, neighbour_row, frames, sel.cgroup[0], sel.cam_ix[0])
-                raw = _apply_affine(raw, rotation_info[0])
+                raw = apply_affine(raw, rotation_info[0])
                 if flipped:
                     raw = raw[:, self._flip_perm[sel.sess.path]]
                 neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
@@ -1591,14 +1580,14 @@ class PoseDataset(Dataset):
                 cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
             cp3 = None if crop_pts is None else [
-                _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
+                apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
             jit = self._jitter(rng)
             cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
                                                       jit, crop_pts=cp3,
                                                       inflate=inflate)
             if cgroup is None:
                 return None
-            resized = [_resize_camera(c, self.cfg.image_size) for c in cgroup]
+            resized = [resize_camera(c, self.cfg.image_size) for c in cgroup]
             cgroup = [c for c, _ in resized]
             scales = [s for _, s in resized]
             if self.train and world_gauge:
@@ -1655,7 +1644,7 @@ class PoseDataset(Dataset):
         REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
 
         The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
-        last frame); the final 3D noisy-OR is over the FINAL `vis_2d` (done in `_realise`).
+        last frame); the final 3D noisy-OR is over the FINAL `vis_2d` (done in `realise`).
         The scorer never calls this: it supplies no prior and no box.
         """
         item, sess, lab, frames = sel.item, sel.sess, sel.lab, sel.frames
@@ -1799,7 +1788,7 @@ def _mask_outside(coords, size):
     return coords
 
 
-def _resize_camera(cam, target_res):
+def resize_camera(cam, target_res):
     """Scale a camera so its long side is `target_res`. Returns (cam, (sx, sy)).
 
     The output dimensions are integer pixels, so the affine actually applied by OpenCV has

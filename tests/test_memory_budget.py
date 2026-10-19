@@ -253,15 +253,15 @@ def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees(
     cache = _ReaderCache(11)
     cache_open = []
 
-    import tailcyclenet.dataset as dsmod
-    real = dsmod._open_reader
-    dsmod._open_reader = lambda p: cache_open.append(p) or object()
+    import tailcyclenet.video as vmod
+    real = vmod.open_reader
+    vmod.open_reader = lambda p: cache_open.append(p) or object()
     try:
         for _ in range(60):                       # 60 passes over a 16-camera rig
             for c in range(16):
                 cache(f'cam{c}')
     finally:
-        dsmod._open_reader = real
+        vmod.open_reader = real
 
     rate = cache.hits / (cache.hits + cache.misses)
     assert rate > 0.3, (

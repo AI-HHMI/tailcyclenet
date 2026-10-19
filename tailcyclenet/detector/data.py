@@ -323,13 +323,6 @@ def _floor_extent(boxes, min_side):
     return out
 
 
-def tt_photometric_transform(img, gain=1.0, gamma=1.0):
-    """Apply clipped gain/gamma to an RGB uint8 image without mutating it."""
-    if gain == 1.0 and gamma == 1.0:
-        return img
-    return np.clip(255.0 * ((img.astype(np.float32) / 255.0) ** gamma) * gain, 0, 255).astype(np.uint8)
-
-
 class BoxDataset(Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
@@ -342,7 +335,7 @@ class BoxDataset(Dataset):
                  augment=False, reduce=False, hflip=0.5, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
                  boxes_by_dataset=None, include_roots=None, datasets=None,
-                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, tt_transform=None,
+                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0,
                  input_norm='none', scale_range=(0.8, 1.25), background_prob=0.0,
                  invert_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
@@ -394,7 +387,6 @@ class BoxDataset(Dataset):
             raise ValueError(f'box_target must be one of {BOX_TARGETS}, got {box_target!r}')
         self.box_target = box_target
         self.antialias = bool(antialias)
-        self.tt_transform = tt_transform
         from .transfer_aug import INPUT_NORMS
         if input_norm not in INPUT_NORMS:
             raise ValueError(f'input_norm must be one of {INPUT_NORMS}, got {input_norm!r}')
@@ -1017,8 +1009,6 @@ class BoxDataset(Dataset):
         img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
         if img is None:
             raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
-        if self.tt_transform is not None:
-            img = self.tt_transform(img)
         dec = (img.shape[1], img.shape[0])
         want = tuple(-(-size[a] // r) for a in (0, 1))
         assert dec == want or dec == size, \

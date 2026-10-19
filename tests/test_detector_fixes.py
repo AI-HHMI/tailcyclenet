@@ -115,19 +115,6 @@ def test_load_detector_refuses_a_convnext_size_not_divisible_by_32(tmp_path):
         load_detector(tmp_path / 'det120.pth')
 
 
-def test_score_fixed_views_restores_augment(tmp_path):
-    """detector B13: `score_fixed_views` set `ds.augment = False` and never restored it, so a
-    train dataset scored mid-run silently stopped augmenting."""
-    from .conftest import _session_2d
-    from tailcyclenet.detector import BoxDataset, YOLOXNano
-    from tailcyclenet.detector.evaluate import score_fixed_views
-    _session_2d(tmp_path / 'r' / 'train' / 's0', T=4, S=2)
-    ds = BoxDataset(tmp_path / 'r', 'train', input_wh=(64, 64), augment=True)
-    rows = score_fixed_views(YOLOXNano(version='hybrid'), ds, [0, 1], 'cpu')
-    assert len(rows) == 2
-    assert ds.augment is True
-
-
 def _saved_detector(tmp_path, **meta):
     """A fresh hybrid detector saved as a checkpoint dict with `meta` on top."""
     from tailcyclenet.detector import YOLOXNano
@@ -189,20 +176,12 @@ def test_eval_detector_trace_uses_the_roots_own_box_source(tmp_path, monkeypatch
 
 
 def test_eval_detector_compare_scores_the_same_views(tmp_path, monkeypatch, capsys):
-    """detector B9: under `--evalset`, `--compare` scored the default sampled views while `--run`
-    scored the fixed subset, and a comma `--split` crashed it; the PAIRED delta compared
-    different frames. Both arms now share one dataset/subset builder."""
-    import json as _json
+    """detector B9: a comma `--split` crashed `--compare`, and the PAIRED delta compared
+    different frames. Both arms now share one dataset builder."""
     from .conftest import _session_2d
-    from tailcyclenet.format import Session
     root = tmp_path / 'root'
     _session_2d(root / 'train' / 's0', T=4, S=2)
     _session_2d(root / 'test' / 's1', T=4, S=2)
-    sess = Session.load(root / 'test' / 's1')
-    gid = list(sess.groups)[0]
-    evalset = tmp_path / 'evalset.json'
-    evalset.write_text(_json.dumps({'frames': [
-        {'session': sess.session_id, 'group': gid, 'frame': 1, 'split': 'test'}]}))
     path = _saved_detector(tmp_path)
     mod = _module('scripts/eval_detector.py', 'tcn_eval_detector_compare')
     calls = []
@@ -216,7 +195,7 @@ def test_eval_detector_compare_scores_the_same_views(tmp_path, monkeypatch, caps
         return real(model, ds, *args, **kwargs)
 
     monkeypatch.setattr(mod, 'score_dataset', spy)
-    for extra in (['--evalset', str(evalset)], ['--split', 'train,test']):
+    for extra in (['--split', 'test'], ['--split', 'train,test']):
         calls.clear()
         monkeypatch.setattr(sys, 'argv', [
             'eval_detector.py', '--run', str(path), '--compare', str(path), '--data', str(root),
@@ -241,3 +220,12 @@ def test_train_detector_weights_dir_raises_by_name():
     from tailcyclenet import train_detector
     with pytest.raises(SystemExit, match='--weights-dir is deleted.*COCO'):
         train_detector.main(['--weights-dir', '/tmp/w'])
+
+
+@pytest.mark.parametrize('flag', ['--evalset', '--out', '--tt-gain', '--tt-gamma'])
+def test_eval_detector_transfer_flags_raise_by_name(flag, monkeypatch):
+    """The report-73 transfer sweep moved to dev/; its flags refuse themselves by name."""
+    mod = _module('scripts/eval_detector.py', 'tcn_eval_detector_removed')
+    monkeypatch.setattr(sys, 'argv', ['eval_detector.py', '--run', 'r', '--data', 'd', flag, '1'])
+    with pytest.raises(SystemExit, match=f'{flag} is deleted.*transfer'):
+        mod.main()

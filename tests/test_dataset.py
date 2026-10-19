@@ -104,7 +104,7 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
     import cv2
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import _crop_affine, _resize_camera
+    from tailcyclenet.dataset import crop_affine, resize_camera
     from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
     from tracktail.model.cube import project_points_torch
 
@@ -126,10 +126,10 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
         cam, rotation = rotate_camera_image_plane_3d(cam, angle)
     box = cropmod.crop_box_for_points(project_points_torch([cam], pt)[0], cam['size'], 96)
     cam = cropmod.apply_crop(cam, box)
-    cam, _ = _resize_camera(cam, 64)
+    cam, _ = resize_camera(cam, 64)
 
     want = project_points_torch([cam], pt)[0][0, 0]             # where the camera says it is now
-    M, size = _crop_affine((W, H), box, cam['size'].tolist(), rotation)
+    M, size = crop_affine((W, H), box, cam['size'].tolist(), rotation)
     out = cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR)
 
     # bilinear spreads the marker over up to 4 pixels; its intensity centroid is the position
@@ -168,7 +168,7 @@ def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
     np.testing.assert_allclose(box.amin(0).numpy(), [0.0, 0.0], atol=0.51)
     np.testing.assert_allclose(box.amax(0).numpy(), list(size), atol=1.01)
     # The camera's principal point moved by the canvas expansion, which is what keeps the pixels
-    # `_crop_affine` produces agreed with the camera `apply_crop` hands downstream: the frame
+    # `crop_affine` produces agreed with the camera `apply_crop` hands downstream: the frame
     # centre must still be the canvas centre.
     centre = moved[0, 4].numpy()
     np.testing.assert_allclose(centre, [size[0] / 2, size[1] / 2], atol=1.01)
@@ -926,7 +926,7 @@ def test_box_source_instances_crops_on_the_stored_box(tiny_root):
     box = cropmod.crop_box_for_points(torch.tensor([[10.0, 10.0], [30.0, 30.0]]),
                                       torch.tensor([64, 48], dtype=torch.int32), 8, pad=0)
     assert box.tolist() == [10, 10, 30, 30], 'a padded extent must not be padded a second time'
-    # `apply_crop` moves the origin to the box and `_resize_camera` scales it by 64/20.
+    # `apply_crop` moves the origin to the box and `resize_camera` scales it by 64/20.
     torch.testing.assert_close(b.cgroup[0]['offset'],
                                torch.tensor([10.0, 10.0]) * (64 / 20))
     assert not torch.allclose(b.cgroup[0]['offset'],
@@ -960,12 +960,12 @@ def test_a_rotated_box_needs_four_corners():
     """
     import cv2
 
-    from tailcyclenet.dataset import _apply_affine
+    from tailcyclenet.dataset import apply_affine
 
     box = torch.tensor([10.0, 10.0, 30.0, 20.0])
     rot = (cv2.getRotationMatrix2D((20.0, 15.0), 30.0, 1.0), (64, 48))
-    four = _apply_affine(torch.stack([box[[0, 1]], box[[2, 1]], box[[2, 3]], box[[0, 3]]]), rot)
-    two = _apply_affine(torch.stack([box[[0, 1]], box[[2, 3]]]), rot)
+    four = apply_affine(torch.stack([box[[0, 1]], box[[2, 1]], box[[2, 3]], box[[0, 3]]]), rot)
+    two = apply_affine(torch.stack([box[[0, 1]], box[[2, 3]]]), rot)
     assert (four.amin(0) <= two.amin(0)).all() and (four.amax(0) >= two.amax(0)).all()
     assert (four.amax(0) - four.amin(0) > two.amax(0) - two.amin(0)).any()
 
@@ -1093,7 +1093,7 @@ def test_crop_inflate_range_flows_through_a_real_item(tiny_root):
             return getattr(self._inner, name)
 
     train_ds = PoseDataset(tiny_root / 'ratlike', 'train', range_cfg, train=True)
-    # `size` after `_resize_camera` is always `image_size` (the resize target), so the varying
+    # `size` after `resize_camera` is always `image_size` (the resize target), so the varying
     # quantity is the SCALE that got it there -- `mat[0,0]`, smaller for a wider source box, as
     # in `test_crop_inflate_widens_the_2d_crop`.
     scales = []
@@ -1283,11 +1283,11 @@ def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
     """
     import cv2
 
-    from tailcyclenet.dataset import _resize_camera
+    from tailcyclenet.dataset import resize_camera
 
     cam = {'size': torch.tensor([2000, 1], dtype=torch.int32),
            'mat': torch.eye(3), 'offset': torch.zeros(2)}
-    out, _ = _resize_camera(cam, 256)
+    out, _ = resize_camera(cam, 256)
     assert out['size'].tolist() == [256, 1], f'a zero side survived: {out["size"].tolist()}'
 
     # The reason it matters, pinned on OpenCV itself so it stays true if the behaviour ever moves.
@@ -1799,7 +1799,7 @@ def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
 
 def test_an_undecodable_video_frame_skips_the_item_instead_of_killing_the_worker(tmp_path):
     """The image path returns None for an unreadable frame and the loader draws another item;
-    the video path used to RAISE out of `_realise`, killing the DataLoader worker."""
+    the video path used to RAISE out of `realise`, killing the DataLoader worker."""
     import shutil
 
     from .conftest import _session_2d, _write_video
@@ -1814,7 +1814,7 @@ def test_an_undecodable_video_frame_skips_the_item_instead_of_killing_the_worker
         rng = np.random.default_rng(0)
         with warnings.catch_warnings(record=True) as got:
             warnings.simplefilter('always')
-            items.append((ds._item(0, rng, ds._shape(rng)), got))
+            items.append((ds._item(0, rng, ds.shape(rng)), got))
     assert items[0][0] is not None and not items[0][1]
     assert items[1][0] is None
     assert any('did not decode' in str(w.message) for w in items[1][1])

@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 from tracktail.model.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
-from ..dataset import _apply_affine, read_frames
+from ..dataset import apply_affine, read_frames
 from ..format import (INST_ABSENT, INST_LABELED, INST_NONE, INST_PRESENT, PROJECTED, UNLABELED,
                       VISIBLE, load_datasets)
 
@@ -941,7 +941,7 @@ class BoxDataset(Dataset):
         if with_keypoints:
             k = p2d.clone()
             if warp is not None:
-                k = _apply_affine(k, (warp, None))
+                k = apply_affine(k, (warp, None))
                 k = drop_outside(k, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
             if tile_box is not None:
                 k = drop_outside(k, tile_box)
@@ -969,7 +969,7 @@ class BoxDataset(Dataset):
             else:
                 src, pad = p2d[s], 20
             if warp is not None:
-                src = _apply_affine(src, (warp, None))
+                src = apply_affine(src, (warp, None))
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
             if tile_box is not None:
                 src = drop_outside(src, tile_box)

@@ -1735,7 +1735,7 @@ def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
 
     That is the whole reason `forward` un-crops the per-camera pose with the SAME expression the
     2D path uses for `pred` (`p / scale + box[:2]`) rather than the more exact per-axis inverse in
-    `dataset._crop_affine`. The two differ by a sub-pixel amount that comes from `_resize_camera`
+    `dataset.crop_affine`. The two differ by a sub-pixel amount that comes from `resize_camera`
     rounding `cam['size']`; adopting the exact form would move every published 2D number, so the
     inexactness is kept deliberately and pinned here.
 

@@ -56,7 +56,7 @@ def _camera(size=(64, 48), offset=(0.0, 0.0), dist=None):
 def test_flip_affine_matches_pixels_and_projection(mode):
     import cv2
     from tracktail.model.cube import project_points_torch
-    from tailcyclenet.dataset import _crop_affine
+    from tailcyclenet.dataset import crop_affine
 
     W, H = 64, 48
     cam = _camera(offset=(4.0, 3.0),
@@ -76,7 +76,7 @@ def test_flip_affine_matches_pixels_and_projection(mode):
     y, x = np.mgrid[:H, :W]
     marker = np.stack([(x * 3 + y * 5) % 256, (x * 7 + y * 11) % 256,
                        (x + 2 * y) % 256], -1).astype(np.uint8)
-    matrix, out_size = _crop_affine((W, H), None, (W, H), rotation)
+    matrix, out_size = crop_affine((W, H), None, (W, H), rotation)
     got = cv2.warpAffine(marker, matrix, out_size, flags=cv2.INTER_LINEAR)
     want = cv2.flip(marker, 1 if mode == 'horizontal' else 0)
     np.testing.assert_array_equal(got, want)
@@ -89,14 +89,14 @@ def test_flip_permutates_labels_visibility_and_view_pixels(tiny_root, mode):
     plain_ds = PoseDataset(tiny_root / 'ratlike', 'train', plain_cfg, train=True, seed=3)
     flip_ds = PoseDataset(tiny_root / 'ratlike', 'train', flip_cfg, train=True, seed=3)
 
-    sel_plain = plain_ds._select(0, np.random.default_rng(17),
-                                 plain_ds._shape(np.random.default_rng(19)))
-    sel_flip = flip_ds._select(0, np.random.default_rng(17),
-                               flip_ds._shape(np.random.default_rng(19)))
+    sel_plain = plain_ds.select(0, np.random.default_rng(17),
+                                 plain_ds.shape(np.random.default_rng(19)))
+    sel_flip = flip_ds.select(0, np.random.default_rng(17),
+                               flip_ds.shape(np.random.default_rng(19)))
     assert sel_plain is not None and sel_flip is not None
     source_before = sel_flip.coords.clone()
-    view_plain = plain_ds._realise(sel_plain, np.random.default_rng(23))
-    view_flip = flip_ds._realise(sel_flip, np.random.default_rng(23))
+    view_plain = plain_ds.realise(sel_plain, np.random.default_rng(23))
+    view_flip = flip_ds.realise(sel_flip, np.random.default_rng(23))
     assert view_plain is not None and view_flip is not None
 
     perm = torch.tensor([0, 2, 1, 3])
@@ -151,9 +151,9 @@ def test_forced_2d_flip_handles_moving_camera(tmp_path):
     ds = PoseDataset(session.parent.parent, 'train',
                      _cfg(flip_2d_prob=1.0, flip_2d_modes=['vertical'], prob_2d_only=1.0),
                      train=True)
-    sel = ds._select(0, np.random.default_rng(4), ds._shape(np.random.default_rng(5)))
+    sel = ds.select(0, np.random.default_rng(4), ds.shape(np.random.default_rng(5)))
     assert sel is not None and sel.true_2d
-    view = ds._realise(sel, np.random.default_rng(6))
+    view = ds.realise(sel, np.random.default_rng(6))
     assert view is not None and view.r == 2
     assert torch.equal(view.kpt_perm, torch.tensor([0, 2, 1]))
     assert view.coords.shape[-1] == 2
@@ -164,17 +164,17 @@ def test_flip_preflight_is_not_needed_for_3d_when_prob_2d_only_is_zero(tiny_root
     ds = PoseDataset(tiny_root / 'mouselike', 'train',
                      _cfg(flip_2d_prob=1.0, prob_2d_only=0.0), train=True)
     assert ds._flip_perm == {}
-    sel = ds._select(0, np.random.default_rng(1), ds._shape(np.random.default_rng(2)))
+    sel = ds.select(0, np.random.default_rng(1), ds.shape(np.random.default_rng(2)))
     assert sel is not None and not sel.true_2d
 
 
 def test_flip_rng_draws_are_pinned(tiny_root):
     cfg = _cfg(flip_2d_prob=1.0, flip_2d_modes=['horizontal'])
     ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg, train=True)
-    sel = ds._select(0, np.random.default_rng(8), ds._shape(np.random.default_rng(9)))
+    sel = ds.select(0, np.random.default_rng(8), ds.shape(np.random.default_rng(9)))
     assert sel is not None
     rng = np.random.default_rng(10)
-    assert ds._realise(sel, rng) is not None
+    assert ds.realise(sel, rng) is not None
     expected = np.random.default_rng(10)
     expected.random()                 # existing rotation coin
     expected.random()                 # flip coin
@@ -184,7 +184,7 @@ def test_flip_rng_draws_are_pinned(tiny_root):
     cfg0 = _cfg(flip_2d_prob=0.0, flip_2d_modes=[])
     ds0 = PoseDataset(tiny_root / 'ratlike', 'train', cfg0, train=True)
     rng0 = np.random.default_rng(10)
-    assert ds0._realise(sel, rng0) is not None
+    assert ds0.realise(sel, rng0) is not None
     expected0 = np.random.default_rng(10)
     expected0.random()                # existing rotation coin only
     assert rng0.integers(2**31) == expected0.integers(2**31)

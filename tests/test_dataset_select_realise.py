@@ -98,7 +98,7 @@ def _states(rng):
 def _run(ds, idx, seed=0, shape_seed=0x5AFE, aug_seed=0xA06, rot_seed=0xB07):
     """One `_item` plus the RNG state it left behind."""
     rng, shape_rng = _seed_all(seed, shape_seed, aug_seed, rot_seed)
-    shape = ds._shape(shape_rng)
+    shape = ds.shape(shape_rng)
     out = ds._item(idx, rng, shape)
     return out, _states(rng)
 
@@ -215,14 +215,14 @@ def test_the_covered_cases_actually_reach_their_branches(seam_root):
     tr = PoseDataset(seam_root / 'mouselike', 'train', _CASES['ranged-inflate'], train=True)
     seen = set()
     for seed in (0, 1, 2, 3, 4, 5):
-        sel = tr._select(0, np.random.default_rng(seed), tr._shape(np.random.default_rng(1)))
+        sel = tr.select(0, np.random.default_rng(seed), tr.shape(np.random.default_rng(1)))
         assert sel is not None
         assert 0.9 <= sel.inflate <= 1.5, f'inflate {sel.inflate} outside the configured range'
         seen.add(round(sel.inflate, 6))
     assert len(seen) > 1, 'train crop-inflate did not vary -- the ranged draw is not running'
 
     va = PoseDataset(seam_root / 'mouselike', 'val', _CASES['val-geometry'], train=False)
-    vsel = va._select(0, np.random.default_rng(0), va._shape(np.random.default_rng(1)))
+    vsel = va.select(0, np.random.default_rng(0), va.shape(np.random.default_rng(1)))
     assert vsel is not None
     assert vsel.inflate == pytest.approx(1.2), \
         f'val crop-inflate must be the range MIDPOINT (1.2), got {vsel.inflate}'
@@ -240,21 +240,21 @@ def _same_or_false(a, b):
 
 
 def test_the_ground_truth_arrays_are_not_written_through(seam_root):
-    """`_select` hands out the stored coordinates; nothing may write through them.
+    """`select` hands out the stored coordinates; nothing may write through them.
 
-    `torch.as_tensor` on the label array SHARES storage, so an in-place op after `_select` would
+    `torch.as_tensor` on the label array SHARES storage, so an in-place op after `select` would
     corrupt the session for every later item. The old fused `_item` had the same exposure but
     could not be asked this question; the split makes it load-bearing, because the scorer realises
     one selection TWICE.
     """
     cfg = _CASES['augmented']
     ds = PoseDataset(seam_root / 'mouselike', 'train', cfg, train=True)
-    sel = ds._select(0, np.random.default_rng(7), ds._shape(np.random.default_rng(1)))
+    sel = ds.select(0, np.random.default_rng(7), ds.shape(np.random.default_rng(1)))
     assert sel is not None
     before3d = sel.lab.points3d.copy()
     before2d = None if sel.lab.points2d is None else sel.lab.points2d.copy()
 
-    ds._realise(sel, np.random.default_rng(11))
+    ds.realise(sel, np.random.default_rng(11))
     np.testing.assert_array_equal(sel.lab.points3d, before3d)
     if before2d is not None:
         np.testing.assert_array_equal(sel.lab.points2d, before2d)
@@ -270,16 +270,16 @@ def test_two_realisations_of_one_selection_are_independent(seam_root, case):
     cfg = _CASES[case]
     for root_name in (('ratlike', 'mouselike') if case == 'box-prompt' else ('mouselike',)):
         ds = PoseDataset(seam_root / root_name, 'train', cfg, train=True)
-        sel_a = ds._select(0, np.random.default_rng(3), ds._shape(np.random.default_rng(1)))
+        sel_a = ds.select(0, np.random.default_rng(3), ds.shape(np.random.default_rng(1)))
         assert sel_a is not None
 
         _, first = _seed_all(100, 1, 0xA06, 0xB07), None
         rng, _ = _seed_all(100, 1, 0xA06, 0xB07)
-        first = ds._realise(sel_a, rng)
+        first = ds.realise(sel_a, rng)
         rng, _ = _seed_all(200, 1, 0xA06, 0xB07)          # a DIFFERENT view of the same selection
-        ds._realise(sel_a, rng)
+        ds.realise(sel_a, rng)
         rng, _ = _seed_all(100, 1, 0xA06, 0xB07)
-        replay = ds._realise(sel_a, rng)                   # the same view again
+        replay = ds.realise(sel_a, rng)                   # the same view again
 
         assert first is not None and replay is not None, f'{case}/{root_name}: realise returned None'
         _same(first.coords, replay.coords, 'coords')
@@ -295,9 +295,9 @@ def test_select_is_deterministic_given_idx_rng_and_shape(seam_root):
     """One selection per `(idx, rng, shape)` -- the scorer realises one, so it cannot re-draw."""
     cfg = _CASES['prompt-swaps']
     ds = PoseDataset(seam_root / 'mouselike', 'train', cfg, train=True)
-    shape = ds._shape(np.random.default_rng(5))
-    a = ds._select(0, np.random.default_rng(9), shape)
-    b = ds._select(0, np.random.default_rng(9), shape)
+    shape = ds.shape(np.random.default_rng(5))
+    a = ds.select(0, np.random.default_rng(9), shape)
+    b = ds.select(0, np.random.default_rng(9), shape)
     assert a is not None and b is not None
     _same(a.frames, b.frames, 'frames')
     _same(a.coords, b.coords, 'coords')

@@ -16,7 +16,7 @@ FULL, UN-AUGMENTED frames and owns the whole geometry chain itself, whereas this
 `PoseDataset` returns already-cropped, already-resized, already-augmented uint8 with the rotation
 baked into the decode. Nothing about that ordering is recoverable by an adapter shim.
 
-The seam (`PoseDataset._select` / `_realise`) is what makes the rewrite possible: ONE selection,
+The seam (`PoseDataset.select` / `realise`) is what makes the rewrite possible: ONE selection,
 TWO independent realisations. Calling `__getitem__` twice would select a DIFFERENT sample -- `_pick`
 re-draws the pool entry and `_frames` re-draws the anchor and stride.
 """
@@ -864,10 +864,10 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     (which would discard most mocap windows with marker dropouts); legacy sequence mode raises.
     """
     dense_3d, dense_2d, sparse_3d, sparse_2d = corruptors
-    view_a = dataset._realise(sel, rng, world_gauge=False)
+    view_a = dataset.realise(sel, rng, world_gauge=False)
     if view_a is None:
         return None
-    view_b = dataset._realise(sel, rng, world_gauge=False)
+    view_b = dataset.realise(sel, rng, world_gauge=False)
     if view_b is None:
         return None
 

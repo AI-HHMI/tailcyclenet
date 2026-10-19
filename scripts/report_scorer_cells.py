@@ -68,11 +68,11 @@ def _walk(config, split, n_windows):
         rng = np.random.default_rng(None if base.train else (base.seed, i))
         shape_rng = rng if base.train else np.random.default_rng((base.seed, 0x5AFE, i))
         cell_of = base.index[i].session
-        sel = base._select(i, rng, base._shape(shape_rng))
+        sel = base.select(i, rng, base.shape(shape_rng))
         if sel is None:
             reasons[(cell_of.label_source, cell_of.mode, 'select returned None')] += 1
             continue
-        view = base._realise(sel, rng, world_gauge=False)
+        view = base.realise(sel, rng, world_gauge=False)
         if view is None:
             reasons[(sel.sess.label_source, sel.sess.mode, 'realise returned None')] += 1
             continue
@@ -124,7 +124,7 @@ def _grad_check(config, device):
     for cell, i in sorted(wanted.items()):
         rng = np.random.default_rng(0)
         ds.base.train = True
-        sel = ds.base._select(i, rng, ds.base._shape(rng))
+        sel = ds.base.select(i, rng, ds.base.shape(rng))
         if sel is None:
             continue
         trip = make_triplet(ds.base, sel, rng, ds.cfg, ds.corruptors)

@@ -27,7 +27,7 @@ from torch.utils.data import Dataset
 from tracktail.datasets.tracktail_dataset import (
     custom_collate, rotate_camera_image_plane_3d as _tracktail_rotate_camera_image_plane_3d,
 )
-from .geometry import _has_skew
+from .geometry import has_skew
 from tracktail.model.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
@@ -219,7 +219,7 @@ def _rotate_2d(cam, coords, angle_deg):
     The inscribed crop silently NaN'd the labels of items whose animal sat outside it (the 3D
     path stays on the library helper because it recomputes `vis_2d` after rotating, which 2D
     cannot). The full canvas costs nothing: the follow-on crop only meets the canvas edge for a
-    frame-edge animal, where `_crop_affine` already renders BORDER_CONSTANT zeros.
+    frame-edge animal, where `crop_affine` already renders BORDER_CONSTANT zeros.
 
     Only the principal point tracks the canvas expansion; `ext`/`ext_inv`/`center` stay
     untouched -- the 2D coords ARE the target, and moving them through the same affine is
@@ -296,7 +296,7 @@ def _flip_2d(cam, coords, mode, prior_rotation=None, perm=None):
     return out, transformed, (composed, (W, H))
 
 
-def _apply_affine(pts, rotation):
+def apply_affine(pts, rotation):
     """Move (...,2) pixel points through a rotation/reflection's own 2x3, or pass through untouched.
 
     Shared so a stored box and the labels can never end up in different frames.
@@ -330,7 +330,7 @@ def _needs_full_image_rotation(cam):
     K2 = cam['mat'][:2, :2]
     unequal_focal = not torch.isclose(K2[0, 0], K2[1, 1], rtol=1e-6, atol=1e-6)
     nonzero_distortion = bool(torch.count_nonzero(cam['dist']))
-    return _has_skew(cam) or unequal_focal or nonzero_distortion
+    return has_skew(cam) or unequal_focal or nonzero_distortion
 
 
 def rotate_camera_image_plane_3d(cam, angle_deg):
@@ -381,13 +381,13 @@ def _rotate_camera_group_with_neighbours(cgroup, coords, others):
     return cgroup, combined[:, :K], combined[:, K:]
 
 
-def _crop_affine(src_wh, crop_coords, target_size, rotation):
+def crop_affine(src_wh, crop_coords, target_size, rotation):
     """The one dst<-src affine for rotate -> crop -> resize. Returns (M_2x3, (w, h)) or None.
 
     None means all three are no-ops and the caller should not warp at all. Composition is not a
     micro-optimisation: sequential rotate-then-crop warps the whole frame and resamples twice.
     The CORNER convention (`x_dst = (x_src - x1) * sx`) matches `crop.apply_crop`'s offset and
-    `_resize_camera`'s mat scale, so the pixels agree with the intrinsics `project_points_torch`
+    `resize_camera`'s mat scale, so the pixels agree with the intrinsics `project_points_torch`
     reprojects through. Out-of-source pixels arrive as BORDER_CONSTANT zeros.
     """
     w, h = src_wh
@@ -430,7 +430,7 @@ def load_warps(path, specs, target_size=None, reduce=1):
     src_wh = (img.shape[1], img.shape[0])
     out = []
     for crop_coords, rotation in specs:
-        aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
+        aff = crop_affine(src_wh, crop_coords, target_size, rotation)
         warped = (img if aff is None
                   else cv2.warpAffine(img, aff[0], aff[1], flags=cv2.INTER_LINEAR))
         out.append(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
@@ -642,7 +642,7 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
         dec = _reader(key, group, cam).get_batch(uniq)
     at = {i: dec[n] for n, i in enumerate(uniq)}
     src_wh = (dec.shape[2], dec.shape[1])
-    aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
+    aff = crop_affine(src_wh, crop_coords, target_size, rotation)
     out, seen = [], set()
     for i in want:
         im = at[i]
@@ -946,6 +946,14 @@ def shard_sessions(sessions, rank: int = 0, world_size: int = 1):
 
 
 class PoseDataset(Dataset):
+    """The pose training loader: one item is `shape` -> `select` -> `realise` -> `_targets`.
+
+    `shape(rng)`, `select(idx, rng, shape)` and `realise(sel, rng, world_gauge=)` are the public
+    seam the scorer builds on (one selection realised into two views). `shape` draws from the
+    rank-shared stream; `select` then `realise` consume the item's own stream in that order, so a
+    caller must keep that order to reproduce `__getitem__`.
+    """
+
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
                  train: bool | None = None, seed: int = 23,
                  registry_base: Registry | None = None, rank: int = 0,
@@ -1207,7 +1215,7 @@ class PoseDataset(Dataset):
         rng = np.random.default_rng(None if self.train else (self.seed, idx))
         shape_rng = (rng if ordinal is None
                      else np.random.default_rng((self.seed, 0x5AFE, int(ordinal))))
-        shape = self._shape(shape_rng)
+        shape = self.shape(shape_rng)
         for _ in range(8):
             out = self._item(idx, rng, shape)
             if out is not None:
@@ -1230,9 +1238,9 @@ class PoseDataset(Dataset):
             raise TypeError('get_once expects an integer index, not an ordinal/index tuple')
         idx = int(idx)
         rng = np.random.default_rng(None if self.train else (self.seed, idx))
-        return self._item(idx, rng, self._shape(rng))
+        return self._item(idx, rng, self.shape(rng))
 
-    def _shape(self, rng) -> dict:
+    def shape(self, rng) -> dict:
         """The cost-determining draws, made from a stream every rank shares. See `__getitem__`.
 
         Exactly the two draws that change how much WORK an item is and nothing else: the camera
@@ -1330,7 +1338,7 @@ class PoseDataset(Dataset):
         return coords.masked_fill(missing, float('nan'))
 
     def _item(self, idx, rng, shape=None):
-        """One window, built as `_select` -> `_realise` -> `_targets`.
+        """One window, built as `select` -> `realise` -> `_targets`.
 
         The three-way split is a SEAM, not a tidy-up: a view-independent selection can be
         realised into more than one view (`tailcyclenet/scorer/`), which a fused `_item` cannot
@@ -1339,20 +1347,20 @@ class PoseDataset(Dataset):
         `tests/test_dataset_select_realise.py`, which is the condition the split was approved
         on, not a nicety.
         """
-        sel = self._select(idx, rng, shape)
+        sel = self.select(idx, rng, shape)
         if sel is None:
             return None
-        view = self._realise(sel, rng)
+        view = self.realise(sel, rng)
         if view is None:
             return None
         return self._targets(sel, view, rng)
 
-    def _select(self, idx, rng, shape=None) -> Selection | None:
+    def select(self, idx, rng, shape=None) -> Selection | None:
         """Draw the view-independent part of a window, or None when the item cannot be built.
 
         Inputs: idx -- the index to pick.
                 rng -- the item's RNG stream.
-                shape -- a pre-drawn cost-determining shape dict (see `_shape`).
+                shape -- a pre-drawn cost-determining shape dict (see `shape`).
         Outputs: the `Selection`, or None (an index that resolves to no labelled frames, or a
         track with fewer than 2 finite coordinates).
 
@@ -1368,7 +1376,7 @@ class PoseDataset(Dataset):
         `coords` here is the CLEAN track at the stored coordinates -- untransformed, NaN where
         unlabelled. Every view-dependent coordinate lives in the `View`.
         """
-        shape = shape or self._shape(rng)
+        shape = shape or self.shape(rng)
         item = self._pick(idx, rng)
         sess, group = item.session, item.session.groups[item.gid]
         lab = sess.labels(item.gid)
@@ -1444,7 +1452,7 @@ class PoseDataset(Dataset):
                          attempt_swap_animal=attempt_swap_animal, neighbour_row=neighbour_row,
                          inflate=inflate)
 
-    def _realise(self, sel, rng, world_gauge=True) -> View | None:
+    def realise(self, sel, rng, world_gauge=True) -> View | None:
         """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
 
         Applies per-camera rotation, optional 2D flip, crop jitter and appearance augmentation.
@@ -1512,14 +1520,14 @@ class PoseDataset(Dataset):
                 flipped = True
                 if vis_2d is not None:
                     vis_2d = vis_2d[:, kpt_perm]
-            cp = _apply_affine(cp, rotation_info[0])
+            cp = apply_affine(cp, rotation_info[0])
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
                                                          inflate=inflate)
             if cam is None:
                 return None
-            cam, scale = _resize_camera(cam, self.cfg.image_size)
+            cam, scale = resize_camera(cam, self.cfg.image_size)
             scales = [scale]
             coords = coords * scale
             coords = _mask_outside(coords, cam['size'])
@@ -1528,7 +1536,7 @@ class PoseDataset(Dataset):
             if attempt_swap_animal:
                 raw = self._hybrid_2d_coords(
                     lab, neighbour_row, frames, sel.cgroup[0], sel.cam_ix[0])
-                raw = _apply_affine(raw, rotation_info[0])
+                raw = apply_affine(raw, rotation_info[0])
                 if flipped:
                     raw = raw[:, self._flip_perm[sel.sess.path]]
                 neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
@@ -1561,14 +1569,14 @@ class PoseDataset(Dataset):
                 cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
             cp3 = None if crop_pts is None else [
-                _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
+                apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
             jit = self._jitter(rng)
             cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
                                                       jit, crop_pts=cp3,
                                                       inflate=inflate)
             if cgroup is None:
                 return None
-            resized = [_resize_camera(c, self.cfg.image_size) for c in cgroup]
+            resized = [resize_camera(c, self.cfg.image_size) for c in cgroup]
             cgroup = [c for c, _ in resized]
             scales = [s for _, s in resized]
             if self.train and world_gauge:
@@ -1625,7 +1633,7 @@ class PoseDataset(Dataset):
         REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
 
         The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
-        last frame); the final 3D noisy-OR is over the FINAL `vis_2d` (done in `_realise`).
+        last frame); the final 3D noisy-OR is over the FINAL `vis_2d` (done in `realise`).
         The scorer never calls this: it supplies no prior and no box.
         """
         item, sess, lab, frames = sel.item, sel.sess, sel.lab, sel.frames
@@ -1769,7 +1777,7 @@ def _mask_outside(coords, size):
     return coords
 
 
-def _resize_camera(cam, target_res):
+def resize_camera(cam, target_res):
     """Scale a camera so its long side is `target_res`. Returns (cam, (sx, sy)).
 
     The output dimensions are integer pixels, so the affine actually applied by OpenCV has

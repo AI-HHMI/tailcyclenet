@@ -276,6 +276,10 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument('--gridresid-offset', default=None, choices=('query', 'triangulated'),
                      help='state the 3D residual anchor of a run folder written before '
                           '`[model].gridresid_offset` existed. Not a sweep knob.')
+    adv.add_argument('--assoc-random-drop', type=float, default=0.0, metavar='P',
+                     help='DIAGNOSTIC: reject each cross-view group that passes the gates with '
+                          'probability P (seed 0): the rate-matched random control for a gating '
+                          'lever (eval rule 14). Never a deployment arm.')
     adv.add_argument('--window-predictions', action='store_true',
                      help='write every window\'s pre-gate predictions to '
                           '<out>/window_predictions.pq')

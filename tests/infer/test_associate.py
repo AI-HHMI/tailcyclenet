@@ -380,3 +380,14 @@ def test_fast_associate_is_identical_to_the_reference():
                 assert g['members'] == h['members'] and g['residual'] == h['residual']
                 assert torch.equal(torch.nan_to_num(g['point'], nan=1e30),
                                    torch.nan_to_num(h['point'], nan=1e30))
+
+
+def test_random_drop_rejects_at_its_rate_and_zero_draws_nothing():
+    """The rule-14 control: p = 0 is the reference; p = 1 keeps nothing; p = 0.5 keeps some."""
+    from tailcyclenet.infer.associate import associate
+
+    cg, boxes = _p8_scene(80.0)
+    ref = associate(cg, boxes)
+    assert len(associate(cg, boxes, random_drop=(1.0, np.random.default_rng(0)))) == 0
+    assert _p8_key(associate(cg, boxes, random_drop=(0.0, np.random.default_rng(0)))) == \
+        _p8_key(ref)

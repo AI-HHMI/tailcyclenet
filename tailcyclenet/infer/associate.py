@@ -120,7 +120,8 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px, sides=None
 
 
 def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
-              max_res_sides=None, scores_per_cam=None, score_order=False, fast=False):
+              max_res_sides=None, scores_per_cam=None, score_order=False, fast=False,
+              random_drop=None):
     """Group boxes across cameras into 3D instances.
 
     Inputs:
@@ -131,12 +132,12 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             algorithm, not a parameter (every group starts from a cross-camera PAIR); `1`
             emits each leftover box as its own single-view instance with no triangulated point.
         max_instances -- cap on returned groups (0 = uncapped).
-        max_res_sides -- TR5, None (default) = the pixel gate. A float REPLACES `max_res_px` with
-            a scale-free gate: each view's residual is divided by that view's own box side, and
-            the pair, growth, support and refit gates all compare the median of those ratios.
+        max_res_sides -- TR5, None (default) = the pixel gate. A float REPLACES `max_res_px`:
+            every gate compares the median over views of residual / that view's box side.
         scores_per_cam / score_order -- TR6a: rank by (-support, -pair_score, residual),
             pair_score = the lower box score of the pair; False = (-support, residual).
         fast -- TR7 (`_fast_candidates`): the same groups with less work. Default False.
+        random_drop -- (p, rng) or None: DIAGNOSTIC rule-14 control, drops passing groups.
     Candidates rank by all-camera support count first, pair residual as tie-break (plan
     E1a/E3), never by the seeding pair's residual alone (which a phantom can always satisfy).
     Outputs:
@@ -215,6 +216,8 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         refined = triangulate(cams, pts, tuple(members[c] for c in cams))
         res_fit = res(cams, pts, refined, tuple(members[c] for c in cams))
         if not res_fit <= max_res_px:
+            continue
+        if random_drop is not None and random_drop[1].random() < random_drop[0]:
             continue
         out.append({'point': refined, 'residual': res_fit,
                     'boxes': {c: boxes_per_cam[c][members[c]] for c in cams},
@@ -326,7 +329,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0,
                     assoc_res_max_sides=None, assoc_score_order=False,
                     track_age_decay=None, track_affinity_2d=0.0, track_camera_claims=False,
-                    assoc_fast=False):
+                    assoc_fast=False, assoc_random_drop=0.0):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -348,9 +351,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             holds one (the tracker is built exactly once).
         assoc_res_max_sides / assoc_score_order -- `associate`'s `max_res_sides` (TR5) and
             `score_order` (TR6a), with or without a tracker; None / False are the shipped gates.
-        track_age_decay / track_affinity_2d / track_camera_claims -- the tracker's
-            `age_decay` (T2), `affinity_2d` (TR3) and `camera_claims` (TR2); inert without one.
+        track_age_decay / track_affinity_2d / track_camera_claims -- T2 / TR3 / TR2 (tracker).
         assoc_fast -- `associate`'s `fast` (TR7): identical groups with less work.
+        assoc_random_drop -- DIAGNOSTIC rule-14 control: drop passing groups at this rate.
     Outputs:
         The same pair re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -384,7 +387,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        age_decay=track_age_decay,
                                        affinity_2d=track_affinity_2d,
                                        camera_claims=track_camera_claims,
-                                       fast=assoc_fast)
+                                       fast=assoc_fast,
+                                       random_drop=assoc_random_drop)
         state['tracker'] = tracker
     tracker = state['tracker']
 
@@ -420,7 +424,10 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                            max_res_px=session.assoc_res_max_px, max_instances=S,
                            min_views=min_views, max_res_sides=assoc_res_max_sides,
                            scores_per_cam=[p[1] for p in per_cam],
-                           score_order=assoc_score_order, fast=assoc_fast)
+                           score_order=assoc_score_order, fast=assoc_fast,
+                           random_drop=(None if not assoc_random_drop else
+                                        (assoc_random_drop, state.setdefault(
+                                            'drop_rng', np.random.default_rng(0)))))
         if stats is not None:
             stats['association_groups'] = stats.get('association_groups', 0) + len(groups)
         for a, g in enumerate(groups[:S]):

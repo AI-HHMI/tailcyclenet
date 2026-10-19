@@ -71,6 +71,7 @@ def identity_provenance(args):
         'track_affinity_2d': float(args.track_affinity_2d),
         'track_camera_claims': bool(args.track_camera_claims),
         'assoc_fast': bool(args.assoc_fast),
+        'assoc_random_drop': float(args.assoc_random_drop),
     }
 
 

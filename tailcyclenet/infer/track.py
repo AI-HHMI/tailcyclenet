@@ -160,7 +160,7 @@ class CrossViewTracker:
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
                  duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0,
                  max_res_sides=None, score_order=False, age_decay=None, affinity_2d=0.0,
-                 camera_claims=False, fast=False):
+                 camera_claims=False, fast=False, random_drop=0.0):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -185,7 +185,7 @@ class CrossViewTracker:
                 age_decay (T2) -- None: the additive sticky-age term; lambda: `aff*exp(-l*age)`.
                 affinity_2d (TR3) -- w2 in `(1-w2)*A_3D + w2*A_2D` (`_affinity_2d`); 0 = A_3D.
                 camera_claims (TR2) -- per-camera claims after matching (`_claim_per_camera`).
-                fast (TR7) -- `associate(fast=True)`: identical groups, less work.
+                fast (TR7), random_drop (rule-14 control) -- passed to `associate`.
                 Every Phase-8 default is the shipped behaviour.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}. 'point' and 'age'
@@ -209,6 +209,8 @@ class CrossViewTracker:
         self.affinity_2d = float(affinity_2d)
         self.camera_claims = bool(camera_claims)
         self.fast = bool(fast)
+        self._random_drop = ((float(random_drop), np.random.default_rng(0))
+                             if random_drop else None)
         self.n_camera_claims = 0
         self._cam_history = {}
         self._residuals = {}
@@ -546,7 +548,7 @@ class CrossViewTracker:
         groups = associate(cgroup, boxes_per_cam, max_res_px=self.max_res_px,
                            min_views=self.min_views, max_res_sides=self.max_res_sides,
                            scores_per_cam=scores_per_cam, score_order=self.score_order,
-                           fast=self.fast)
+                           fast=self.fast, random_drop=self._random_drop)
         self.n_groups += len(groups)
         proj = {c: (_project(cgroup[c], pts) if slots else None) for c in range(C)}
         ages = {s: float(self.targets[s].get('age', 0)) for s in slots}

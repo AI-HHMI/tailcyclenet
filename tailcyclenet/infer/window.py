@@ -722,8 +722,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
-    def forward(frames, plan, crops, wi, window_det=None, *, score_quality=False):
+    def forward(frames, plan, crops, wi, window_det=None, *, score_quality=False, trace=True):
         """One animal, one window -> its prediction in the SOURCE frame, or None.
+
+        `trace` gates the overlap-trace probes (`prior_oob`, `model_conf`); `--refine`'s pass 1
+        passes False so each (animal, window) is recorded once, from the pass it reports.
 
         `frames` is a parameter for the same reason as `decode_crops`. `carried` is read here on
         the main thread only, in window order -- the window-order guarantee lives in the caller.
@@ -755,7 +758,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             return None
         prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
                                        scales, mode, K, R, cgroup)
-        if stats is not None and stats.get('capture_overlap_agreement') and prior is not None:
+        if (trace and stats is not None and stats.get('capture_overlap_agreement')
+                and prior is not None):
             _count_prior_oob(stats, a, int(frames[0]), prior)
         dev = cfg.device
         chunk = cfg.kpt_chunk or None
@@ -802,7 +806,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if cfg.anchor == 'self':
                 out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                   kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
-        if stats is not None and stats.get('capture_overlap_agreement'):
+        if trace and stats is not None and stats.get('capture_overlap_agreement'):
             _capture_model_confidence(stats, a, frames, out)
         p = out['coords_pred'][0].detach().cpu().numpy()
         q = None
@@ -886,7 +890,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             refined = []
             for plan in plans:
                 a, use, boxes, cgroup, scales, *_ = plan
-                got = forward(frames, plan, crops, wi, window_det)
+                got = forward(frames, plan, crops, wi, window_det, trace=False)
                 if got is None:
                     refined.append(_at_image_size(plan))
                     continue

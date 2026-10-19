@@ -2996,3 +2996,21 @@ def test_det_trace_file_is_valid_json(tmp_path):
     assert json.loads(path.read_text()) == {'s/g000': [{'frame': 0, 'kept': 2}]}
     assert path.read_text().endswith('}\n')
 
+
+def test_refine_records_each_overlap_trace_probe_once(multiwindow_scene):
+    """`--refine` runs `forward` twice per (animal, window); the overlap-trace probes
+    (`prior_oob`, `model_conf`) must record each (animal, window) once, not once per pass."""
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+
+    model, sess, registry, name = multiwindow_scene
+    counts = {}
+    for refine in (False, True):
+        stats = {'capture_overlap_agreement': True}
+        merge_blocks(run_blocks(model, sess, 'g000', registry, name,
+                                _cfg(anchor='carry', refine=refine), stats=stats))
+        oob = [(a, f) for a, f, *_ in stats.get('prior_oob', [])]
+        assert len(oob) == len(set(oob))
+        counts[refine] = (len(oob), len(stats.get('model_conf', [])))
+    assert counts[True][0] == counts[False][0] > 0
+    if counts[False][1]:
+        assert counts[True][1] == counts[False][1]

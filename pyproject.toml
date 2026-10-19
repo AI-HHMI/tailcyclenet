@@ -39,7 +39,7 @@ tailcyclenet = "tailcyclenet.__main__:main"
 # in the repo only.
 packages = [
     "tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer", "tailcyclenet.scorer",
-    "tailcyclenet.configs",
+    "tailcyclenet.configs", "tailcyclenet.pose",
 ]
 
 [tool.setuptools.package-dir]

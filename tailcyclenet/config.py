@@ -52,7 +52,7 @@ def check_image_size(config: dict) -> None:
     """`[model].image_size` and `[data].image_size` must agree; nothing else notices if they do
     not. The loader resizes crops to the data value while the weights bake the model value into
     the decode arithmetic -- both silent otherwise. `--refine-px` is the only thing that may walk
-    past this, because `model.PoseTrackerEncoder.forward` compensates for it.
+    past this, because `pose.model.PoseTrackerEncoder.forward` compensates for it.
     """
     model_px = config.get('model', {}).get('image_size')
     data_px = config.get('data', {}).get('image_size')

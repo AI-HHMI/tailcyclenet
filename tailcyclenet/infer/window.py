@@ -22,9 +22,9 @@ from tracktail.model.cube import project_points_torch
 from .. import crop as cropmod
 from .. import memory
 from ..dataset import crop_affine, resize_camera, prior_out_of_bounds
-from ..model import self_prompt
+from ..pose.prompt import self_prompt
 from ..format import Labels, Session
-from ..model import share_scene
+from ..pose.model import share_scene
 from .store import FrameStore
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
@@ -186,7 +186,7 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
     to begin with. 2D is the single-camera case. A camera absent from `use` is absent from the
     output too (never a NaN at the wrong index).
     """
-    from .. import box_prompt as bpmod
+    from ..pose import box_prompt as bpmod
 
     if mode == '3d' and src_pts is not None:
         pts = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)

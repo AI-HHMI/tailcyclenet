@@ -12,7 +12,7 @@ from tailcyclenet import checkpoints as ck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
 from tailcyclenet.scorer.checkpoint import load_scorer_run, save_scorer_checkpoint
-from tailcyclenet.model import build_model
+from tailcyclenet.pose.model import build_model
 
 from .test_model import SMALL
 

@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
-from tailcyclenet.model import build_model
+from tailcyclenet.pose.model import build_model
 from tailcyclenet.unfreeze import _norms_in_range, apply_staged_unfreeze
 
 # Everything structural from the shipped configs, everything expensive at its floor.
@@ -153,7 +153,7 @@ def test_kpt_chunk_matches_unchunked(moving_batch):
 
 def test_share_scene_matches_encoding_every_time(moving_batch):
     """`share_scene` encodes once but must still re-run the decode (the prior moves `coords_q`)."""
-    from tailcyclenet.model import share_scene
+    from tailcyclenet.pose.model import share_scene
 
     b = moving_batch
     model = _model(b)
@@ -540,7 +540,7 @@ def test_single_view_predicts_the_mean_ray_point(moving_batch):
 
 def test_uncalibrated_singleview_uses_finite_unit_anchor(moving_batch):
     """A nominal one-camera inference has no metric scale, but must not emit NaN XYZ."""
-    from tailcyclenet.model import scene_center
+    from tailcyclenet.pose.anchor import scene_center
 
     b = moving_batch
     cam = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in
@@ -658,7 +658,7 @@ def test_gradients_reach_the_unfrozen_blocks_only(moving_batch):
 def test_2d_forward_shapes_match_pose_loss_expectations(tiny_root):
     """A real R == 2 forward's `vis_pred_2d` pairs with the collate's `vis_2d` in `PoseLoss` and
     runs a finite backward into the query encoder."""
-    from tailcyclenet.losses import PoseLoss
+    from tailcyclenet.pose.losses import PoseLoss
 
     ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG, train=False)
     b = next((it for it in (pose_collate([ds[i]]) for i in range(len(ds)))

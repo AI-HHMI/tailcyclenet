@@ -18,7 +18,7 @@ from tracktail.model.train_utils import (_convert_cross_attn, _filter_shape_mism
 
 from .config import check_image_size
 from .format import Registry
-from .model import build_model
+from .pose.model import build_model
 
 # What a checkpoint or run folder is a checkpoint OF. A run folder's kind lives in its config as
 # `[run] kind`; a checkpoint's lives in the file. Both are written by `save_run_meta` /

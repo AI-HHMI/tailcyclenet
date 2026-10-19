@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import tailcyclenet.render as render_cli
 from tailcyclenet.format import Registry, load_dataset
 from tailcyclenet.infer import cli as infer_cli
-from tailcyclenet.model import build_model
+from tailcyclenet.pose.model import build_model
 from test_model import SMALL
 
 

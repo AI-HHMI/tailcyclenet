@@ -24,7 +24,7 @@ from einops import rearrange, repeat
 from tracktail.model.cube import (get_camera_scale, points_to_rays, project_points_torch)
 from tracktail.model.encoder_decoder import AttentionPooling
 
-from ..model import PoseTrackerEncoder, build_model
+from ..pose.model import PoseTrackerEncoder, build_model
 
 
 SCORER_OUTPUT_GRANULARITIES = ('sequence', 'frame')

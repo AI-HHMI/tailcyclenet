@@ -3,7 +3,7 @@ import pytest
 import torch
 from tracktail.model.losses import BCELossVis, TotalLoss
 
-from tailcyclenet.losses import PoseLoss, masked_bce_with_logits
+from tailcyclenet.pose.losses import PoseLoss, masked_bce_with_logits
 
 
 # ----------------------------------------------------------------------------------------------

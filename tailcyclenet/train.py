@@ -24,8 +24,8 @@ from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
 from tailcyclenet.config import BASE_CONFIG, check_image_size, load_config
 from tailcyclenet.dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
                                   pose_collate, worker_init)
-from tailcyclenet.losses import PoseLoss
-from tailcyclenet.model import build_model
+from tailcyclenet.pose.losses import PoseLoss
+from tailcyclenet.pose.model import build_model
 from tailcyclenet.optim import KNOWN_OPTIMIZER_KEYS
 from tailcyclenet.runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from tailcyclenet.start import build_start, plan_start
@@ -255,8 +255,8 @@ def evaluate(model, batches, optimizer, device, fabric=None):
     """
     from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
 
-    from tailcyclenet.model import self_prompt
-    from tailcyclenet.model import share_scene
+    from tailcyclenet.pose.prompt import self_prompt
+    from tailcyclenet.pose.model import share_scene
 
     model.eval()
     if hasattr(optimizer, 'eval'):

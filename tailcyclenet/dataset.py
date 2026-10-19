@@ -172,8 +172,8 @@ class LoaderConfig:
     def _check_values(self) -> None:
         """Refuse, at construction, the values the loader would otherwise first trip over inside a
         worker at the first item -- or, for `box_prompt`, silently read as ON."""
-        from .box_prompt import BOX_PROMPT_FRAMES
-        from .query_encoder import BOX_MODES
+        from .pose.box_prompt import BOX_PROMPT_FRAMES
+        from .pose.query_encoder import BOX_MODES
 
         sampling = ('true-2d-hybrid-v1', 'legacy-3d-single-view')
         if self.two_d_sampling not in sampling:
@@ -1734,7 +1734,7 @@ class PoseDataset(Dataset):
         out = [views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
                vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t]
         if self.cfg.box_prompt != 'none':
-            from . import box_prompt as bpmod
+            from .pose import box_prompt as bpmod
             box = bpmod.compute_box_prompt(coords, cgroup, '2d' if R == 2 else '3d')
             box = bpmod.apply_frames_mode(box, self.cfg.box_prompt_frames)
             if self.train:

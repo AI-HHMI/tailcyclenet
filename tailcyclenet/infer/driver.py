@@ -35,7 +35,7 @@ def _refuse_selector_beside_file(path, selector, flag, selector_flag, default=No
 def _share_pose_scorer_encoder(pose_model, scorer_model, *, allow_mismatch,
                                pose_run, scorer_run) -> bool:
     """Share the raw video backbone, refusing unequal weights without explicit opt-in."""
-    from ..model import share_video_encoder_if_identical
+    from ..pose.model import share_video_encoder_if_identical
 
     shared = share_video_encoder_if_identical(pose_model, scorer_model)
     if not shared and not allow_mismatch:

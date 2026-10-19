@@ -22,7 +22,7 @@ def mv16(tmp_path_factory):
     """(model, session, registry, name): a static 3-camera 3D session, T=16 (seven windows)."""
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.model import build_model
+    from tailcyclenet.pose.model import build_model
     from test_model import SMALL
 
     root = tmp_path_factory.mktemp('mv16')

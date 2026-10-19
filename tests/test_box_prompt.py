@@ -11,10 +11,10 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet import box_prompt as bpmod
+from tailcyclenet.pose import box_prompt as bpmod
 from tailcyclenet import crop as cropmod
-from tailcyclenet.model import build_model
-from tailcyclenet.query_encoder import (BoxFilmEncoder, WideQueryEncoder,
+from tailcyclenet.pose.model import build_model
+from tailcyclenet.pose.query_encoder import (BoxFilmEncoder, WideQueryEncoder,
                                         _normalize_box)
 from test_model import SMALL
 

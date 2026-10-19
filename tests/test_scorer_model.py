@@ -9,10 +9,10 @@ import pytest
 import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
-from tailcyclenet.query_encoder import _tile_to_query_axis
+from tailcyclenet.pose.query_encoder import _tile_to_query_axis
 from tailcyclenet.scorer import build_scorer
 from tailcyclenet.scorer.model import FrameCameraPooling
-from tailcyclenet.model import build_model, share_video_encoder_if_identical
+from tailcyclenet.pose.model import build_model, share_video_encoder_if_identical
 
 from .test_model import SMALL
 

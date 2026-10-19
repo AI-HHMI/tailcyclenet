@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from tailcyclenet.format import Registry, load_dataset
 from tailcyclenet.infer.window import InferConfig, run_group
-from tailcyclenet.model import build_model
+from tailcyclenet.pose.model import build_model
 from test_model import SMALL
 
 
@@ -187,7 +187,7 @@ def test_scorer_encoder_mismatch_requires_explicit_opt_in():
 def test_integrated_scorer_shares_scene_and_preserves_pose(rat):
     model, sess, registry, name = rat
     from tests.test_scorer_model import _scorer
-    from tailcyclenet.model import share_video_encoder_if_identical
+    from tailcyclenet.pose.model import share_video_encoder_if_identical
 
     scorer = _scorer(registry.n_keypoints, stride_length=4,
                      output_granularity='frame').eval()
@@ -441,7 +441,7 @@ def test_deploy_box_prompt_lands_inside_the_crop_2d():
 
 def test_deploy_box_prompt_3d_labels_matches_the_training_computation(mv):
     """3D `labels` box prompt is byte-identical to `compute_box_prompt` (deploy/train parity)."""
-    from tailcyclenet import box_prompt as bpmod
+    from tailcyclenet.pose import box_prompt as bpmod
     from tailcyclenet.infer.window import _deploy_box_prompt
 
     _, sess, _, _ = mv
@@ -506,7 +506,7 @@ def test_box_prompt_detector_per_camera_degradation():
 
 def test_box_prompt_column_order_matches_use():
     """Column i of the box prompt is built from `use[i]`'s own box/scale/cgroup, not a neighbour's."""
-    from tailcyclenet import box_prompt as bpmod
+    from tailcyclenet.pose import box_prompt as bpmod
     from tailcyclenet.infer.window import _deploy_box_prompt
 
     T = 2

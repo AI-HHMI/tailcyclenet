@@ -1273,7 +1273,8 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     rule 2 (names unique; skeleton/flip_pairs reference known names; flip is an involution --
     each pair is listed once, and the involution is the symmetric closure, so the only way to
     break it is to name a keypoint in two pairs with different partners); rules 4/5 (cameras
-    and calibration); rule 9 (no duplicate keys); rule 10 (a
+    and calibration); rule 6 (every label-table `group_id` is in groups.pq); rule 9 (no
+    duplicate keys); rule 10 (a
     positioned row -- visible or projected -- carries its coordinates); rule 11 (a `labeled`
     instance row carries a finite, non-empty box; prediction sessions are exempt); rule 6 (no
     stale `regions.pq`); rule 13
@@ -1358,6 +1359,16 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         n = len(table)
         if n and len(table.select(cols).group_by(list(cols)).aggregate([])) != n:
             bad(9, f'{stem}.pq has duplicate keys')
+
+    for stem in ('keypoints', 'points3d', 'instances', 'extrinsics'):
+        table = sess._tables[stem]
+        if table is None or not len(table) or 'group_id' not in table.column_names:
+            continue
+        codes, values = _codes(table, 'group_id')
+        unknown = sorted({values[c] for c in np.unique(codes)} - set(sess.groups))
+        if unknown:
+            bad(6, f'{stem}.pq has {len(unknown)} group_id(s) not in groups.pq, e.g. '
+                   f'{unknown[0]!r}; their rows are never read')
 
     t2p = sess._tables['points2d']
     if t2p is not None:
@@ -1454,7 +1465,7 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         gcodes, gvals = _codes(te, 'group_id')
         frames = te.column('frame').combine_chunks().to_numpy(zero_copy_only=False)
         ccodes, cvals = _codes(te, 'camera')
-        for gid, g in sess.groups.items():
+        for gid, g in (sess.groups.items() if moving else ()):
             if gid not in gvals:
                 bad(13, f'group {gid!r}: cameras {sorted(moving)} are moving=true but '
                         f'extrinsics.pq has no rows for it')

@@ -760,3 +760,40 @@ def test_a_video_session_never_reads_a_table(tmp_path):
     sess.preload()
     assert sess.labels('g0') is lab or sess.labels('g0').points3d.shape == lab.points3d.shape
     assert sess._table('points3d') is None
+
+
+def _rule_errs(path, check_images=True):
+    """validate_session's errors for the session at `path`."""
+    return fmt.validate_session(fmt.Session.load(path), check_images=check_images)
+
+
+def test_rule_6_rows_with_an_unknown_group_id_are_an_error(tmp_path):
+    """A typo'd group id used to vanish silently: `labels()` scatters only known groups."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(s)
+    assert not _rule(_rule_errs(s, False), 6)
+    t = pq.read_table(s / 'keypoints.pq').to_pydict()
+    t = {k: v + (['no_such_group'] if k == 'group_id' else v[:1]) for k, v in t.items()}
+    pq.write_table(pa.table(t), s / 'keypoints.pq')
+    errs = _rule(_rule_errs(s, False), 6)
+    assert errs and 'no_such_group' in errs[0]
+
+
+def test_rule_13_is_quiet_for_a_static_rig_with_a_partial_extrinsics_table(tmp_path):
+    """No camera is moving, so the only error is the one naming the static camera."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_3d(s)
+    g = pq.read_table(s / 'groups.pq').to_pydict()
+    g = {k: v + ['g001' if k == 'group_id' else v[0]] for k, v in g.items()}
+    pq.write_table(pa.table(g), s / 'groups.pq')
+    pq.write_table(pa.table({'group_id': ['g000'], 'frame': [0], 'camera': ['cam0'],
+                             'ext': [np.eye(4).ravel().tolist()]}), s / 'extrinsics.pq')
+    errs = _rule(_rule_errs(s, False), 13)
+    assert len(errs) == 1 and 'not moving=true' in errs[0], errs
+

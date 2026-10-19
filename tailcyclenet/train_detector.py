@@ -293,14 +293,14 @@ def main(argv: list[str] | None = None):
       split. `CohortSampler` therefore ALWAYS runs, `ChunkShuffle` is no longer a
       train fallback, `annot_frac` overrides the otherwise-natural cohort share,
       and `alpha`/W1.1/A6/A6c compose on top. The realised mix is PRINTED.
-    - No `val/` is the only thing swallowed; config errors fail at construction.
-      A COCO-pretrained backbone gets BACKBONE_LR_SCALE x lr (COCO convs, fresh
-      GroupNorm net).
+    - No `val/` is the only thing swallowed; config errors fail at construction. A
+      COCO-pretrained backbone gets BACKBONE_LR_SCALE x lr (COCO convs, fresh GroupNorm net).
     - `detector.pth` is the BEST checkpoint, not the last one (recall peaks
       early on partially-labelled roots); every `detector_it*.pth` is still
       written. Evaluation scores both splits, stores the score beside the
       weights, and selects on `val` where there is one (`train` otherwise);
       the loader does NOT trust `detector_last.pth`.
+    - `obj_quantiles` come from the selection split only (`val` where there is one, else `train`).
     - `model_state` IS THE SCORED WEIGHT. Under schedule-free, `opt.eval()` swaps in the
       averaged `x` for scoring and `opt.train()` swaps the SAME tensors back to the gradient point
       `y` in place, so `x` is cloned before the swap; saving after it deployed weights nobody had

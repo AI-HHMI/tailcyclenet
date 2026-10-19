@@ -325,7 +325,8 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
     process-wide -- so with the budget resolved BELOW the input branch the override was not in
     effect during the probe, and any consumer that asked would have got the HOST figure.
     """
-    from tailcyclenet import adopt, memory
+    from tailcyclenet import memory
+    from tailcyclenet.infer import adopt
     from tailcyclenet.infer import driver
 
     memory.reset()
@@ -375,7 +376,8 @@ def test_the_probe_is_inside_the_budget_partition():
     comes out of `FRACTION_READERS` rather than sitting outside a partition that sums to 1.00.
     It does NOT change the number on any rig anyone has run -- an open reader retains ~0.03 GB.
     """
-    from tailcyclenet import adopt, memory
+    from tailcyclenet import memory
+    from tailcyclenet.infer import adopt
 
     big = memory.host_budget(override_gb=1024)
     assert adopt.probe_workers(16, big) == adopt.PROBE_WORKERS_MAX

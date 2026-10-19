@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from tailcyclenet import adopt
+from tailcyclenet.infer import adopt
 from tailcyclenet import format as fmt
 
 from .conftest import KPTS_3D, _rig, _write_video

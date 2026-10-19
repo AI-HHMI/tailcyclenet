@@ -136,7 +136,7 @@ def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
     """A directory session and an `adopt.build` (--videos) session over the SAME mp4 render
     byte-identical frames."""
     import conftest as cf
-    from tailcyclenet import adopt
+    from tailcyclenet.infer import adopt
     from tailcyclenet import format as fmt
     from tailcyclenet.render import render_group
 

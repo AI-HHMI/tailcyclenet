@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import format as fmt
+from .. import format as fmt
 
 # How many videos to probe at once. It is I/O, so it parallelises; bounded by the READER share
 # of the RAM budget (an un-budgeted consumer is how the next one gets added), and cheap -- an
@@ -31,7 +31,7 @@ _PROBE_READER_BYTES = 0.05 * (1 << 30)
 def probe_workers(n_videos: int, budget=None) -> int:
     """How many containers the probe may hold open at once. Never above `PROBE_WORKERS_MAX`, never
     below 1, and bounded by the reader share of the RAM budget."""
-    from . import memory
+    from .. import memory
 
     b = memory.current() if budget is None else budget
     return memory.fits(b.share(memory.FRACTION_READERS), _PROBE_READER_BYTES,
@@ -87,23 +87,9 @@ def parse_name(stem: str, cam_regex: str | None) -> tuple[str, str]:
 def _stable_path(q: Path) -> Path:
     """Absolute, WITHOUT resolving any symlink -- at the leaf or anywhere in the parent chain.
 
-    `Path.resolve()` follows every symlink it encounters, including the file itself, to its
-    real target's own path -- fine for an ordinary symlink, but silently wrong for one whose
-    own name carries meaning, e.g. a per-camera video symlink renamed to a normalized trial
-    timestamp while its target (elsewhere, out of this package's control) keeps the
-    pre-normalization name. `parse_name` reads camera/trial-group identity from THIS basename
-    (see `plan`'s Refusal 3/4 just below it), so resolving through a renamed symlink's target
-    silently reverts the rename and splits one trial into mismatched groups with no error until
-    the missing-camera refusal fires downstream, naming a group id that matches no file anyone
-    actually passed in. `Path.absolute()` (no filesystem access, unlike `.resolve()`) prepends
-    the working directory without touching any symlink at all, so a renamed symlink's OWN path
-    -- not its target's -- is what gets recorded, matching what was actually passed on the
-    command line or found in a directory listing. This still gives `_expand`'s docstring the
-    stability it wants (a `--videos rec/` that later grows a file does not reconstruct
-    differently) as long as the same working directory is used across a run and any later
-    replay of its provenance -- the one case `.resolve()`'s extra `..`/symlink normalization
-    would have additionally covered, traded away here because it is exactly the same mechanism
-    that caused this bug.
+    `parse_name` reads camera/trial identity from THIS basename, so resolving a renamed symlink to
+    its target's name would silently split one trial into mismatched groups. `absolute()` touches
+    no symlink; the price is that provenance replays need the same working directory.
     """
     return q.absolute()
 
@@ -351,7 +337,7 @@ def _probe(path: Path) -> tuple[int, tuple[int, int], float]:
     the decoder fails inside the window loop), and NOT from `reader_cache.reader`, whose size would
     be fixed before the run's own budget is resolved. The open also warms the page cache.
     """
-    from .data import video
+    from ..data import video
 
     vr = video.open_reader(str(path))
     try:
@@ -463,7 +449,7 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
         print(f'--videos: session {sess.session_id!r}, mode {sess.mode}, units {sess.units!r} '
               f'(a DECLARATION about the calibration, not a measurement), {len(groups)} group(s), '
               f'{len(plan.rig)} camera(s)')
-    from . import memory
+    from .. import memory
     memory.trim()
     memory.check_peak('the --videos probe')
     return sess

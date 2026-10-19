@@ -276,7 +276,7 @@ def session_for_prediction(pred, data=None, split=None):
 
     import pyarrow.parquet as pq
 
-    from . import adopt
+    from .infer import adopt
     from .format import sessions_for
 
     pred = Path(pred)

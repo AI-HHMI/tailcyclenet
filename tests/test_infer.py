@@ -1786,7 +1786,7 @@ def test_2d_videos_without_calibration_defaults_to_px_and_nominal_cam(cli, monke
     got = Session.load(out)
     assert got.mode == '2d' and got.units == 'px'
     assert got.cam_names == ['cam0'] and got.rig.size('cam0') == wh
-    from tailcyclenet import adopt
+    from tailcyclenet.infer import adopt
     back = adopt.session_from_prediction(out)
     assert back.cam_names == ['cam0'] and back.rig.size('cam0') == wh
     with open(out / 'session.toml', 'rb') as f:
@@ -1858,7 +1858,7 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
 
     assert not validate_session(Session.load(tmp_path / 'dumped'))
 
-    from tailcyclenet import adopt
+    from tailcyclenet.infer import adopt
     back = adopt.session_from_prediction(out)
     assert back.groups['t'].source('0')[1] == vids['0'].resolve()
 

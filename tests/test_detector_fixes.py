@@ -77,17 +77,13 @@ def test_convnext_config_refuses_an_input_side_not_divisible_by_32(tmp_path):
 
 
 def test_load_detector_refuses_a_convnext_size_not_divisible_by_32(tmp_path):
-    """B3: a convnext-t checkpoint with a side not divisible by 32 is refused at load, not by an
-    opaque RuntimeError in `detect_raw`'s first forward."""
-    from tailcyclenet.detector import YOLOXNano, load_detector
-    model = YOLOXNano(version='convnext-t')
-    for wh in ([128, 96], [120, 96]):
-        torch.save({'kind': 'detector', 'input_wh': wh, 'norm': 'gn',
-                    'yolox_version': 'convnext-t', 'model_state': model.state_dict()},
-                   tmp_path / f'det{wh[0]}.pth')
-    assert load_detector(tmp_path / 'det128.pth').input_wh == (128, 96)
+    """B3: a convnext-t checkpoint with a side not divisible by 32 is refused at load, before any
+    weights are built, not by an opaque RuntimeError in `detect_raw`'s first forward."""
+    from tailcyclenet.detector import load_detector
+    torch.save({'kind': 'detector', 'input_wh': [120, 96], 'norm': 'gn',
+                'yolox_version': 'convnext-t', 'model_state': {}}, tmp_path / 'det.pth')
     with pytest.raises(ValueError, match='divisible by 32'):
-        load_detector(tmp_path / 'det120.pth')
+        load_detector(tmp_path / 'det.pth')
 
 
 def _saved_detector(tmp_path, **meta):

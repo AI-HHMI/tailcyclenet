@@ -292,7 +292,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     return table, registry, config
 
 
-def _non_missing(table: pl.DataFrame, name: str) -> pl.Expr:
+def non_missing(table: pl.DataFrame, name: str) -> pl.Expr:
     """Match the table backend's default missing-value policy for a grouping/aggregate column."""
     expr = pl.col(name).is_not_null()
     if table.schema[name] in (pl.Float32, pl.Float64):
@@ -347,7 +347,7 @@ def _rank_frame(table: pl.DataFrame, top: int = 10) -> str:
         valid = pl.col('observed').fill_null(False)
     else:
         valid = pl.lit(True)
-    valid = valid & _non_missing(aggregate, 'score')
+    valid = valid & non_missing(aggregate, 'score')
     usable = aggregate.filter(valid)
     if usable.is_empty():
         return 'no observed frame/keypoint rows were scored'
@@ -401,9 +401,9 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
     group_keys = ['dataset', 'session', 'group', 'animal']
     keypoint_keys = ['dataset', 'session', 'group', 'keypoint']
     aggregate = _aggregate_input(table)
-    group_input = aggregate.filter(pl.all_horizontal([_non_missing(aggregate, k)
+    group_input = aggregate.filter(pl.all_horizontal([non_missing(aggregate, k)
                                                        for k in group_keys]))
-    kpt_input = aggregate.filter(pl.all_horizontal([_non_missing(aggregate, k)
+    kpt_input = aggregate.filter(pl.all_horizontal([non_missing(aggregate, k)
                                                      for k in keypoint_keys]))
     per_group = (group_input.group_by(group_keys, maintain_order=True)
                  .agg(pl.col('score').min().alias('worst'),
@@ -416,7 +416,7 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
                     pl.col('n_observed_frames').median().alias('obs'))
                .sort(['median', *keypoint_keys], nulls_last=True, maintain_order=True))
 
-    n_groups = table.filter(_non_missing(table, 'group')).get_column('group').n_unique()
+    n_groups = table.filter(non_missing(table, 'group')).get_column('group').n_unique()
     lines = [f'scored {table.height} (window, keypoint) rows over '
              f'{n_groups} group(s)',
              '',

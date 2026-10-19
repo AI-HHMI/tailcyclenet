@@ -1,5 +1,6 @@
 """Suite-wide fixtures: the tiny synthetic roots, small model widths, cached provenance."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -29,6 +30,21 @@ def _small_hybrid_detector(monkeypatch):
     monkeypatch.setattr(yolox, 'NECK_WIDTH', 32)
     init = hybrid.HybridBackbone.__init__
     monkeypatch.setattr(init, '__defaults__', (8, (1, 1), 8, 4.0, True))
+
+
+@pytest.fixture(autouse=True)
+def _seeded_global_rngs():
+    """Every test starts from the same torch / numpy-legacy / `random` state.
+
+    Without it a test drawing `torch.rand` inputs sees whatever state the tests xdist happened to
+    run before it left behind, so a property that holds for almost every draw fails at random.
+    Entropy-seeded streams (`np.random.default_rng()`, train items) are untouched by design: a
+    test over those must draw enough to fail with P < 1e-9."""
+    import random
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
 
 
 @pytest.fixture(scope='session', autouse=True)

@@ -499,11 +499,11 @@ def test_prompt_dropout_is_per_item_not_per_keypoint(tiny_root):
 
     ds5 = PoseDataset(tiny_root / 'ratlike', 'train', cfg(0.5))
     seen = set()
-    for _ in range(24):
+    for _ in range(32):                            # P(one outcome only) = 2 * 0.5^32 ~ 5e-10
         nan = torch.isnan(_batch(ds5).kpt_prior)
         assert nan.all() or not nan.any(), 'dropout mixed within one window -> it is per-keypoint'
         seen.add(bool(nan.all()))
-    assert seen == {True, False}, f'p=0.5 never produced both outcomes in 24 draws: {seen}'
+    assert seen == {True, False}, f'p=0.5 never produced both outcomes in 32 draws: {seen}'
 
 
 def test_window_is_sized_to_the_labelled_span(tiny_root, centred_root):
@@ -923,15 +923,16 @@ def test_a_stale_prior_is_a_wrong_position_not_a_withdrawn_one(tiny_root):
                             prompt_dropout=0.0, prob_2d_only=0.0, **kw)
 
     base = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg()))
+    stale = PoseDataset(tiny_root / 'ratlike', 'train', cfg(prompt_stale_frames=3))
     moved = False
-    for _ in range(10):
-        b = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg(prompt_stale_frames=3)))
+    for _ in range(16):                            # P(d = 0 every draw) = 0.25^16 ~ 2e-10
+        b = _batch(stale)
         assert torch.isnan(b.kpt_prior).sum() == torch.isnan(base.kpt_prior).sum(), \
             'staleness must not withhold a prior'
         # `prompt_t` still claims the first labelled frame; only the POSE came from elsewhere.
         assert (b.prompt_t == base.prompt_t).all()
         moved |= not torch.allclose(b.kpt_prior, base.kpt_prior, equal_nan=True)
-    assert moved, 'prompt_stale_frames=3 never moved the prior in 10 draws'
+    assert moved, 'prompt_stale_frames=3 never moved the prior in 16 draws'
 
 
 def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():

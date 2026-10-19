@@ -96,7 +96,6 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
     return {
         'detector': str(Path(args.detector).resolve()) if args.detector else '',
         'detector_checkpoint': str(getattr(args, '_detector_checkpoint', '') or ''),
-        'det_input_wh': str(args.det_input_wh or ''),
         'det_score': float(args.det_score),
         'det_nms_iou': float(getattr(args, 'det_nms_iou', 0.5)),
         'det_nms_center_dist': (float(args.det_nms_center_dist)
@@ -290,7 +289,7 @@ def check_frame_range(args) -> None:
 
 
 def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
-                    stats=None, independent=False, box_source=None):
+                    stats=None, box_source=None):
     """-> `boxes_for(store, lo, hi)`, detecting and associating on demand for one group.
 
     The detection cursor is not the block cursor: blocks are sized by free memory, and a
@@ -314,8 +313,6 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
     T = min(sess.groups[gid].n_frames, args.frame_stop or sess.groups[gid].n_frames)
     assoc_state, buf = {}, {}
     cursor = args.frame_start - args.frame_start % _DET_BATCH
-    raw_buf = {}
-    window_cursor = cursor
 
     def boxes_for(store, lo, hi):
         """Boxes for the frames [lo, hi): detect/associate on demand, served from the buffer.
@@ -371,56 +368,6 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             del buf[t]
         return out
 
-    if independent:
-        def for_window(store, lo, hi, keep_from=None, ordinal=None):
-            """Raw detections are group-batched; only association is window-local."""
-            nonlocal window_cursor
-            while window_cursor < hi:
-                end = min(window_cursor + _DET_BATCH, T)
-                raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
-                                 score_thresh=args.det_score, reduce=det_red,
-                                 iou_thresh=getattr(args, 'det_nms_iou', 0.5),
-                                 center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
-                                 max_frames=T, tile_scale=det_tile, box_source=box_source,
-                                 frames=np.arange(window_cursor, end),
-                                 trace=(stats.setdefault('decode_trace', [])
-                                        if getattr(args, 'det_trace', None) else None),
-                                 read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
-                                     ci, cam, fr, pool=pool, reduce=reduce))
-                for j, frame in enumerate(range(window_cursor, end)):
-                    raw_buf[frame] = tuple(None if x is None else x[:, j].copy() for x in raw)
-                window_cursor = end
-            frames = list(range(lo, min(hi, T)))
-            if not frames:
-                raise ValueError(f'empty independent detector window [{lo}, {hi})')
-            raw_window = tuple(None if raw_buf[frames[0]][i] is None else
-                               np.stack([raw_buf[t][i] for t in frames], axis=1)
-                               for i in range(3))
-            local_stats, local_state = {}, {}
-            b, sc, kp = associate_group(
-                raw_window, sess, gid, n_want, link=args.link_boxes,
-                min_views=args.min_views, track=args.track, max_move=args.max_move,
-                max_age=getattr(args, 'max_age', 8), stats=local_stats,
-                pose_nms=args.pose_nms, state=local_state, duplicate_radius=getattr(
-                    args, 'duplicate_radius', 0.75), duplicate_persist=getattr(
-                    args, 'duplicate_persist', 5), frame_base=lo)
-            if stats is not None:
-                for key, value in local_stats.items():
-                    if isinstance(value, (int, float, np.number)):
-                        stats[key] = stats.get(key, 0) + value
-                tracker = local_state.get('tracker')
-                if tracker is not None and tracker.events:
-                    events = [dict(event, window=int(ordinal if ordinal is not None else -1))
-                              for event in tracker.events]
-                    stats.setdefault('identity_events', []).extend(events)
-                stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
-                stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
-            next_start = T if keep_from is None else int(keep_from)
-            for t in [t for t in raw_buf if t < next_start]:
-                del raw_buf[t]
-            return b, sc, kp
-
-        boxes_for.for_window = for_window
     return boxes_for
 
 
@@ -465,7 +412,6 @@ def run_dataset(args):
     than trusted. Decode's share is printed beside the wall clock.
     """
 
-    independent = bool(getattr(args, 'independent_windows', False))
     scorer_path = getattr(args, 'scorer', None)
     scorer_checkpoint_name = getattr(args, 'scorer_checkpoint', None)
     allow_pose_scorer_mismatch = bool(getattr(args, 'allow_pose_scorer_mismatch', False))
@@ -479,20 +425,6 @@ def run_dataset(args):
                                  '--scorer-checkpoint')
     _refuse_selector_beside_file(args.detector, getattr(args, 'detector_checkpoint', None),
                                  '--detector', '--detector-checkpoint', default='latest')
-    if independent:
-        if not args.detector:
-            raise SystemExit('--independent-windows requires --detector; labels and --boxes preserve row identity.')
-        if args.anchor != 'none':
-            raise SystemExit('--independent-windows requires --anchor none; carry/self/labels are incompatible.')
-        if args.boxes:
-            raise SystemExit('--independent-windows refuses --boxes; use --detector for per-window association.')
-        if getattr(args, 'identity_bridge', False) or getattr(args, 'fill_from', None):
-            raise SystemExit('--independent-windows refuses --identity-bridge and --fill-from (identity continuity assumed).')
-        if getattr(args, 'overlap_trace', None):
-            raise SystemExit('--independent-windows refuses --overlap-trace (slot comparisons cross identities).')
-        if args.box_prompt == 'labels':
-            raise SystemExit('--independent-windows refuses --box-prompt labels.')
-
     if args.anchor == 'labels':
         if args.detector or args.boxes:
             raise SystemExit(
@@ -713,7 +645,7 @@ def run_dataset(args):
         crop_source=args.crop_source,
         box_prompt=box_prompt, box_prompt_first_only=box_prompt_first_only,
         crop_inflate=crop_inflate,
-        prefetch_windows=args.prefetch_windows, independent_windows=independent,
+        prefetch_windows=args.prefetch_windows,
         capture_window_predictions=bool(args.window_predictions))
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
@@ -727,7 +659,7 @@ def run_dataset(args):
         det_path = resolve_detector_checkpoint(args.detector, args.detector_checkpoint)
         args._detector_checkpoint = str(det_path.resolve())
         det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile, det_objq = load_detector(
-            det_path, device, input_wh=args.det_input_wh)
+            det_path, device)
         if det_objq and args.det_score >= det_objq.get('q50', 0.0):
             print(f'WARNING: --det-score {args.det_score} is at or above this detector\'s MEDIAN '
                   f'objectness ({det_objq["q50"]:.4f}), so it discards at least half of the '
@@ -800,7 +732,6 @@ def run_dataset(args):
                             'checkpoint': str(Path(ckpt).resolve()),
                             'checkpoint_name': ckpt.name,
                             'anchor': cfg.anchor, 'carry_source': cfg.carry_source,
-                            'independent_windows': bool(cfg.independent_windows),
                             'window_predictions': bool(args.window_predictions),
                             'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
                             'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
@@ -852,7 +783,7 @@ def run_dataset(args):
                       flush=True)
                 boxes_for = _detector_boxes(
                     det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
-                    stats=det_stats, independent=independent, box_source=det_boxsrc)
+                    stats=det_stats, box_source=det_boxsrc)
             if args.boxes and key not in boxes:
                 raise SystemExit(
                     f'{args.boxes}: no entry for {key!r}. Falling back to the labels here would '
@@ -927,9 +858,7 @@ def run_dataset(args):
     if getattr(args, 'identity_bridge', False):
         from . import bridge as _bridge
         _cfg = _bridge.BridgeConfig()
-        _fill_dir = getattr(args, 'fill_from', None)
-        _decisions = _bridge.bridge_session(args.out, _cfg, int(cfg.n_frames),
-                                            fill_dir=_fill_dir)
+        _decisions = _bridge.bridge_session(args.out, _cfg, int(cfg.n_frames))
         print(_bridge.summarise(_decisions))
     print(f'wrote {args.out} ({len(gids)} group(s))')
 

@@ -185,7 +185,7 @@ def main():
     ap.add_argument('--out', type=Path)
     ap.add_argument('--tt-gain', type=float, nargs='+', default=[1.0])
     ap.add_argument('--tt-gamma', type=float, nargs='+', default=[1.0])
-    ap.add_argument('--det-input-wh', type=int, nargs=2)
+    ap.add_argument('--det-input-wh', nargs='*', default=None, help=argparse.SUPPRESS)
     ap.add_argument('--compare', type=Path, default=None,
                     help='a second run, scored on the SAME groups, reported as `--run` minus this '
                          'one under a PAIRED bootstrap.')
@@ -241,13 +241,14 @@ def main():
     ap.add_argument('--det-max-frames', type=int, default=0,
                     help='deploy mode only: 0 = the whole group; matches infer.py --max-frames')
     args = ap.parse_args()
+    if args.det_input_wh is not None:
+        from tailcyclenet.infer.cli import REMOVED_FLAGS
+        raise SystemExit(f"--det-input-wh was removed: {REMOVED_FLAGS['--det-input-wh']}")
 
     device = args.device if torch.cuda.is_available() else 'cpu'
     if args.deploy:
         return main_deploy(args, device)
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
-    if args.det_input_wh:
-        wh = tuple(args.det_input_wh)
+    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint)
     score_thresh = args.score_thresh[0]
     _tiled(args.run, tile_scale)
     if trained_on != args.boxes:
@@ -367,9 +368,7 @@ def main_deploy(args, device):
     per group (each group is already a quantile of many windows/points), so a mean-of-medians is
     reported rather than bootstrapped a second time.
     """
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
-    if args.det_input_wh:
-        wh = tuple(args.det_input_wh)
+    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint)
     score_thresh = args.score_thresh[0]
     ds = load_datasets(args.data)[0]
     sessions = ds.sessions.get(args.split, [])

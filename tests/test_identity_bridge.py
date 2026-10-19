@@ -41,6 +41,40 @@ def _two_animals_crossing(n_frames=240, k=3):
     return pred
 
 
+def _bridge_group(rows, windows, events, gid, n_frames, window_length, cfg):
+    """Plan every episode with the production planner and apply it to the row ARRAYS.
+
+    `bridge_session` applies the same plans to the tables (quarantine = row deletion, release =
+    relabel); this array form makes the planner's consequences directly assertable. Episodes are
+    applied latest first, so an earlier repair's persistence is laid down last.
+    """
+    cfg.validate()
+    segments = bridge.owned_segments(windows, gid, n_frames, window_length)
+    decisions = []
+    for ep in sorted(bridge.episodes(events, gid, cfg.max_event_gap),
+                     key=lambda e: e['first_frame'], reverse=True):
+        plan = bridge.plan_episode(rows['pred'], segments, ep, cfg)
+        if plan is None:
+            decisions.append({'component': list(ep['component']), 'skipped': True})
+            continue
+        if plan.get('windows') or plan.get('release') is not None:
+            quarantine, released = bridge._plan_frames(segments, plan, n_frames)
+            component = np.asarray(plan['component'])
+            for key, value in list(rows.items()):
+                if not isinstance(value, np.ndarray) or value.ndim < 2:
+                    continue
+                changed = value.copy()
+                if len(released):
+                    original = value[:, released]
+                    for logical, local in zip(plan['component'], plan['mapping']):
+                        changed[logical, released] = original[local]
+                if len(quarantine):
+                    changed[component[:, None], quarantine] = np.nan
+                rows = {**rows, key: changed}
+        decisions.append(plan)
+    return rows, list(reversed(decisions))
+
+
 def test_config_refuses_nonsense_by_name():
     for kw in ({'recovery_windows': 0}, {'horizon_steps': 0}, {'horizon_stride': 0},
                {'min_margin': -1}, {'missing_cost': 0}, {'pre_event_windows': -1},
@@ -81,7 +115,7 @@ def test_no_event_log_is_a_byte_exact_no_op():
     """Output neutrality: a session with no episodes must come back untouched."""
     rows = {'pred': _two_animals_crossing(), 'group_id': 'g'}
     before = rows['pred'].copy()
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), _events([]), 'g',
+    out, decisions = _bridge_group(rows, _windows(24, 10), _events([]), 'g',
                                          n_frames=240, window_length=10,
                                          cfg=bridge.BridgeConfig())
     assert decisions == []
@@ -97,7 +131,7 @@ def test_identity_mapping_is_skipped_rather_than_quarantined():
     rows = {'pred': _two_animals_crossing(), 'group_id': 'g'}
     before = rows['pred'].copy()
     ev = _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')])
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     assert len(decisions) == 1 and decisions[0].get('identity') is True
     assert np.array_equal(out['pred'], before, equal_nan=True)
@@ -112,7 +146,7 @@ def test_a_real_swap_is_repaired_and_only_inside_the_component():
     rows = {'pred': pred, 'group_id': 'g'}
     row2_before = pred[2].copy()
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     assert len(decisions) == 1
     plan = decisions[0]
@@ -131,7 +165,7 @@ def test_quarantine_nans_the_component_before_release():
     pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
     rows = {'pred': pred, 'group_id': 'g'}
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     plan = decisions[0]
     quarantined = [w for w in plan['windows'] if w < plan['release']]
@@ -151,7 +185,7 @@ def test_every_row_field_takes_the_same_permutation():
     boxes[0], boxes[1], boxes[2] = 10.0, 20.0, 30.0
     rows = {'pred': pred, 'boxes': boxes, 'group_id': 'g'}
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     assert decisions[0]['mapping'] == [1, 0]
     assert out['boxes'][0, 230, 0, 0] == pytest.approx(20.0), 'boxes must follow the pose'
@@ -163,7 +197,7 @@ def test_an_unbridgeable_episode_is_left_completely_alone():
     rows = {'pred': _two_animals_crossing(), 'group_id': 'g'}
     before = rows['pred'].copy()
     ev = _events([(1, 0, 'retired_duplicate'), (1, 1, 'shielded')])
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     assert decisions[0].get('skipped') is True
     assert np.array_equal(out['pred'], before, equal_nan=True)
@@ -177,7 +211,7 @@ def test_an_impossible_margin_refuses_and_quarantines_instead_of_guessing():
     rows = {'pred': pred, 'group_id': 'g'}
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
     cfg = bridge.BridgeConfig(min_margin=1e12)  # nothing can clear this
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10, cfg)
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10, cfg)
     plan = decisions[0]
     assert plan['refused'] is True and plan['mapping'] is None
     assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
@@ -211,7 +245,7 @@ def test_a_low_margin_release_is_refused_at_the_shipped_default_but_not_at_the_o
     rows = {'pred': pred, 'group_id': 'g'}
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
 
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     plan = decisions[0]
     assert plan['refused'] is True, 'the shipped default must refuse a low-margin release'
@@ -221,7 +255,7 @@ def test_a_low_margin_release_is_refused_at_the_shipped_default_but_not_at_the_o
     pred_old = _nearly_parallel_tracks()
     pred_old[0, swap_at:], pred_old[1, swap_at:] = tail[1], tail[0]
     rows_old = {'pred': pred_old, 'group_id': 'g'}
-    _, decisions_old = bridge.bridge_group(rows_old, _windows(24, 10), ev, 'g', 240, 10,
+    _, decisions_old = _bridge_group(rows_old, _windows(24, 10), ev, 'g', 240, 10,
                                            bridge.BridgeConfig(min_margin=1.0))
     plan_old = decisions_old[0]
     assert not plan_old.get('refused'), 'the OLD default applied this release -- reproduces the bug'
@@ -239,7 +273,7 @@ def test_backward_agrees_is_a_diagnostic_that_never_changes_the_arrays():
     rows = {'pred': pred.copy(), 'group_id': 'g'}
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
 
-    out, decisions = bridge.bridge_group(rows, _windows(40, 10), ev, 'g', 400, 10,
+    out, decisions = _bridge_group(rows, _windows(40, 10), ev, 'g', 400, 10,
                                          bridge.BridgeConfig())
     plan = decisions[0]
     assert 'backward_agrees' in plan
@@ -249,7 +283,7 @@ def test_backward_agrees_is_a_diagnostic_that_never_changes_the_arrays():
     assert plan['backward_agrees'] is True
 
     # identity and refused outcomes carry the key too (unconditional membership), always None
-    out_id, dec_id = bridge.bridge_group(
+    out_id, dec_id = _bridge_group(
         {'pred': _two_animals_crossing(), 'group_id': 'g'}, _windows(24, 10),
         _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]), 'g', 240, 10,
         bridge.BridgeConfig())
@@ -268,7 +302,7 @@ def test_all_candidates_are_recorded_sorted_by_margin_and_change_nothing():
     rows = {'pred': pred.copy(), 'group_id': 'g'}
     ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
 
-    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
                                          bridge.BridgeConfig())
     plan = decisions[0]
     assert 'all_candidates' in plan
@@ -280,7 +314,7 @@ def test_all_candidates_are_recorded_sorted_by_margin_and_change_nothing():
     assert winner['mapping'] == plan['mapping']
 
     # identity and refused outcomes carry the field too (unconditional membership)
-    _, dec_id = bridge.bridge_group(
+    _, dec_id = _bridge_group(
         {'pred': _two_animals_crossing(), 'group_id': 'g'}, _windows(24, 10),
         _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]), 'g', 240, 10,
         bridge.BridgeConfig())
@@ -434,85 +468,3 @@ def test_bridge_session_marks_the_session_incomplete_while_it_edits(tmp_path, mo
     with pytest.raises(RuntimeError, match='mid-bridge'):
         bridge.bridge_session(path, bridge.BridgeConfig(), 10)
     assert read()['complete'] is False
-
-
-def test_boundary_fill_map_matches_one_to_one_by_centre_distance():
-    """The fill map is a Hungarian on 3D centroids at the boundary frame, one-to-one."""
-    pred = np.zeros((2, 4, 3, 3))
-    pred[0, :, :, 0] = 0.0
-    pred[1, :, :, 0] = 100.0
-    fill_pred = np.zeros((2, 4, 3, 3))
-    fill_pred[0, :, :, 0] = 90.0
-    fill_pred[1, :, :, 0] = 10.0
-    m = bridge.boundary_fill_map(pred, fill_pred, 2, (0, 1))
-    assert m == {0: 1, 1: 0}
-
-
-def test_boundary_fill_map_refuses_a_boundary_it_cannot_compute():
-    """A boundary the map cannot be computed at is a refusal, not a guess (section 6.4)."""
-    pred = np.zeros((2, 4, 3, 3))
-    pred[1, :, :] = np.nan
-    fill_pred = np.zeros((2, 4, 3, 3))
-    assert bridge.boundary_fill_map(pred, fill_pred, 2, (0, 1)) is None
-    assert bridge.boundary_fill_map(pred, fill_pred, 99, (0,)) is None
-    assert bridge.boundary_fill_map(pred, fill_pred, -1, (0,)) is None
-
-
-def test_fill_keeps_a_quarantined_row_with_the_fill_pass_measurements(tmp_path):
-    """A quarantined row with a fill observation is KEPT and its measurement columns are the
-    fill pass's own values wholesale; a row with no fill observation stays dropped, exactly as
-    the quarantine would leave it (section 6.4). Identity columns are never replaced."""
-    from tailcyclenet.format import DICT_COLS, write_table
-    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
-    animals = np.array(['a0', 'a1', 'a0', 'a1', 'a0', 'a1'], dtype=object)
-    write_table(tmp_path / 'points3d.pq', {
-        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
-        'animal_id': animals, 'bodypart': np.array(['n'] * 6, dtype=object),
-        'status': np.array(['visible'] * 6, dtype=object),
-        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
-        'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
-    fill_table = pl.DataFrame({
-        'group_id': np.array(['g'] * 4, dtype=object),
-        'frame': np.array([0, 0, 5, 20], np.int32),
-        'animal_id': np.array(['f0', 'f1', 'f0', 'f0'], dtype=object),
-        'bodypart': np.array(['n'] * 4, dtype=object),
-        'status': np.array(['visible', 'projected', 'visible', 'visible'], dtype=object),
-        'x': np.array([90.0, 91.0, 92.0, 93.0], np.float32), 'y': np.zeros(4, np.float32),
-        'z': np.zeros(4, np.float32)})
-    segments = {0: np.arange(0, 10), 1: np.arange(10, 30)}
-    plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
-            'refused': False, 'fill_map': {0: 0, 1: 1}}
-    fill = {'tables': {'points3d': fill_table}, 'animal_ids': ['f0', 'f1']}
-    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], segments, [plan], n_frames=30, fill=fill)
-    out = pl.read_parquet(tmp_path / 'points3d.pq')
-    got = {(str(r['animal_id']), int(r['frame'])): (float(r['x']), str(r['status']))
-           for r in out.iter_rows(named=True)}
-    # both quarantined a0 rows observed by fill slot f0: kept with the fill's measurements
-    assert got[('a0', 0)][0] == pytest.approx(90.0)
-    assert got[('a0', 5)][0] == pytest.approx(92.0)
-    # the (0, a1) row is observed by fill slot f1: kept, and the fill's STATUS replaces the
-    # standard's own -- status is a measurement column the fill borrows wholesale
-    assert got[('a1', 0)] == (pytest.approx(91.0), 'projected')
-    # the (5, a1) row has no fill observation: it stays dropped
-    assert ('a1', 5) not in got
-    # released rows keep the standard session's own relabel and are never filled
-    assert got[('a0', 20)][0] == pytest.approx(5.0) and got[('a1', 20)][0] == pytest.approx(4.0)
-
-
-def test_fill_defaults_off_and_is_byte_identical_to_before(tmp_path):
-    """rewrite_tables without `fill` is byte-identical to the pre-fill contract."""
-    from tailcyclenet.format import DICT_COLS, write_table
-    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
-    animals = np.array(['a0', 'a1', 'a0', 'a1', 'a0', 'a1'], dtype=object)
-    write_table(tmp_path / 'points3d.pq', {
-        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
-        'animal_id': animals, 'bodypart': np.array(['n'] * 6, dtype=object),
-        'status': np.array(['visible'] * 6, dtype=object),
-        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
-        'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
-    plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
-            'refused': False}
-    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10), 1: np.arange(10, 30)},
-                          [plan], n_frames=30)
-    out = pl.read_parquet(tmp_path / 'points3d.pq')
-    assert set(out['frame'].to_list()) == {20}

@@ -30,6 +30,28 @@ from pathlib import Path
 
 from .window import ANCHORS, CARRY_SOURCES
 
+REMOVED_FLAGS = {
+    '--independent-windows': 'deleted 2026-10-19: per-window association was unmeasured and '
+                             'opt-in; last release with it: v0.3.4',
+    '--fill-from': 'deleted 2026-10-19: its own help called it actively harmful with no gate; '
+                   '--identity-bridge drops the quarantined rows; last release with it: v0.3.4',
+    '--det-input-wh': 'deleted 2026-10-19: posetail-pose detector compat; a detector checkpoint '
+                      'records its own input size; last release with it: v0.3.4',
+}
+
+
+class _RemovedFlag(argparse.Action):
+    """Refuse a deleted flag by name, with the reason it was deleted."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        """Exit naming the flag, whatever value it was given."""
+        raise SystemExit(f'{option_string} was removed: {REMOVED_FLAGS[option_string]}')
+
+
+def _add_removed_flags(ap: argparse.ArgumentParser) -> None:
+    """Register every `REMOVED_FLAGS` entry so an old command line fails loudly, not silently."""
+    for flag in REMOVED_FLAGS:
+        ap.add_argument(flag, nargs='*', action=_RemovedFlag, help=argparse.SUPPRESS)
 
 
 
@@ -152,10 +174,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help='pose checkpoint filename when --pose is a run folder (refused beside a '
                          'file); default is the latest training checkpoint. --checkpoint is the '
                          'older spelling of the same option.')
-    ap.add_argument('--independent-windows', action='store_true',
-                    help='reset detector association in every pose window. Requires --detector '
-                         'and --anchor none; no query prior reaches the model, and window-local '
-                         'IDs are not continuous tracks. Unmeasured, opt-in.')
     ap.add_argument('--window-predictions', action='store_true',
                     help='write pre-gate predictions from every processed window to '
                          '<out>/window_predictions.pq (default: off)')
@@ -190,18 +208,6 @@ def build_parser() -> argparse.ArgumentParser:
                          'at 11 -> 563 misses, Sequence 29 9 -> 4 at 32 -> 250. Worth it only '
                          'when identity outranks coverage; quote miss and coverage with any idsw '
                          'from it. Edits the written session in place, after it is written.')
-    ap.add_argument('--fill-from', type=Path, default=None,
-                    help="fill the bridged quarantine from a fill pass's prediction session "
-                         '(plan section 6.4) instead of dropping those rows: run infer.py again '
-                         'over the same clip with --anchor carry --box-prompt none, pass its --out '
-                         'here, and each quarantined row the fill pass observed is kept with the '
-                         "fill pass's measurements, mapped onto this session's rows at the "
-                         'quarantine boundary by centre distance. The fill session is bridged in '
-                         'place first; a frame it did not observe stays dropped. Measured '
-                         '0.71-1.15x clip-normal accuracy on 3 episodes (report 55) with NO '
-                         'automatic gate that separates fill-good from fill-harmful episodes -- '
-                         'user-opt-in only, and actively harmful on crowd-ambiguity shapes. '
-                         'Requires --identity-bridge.')
     ap.add_argument('--overlap-trace', type=Path, default=None,
                     help='write the OUTPUT-NEUTRAL overlap test-retest capture as an npz: for '
                          'every seam frame, the earlier window\'s discarded estimate and the '
@@ -214,10 +220,6 @@ def build_parser() -> argparse.ArgumentParser:
                          'this session\'s own dataset root. A detector is trained per dataset '
                          '(scale/appearance are dataset-specific), so this is refused by default; '
                          'pass this flag only for an explicit, labelled transfer-evaluation arm.')
-    ap.add_argument('--det-input-wh', type=int, nargs=2, default=None,
-                    help='letterbox size the detector was TRAINED at. Only needed for a '
-                         'posetail-pose checkpoint, which keeps it in a config file rather than '
-                         'in the weights.')
     ap.add_argument('--det-score', type=float, default=0.01,
                     help='objectness floor for a detection. 0.01 (default, CHANGED from 0.5 then '
                          '0.05) is measured against the current iou_aware_obj+COCO-pretrained '
@@ -408,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
                          'inert (16 vs 3 moves boxes 0.204 px, scores 1.7e-03), see '
                          'tests/test_memory_budget.py. '
                          'TAILCYCLENET_MAX_RAM_GB does the same for paths with no CLI.')
+    _add_removed_flags(ap)
     return ap
 
 

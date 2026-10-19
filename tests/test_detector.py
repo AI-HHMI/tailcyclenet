@@ -2954,20 +2954,21 @@ def test_provenance_records_every_box_affecting_option():
     from tailcyclenet.detector import detect_raw
     from tailcyclenet.infer.driver import _box_provenance
 
-    args = argparse.Namespace(detector=None, det_input_wh=None, det_score=0.5, det_top_k=0,
+    args = argparse.Namespace(detector=None, det_score=0.5, det_top_k=0,
                               max_animals=0, max_frames=0, frame_start=0, frame_stop=0,
                               det_nms_iou=0.5, det_nms_center_dist=None)
     prov = _box_provenance(args, None, False, None)
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
     # `batch` is in there under protest: it is NOT inert but it is pinned rather
-    # than exposed, so no run can differ in it. `frames`/`read` are the block loop's plumbing and
+    # than exposed, so no run can differ in it. `input_wh` is the checkpoint's own, so
+    # `detector_checkpoint` records it. `frames`/`read` are the block loop's plumbing and
     # change no pixel. See tests/test_memory_budget.py.
     plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read', 'trace',
-                'trace_detail', 'embed_out'}
+                'trace_detail', 'embed_out', 'input_wh'}
     params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
-    alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k',
+    alias = {'score_thresh': 'det_score', 'top_k': 'det_top_k',
              'iou_thresh': 'det_nms_iou', 'center_dist_thresh': 'det_nms_center_dist',
              'box_source': 'det_box_source'}
     missing = [p for p in sorted(params) if alias.get(p, p) not in prov]
@@ -2979,7 +2980,7 @@ def test_provenance_records_every_box_affecting_option():
     # their defaults, because a positional list invalidated every cache on disk each time a flag
     # was added. Nothing here has that pressure, and conditional membership is what made the stamp
     # need five exceptions to its own rule.
-    args2 = argparse.Namespace(detector='d.pt', det_input_wh=(416, 416), det_score=0.97,
+    args2 = argparse.Namespace(detector='d.pt', det_score=0.97,
                                det_top_k=24, max_animals=2, max_frames=120,
                                frame_start=300, frame_stop=500, det_nms_iou=0.65,
                                det_nms_center_dist=0.25)

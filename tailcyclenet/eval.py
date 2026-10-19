@@ -133,8 +133,7 @@ def restrict_frames(preds, labels, start, stop):
         out_l[key] = (dataclasses.replace(lab, **fields), sess)
     return out_p, out_l
 
-def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_cost='mean',
-          identity_metrics=True):
+def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_cost='mean'):
     """One row per group: error, the coverage behind it, MOTA where there are instances.
     Factored out so `--vs` scores the second file through the identical path.
 
@@ -157,9 +156,7 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
     instances is an undefined reference path, past both guards above, not merely an unmatched one.
 
     `box_agree` is where the pose landed relative to its own crop box, in units of one box side:
-    a pose off its crop is not a prediction of that animal. `kpt_agree` is the 2D half of the
-    same check, unbounded (the detector's keypoints are regressed in the full frame, unlike a
-    pose decoded inside its own crop), so it is the 2D diagnostic.
+    a pose off its crop is not a prediction of that animal.
 
     Groups are visited in each group's own TEMPORAL order (`__chunk_of__`/`__t0__`, not the
     lexical `{key}#{t0}` string, which sorts `'s/g#1000'` before `'s/g#500'`), so `mota`'s
@@ -218,21 +215,15 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         m['S'] = S
         m['S_pred'], m['S_true'] = Sp, St
         m['_pred'], m['_true'] = pred, true
-        mr = (motion_ratio(m.get('_pred_matched', pred), true)
-              if St and not out.get('__independent_windows__') else None)
+        mr = motion_ratio(m.get('_pred_matched', pred), true) if St else None
         m['motion_ratio'] = mr['ratio'] if mr and mr['n_steps'] else None
         if 'box_agree' in out:
             ba = np.asarray(out['box_agree'], float)
             ba = ba[np.isfinite(ba)]
             m['box_agree'] = float(np.median(ba)) if ba.size else None
             m['box_agree_p99'] = float(np.quantile(ba, 0.99)) if ba.size else None
-        if 'kpt_agree' in out:
-            ka = np.asarray(out['kpt_agree'], float)
-            ka = ka[np.isfinite(ka)]
-            m['kpt_agree'] = float(np.median(ka)) if ka.size else None
-            m['kpt_agree_p99'] = float(np.quantile(ka, 0.99)) if ka.size else None
         m.update(_vis_confusion(out, lab, mode, T, frame_pairs=m.pop('_vis_pairs', None)))
-        if identity_metrics and (S > 1 or (Sp == 0 and St >= 1)):
+        if S > 1 or (Sp == 0 and St >= 1):
             state = mota_state.setdefault(out.get('__chunk_of__', key), {})
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
                                                extent_override=out.get('__extent__'),
@@ -342,125 +333,6 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
                         min_kpts_frac=min_kpts_frac, cost=match_cost, last=last)
 
 
-def _prediction_2d_stem(path: Path) -> str | None:
-    """Select model predictions, with only the audited legacy inference fallback."""
-    import tomllib
-
-    if path.suffix == '.npz':
-        return None
-    if (path / 'points2d.pq').exists():
-        return 'points2d'
-    if not (path / 'keypoints.pq').exists():
-        return None
-    try:
-        with open(path / 'session.toml', 'rb') as f:
-            prov = tomllib.load(f).get('provenance', {})
-    except (OSError, ValueError):
-        prov = {}
-    if prov.get('run') and prov.get('checkpoint'):
-        return 'keypoints'
-    raise SystemExit(f'{path}: keypoints.pq without run+checkpoint provenance is ambiguous; '
-                     'refusing to score annotation observations as predictions')
-
-
-def _scatter_prediction_2d(path, preds, labels):
-    """Read model-produced 2D prediction rows (never project the 3D estimate)."""
-    stem = _prediction_2d_stem(path)
-    if stem is None:
-        return
-    import polars as pl
-
-    table = pl.read_parquet(path / f'{stem}.pq')
-    for key, out in preds.items():
-        if out.get('mode') != '2d' or key not in labels:
-            continue
-        lab, sess = labels[key]
-        ids = [str(x) for x in out.get('animal_ids', lab.animal_ids)]
-        S, T, K = len(ids), sess.groups[key.rsplit('/', 1)[-1]].n_frames, len(sess.names)
-        arr = np.full((S, T, K, 2), np.nan, np.float32)
-        ai, ki = {v: i for i, v in enumerate(ids)}, {v: i for i, v in enumerate(sess.names)}
-        gid = key.rsplit('/', 1)[-1]
-        q = table.filter(pl.col('group_id').cast(pl.String) == gid)
-        if 'camera' in q.columns and len(q):
-            q = q.filter(pl.col('camera').cast(pl.String) == str(sess.cam_names[0]))
-        for r in q.iter_rows(named=True):
-            a, k, t = ai.get(str(r.get('animal_id')), -1), ki.get(str(r.get('bodypart')), -1), int(r['frame'])
-            if 0 <= a < S and 0 <= k < K and 0 <= t < T and r.get('x') is not None and r.get('y') is not None:
-                arr[a, t, k] = (r['x'], r['y'])
-        out['pred'] = arr
-
-
-def _independent_slots(path, preds, labels):
-    """Replace expanded window IDs by S seam-owned slot rows for pose scoring.
-
-    The output axis includes slots found in point, instance, and window tables, even when a slot
-    failed every point prediction or is the highest-numbered slot.
-    """
-    import tomllib
-    import polars as pl
-
-    with open(path / 'session.toml', 'rb') as f:
-        cfg = tomllib.load(f)
-    prov = cfg.get('provenance', {})
-    independent = bool(cfg.get('independent_windows', prov.get('independent_windows', False)))
-    if not independent:
-        return False
-    if cfg.get('mode') == '3d':
-        if not (path / 'points3d.pq').exists():
-            raise SystemExit(f'{path}: independent 3D prediction has no points3d.pq')
-        table, stem = pl.read_parquet(path / 'points3d.pq'), '3d'
-    else:
-        chosen = _prediction_2d_stem(path)
-        if chosen is None:
-            raise SystemExit(f'{path}: independent prediction has no points2d.pq')
-        table, stem = pl.read_parquet(path / f'{chosen}.pq'), '2d'
-    slot_tables = [table]
-    seen_paths = {path / f'{stem}.pq'}
-    for extra in ('instances', 'windows'):
-        candidate_path = path / f'{extra}.pq'
-        if candidate_path.exists() and candidate_path not in seen_paths:
-            slot_tables.append(pl.read_parquet(candidate_path))
-            seen_paths.add(candidate_path)
-    for key, out in preds.items():
-        if key not in labels:
-            continue
-        _, sess = labels[key]
-        gid = key.rsplit('/', 1)[-1]
-        q = table.filter(pl.col('group_id').cast(pl.String) == gid)
-        slot_values = set()
-        for candidate_table in slot_tables:
-            candidate = candidate_table.filter(pl.col('group_id').cast(pl.String) == gid)
-            if 'slot' in candidate.columns:
-                slot_values.update(int(x) for x in candidate['slot'].drop_nulls().unique().to_list())
-        if not slot_values:
-            raise SystemExit(f'{path}/{gid}: independent output lacks explicit slot rows')
-        slots = sorted(slot_values)
-        S = max(slots, default=-1) + 1
-        T, K = sess.groups[gid].n_frames, len(sess.names)
-        dim = 3 if stem == '3d' else 2
-        arr = np.full((S, T, K, dim), np.nan, np.float32)
-        conf = np.full((S, T, K), np.nan, np.float32)
-        by_k = {v: i for i, v in enumerate(sess.names)}
-        logit_key = 'score_logit' if stem == '3d' else 'visibility_logit'
-        for r in q.iter_rows(named=True):
-            a, t, k = int(r['slot']), int(r['frame']), by_k.get(str(r['bodypart']), -1)
-            if not (0 <= a < S and 0 <= t < T and 0 <= k < K):
-                continue
-            if dim == 2 and 'camera' in r and str(r['camera']) != str(sess.cam_names[0]):
-                continue
-            vals = tuple(r.get(c) for c in ('x', 'y', 'z')[:dim])
-            if all(v is not None for v in vals):
-                arr[a, t, k] = vals
-            logit = r.get(logit_key)
-            if logit is not None:
-                conf[a, t, k] = float(logit)
-        out['pred'] = arr
-        out['animal_ids'] = np.asarray([f'slot_{i:02d}' for i in range(S)], object)
-        out['__independent_windows__'] = True
-        out['conf'] = conf
-    return True
-
-
 def main(argv: list[str] | None = None):
     """Score a prediction file; exit via SystemExit on bad config.
 
@@ -474,8 +346,7 @@ def main(argv: list[str] | None = None):
       No labels in the scored prefix is a diagnosis, not a ZeroDivisionError. A ranged session is
       scored only inside its `[provenance]` range (`restrict_frames`); `--vs` refuses two ranges. The tail percentiles
       matter because the mean cannot show one: an arm that declines hard animals has a
-      flattering mean and a p90 that says so. `kpt_agree` is unbounded in 2D where `box_agree`
-      is capped by construction. The vis head's TARGET, not its output, is printed: a `base` at
+      flattering mean and a p90 that says so. The vis head's TARGET, not its output, is printed: a `base` at
       1.000 means there is nothing for `--vis-thresh` to learn. PCK reuses the table's own
       arrays (re-deriving the slicing from the npz got it wrong whenever pred and true
       disagreed on S or T), excluding `St == 0` groups -- nothing to measure PCK against, and
@@ -544,14 +415,6 @@ def main(argv: list[str] | None = None):
 
     preds, meta = load_predictions(args.predictions)
     labels = label_lookup(args.data, args.split)
-    if args.predictions.suffix != '.npz':
-        _scatter_prediction_2d(args.predictions, preds, labels)
-    independent = (args.predictions.suffix != '.npz' and
-                   _independent_slots(args.predictions, preds, labels))
-    if independent and (args.mota_dist is not None or args.idsw_band):
-        raise SystemExit('independent-window predictions have window-local identity; MOTA/IDSW options are refused')
-    if independent:
-        print('independent windows: scoring pose accuracy by explicit slot; identity metrics are unavailable (IDs reset each window)')
     frame_range = (int(meta.get('frame_start', 0)), int(meta.get('frame_stop', 0)))
     if any(frame_range):
         preds, labels = restrict_frames(preds, labels, *frame_range)
@@ -567,7 +430,7 @@ def main(argv: list[str] | None = None):
         print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
 
     rows = score(preds, labels, args.mota_dist, min_kpts_frac=args.min_match_kpts,
-                 match_cost=args.match_cost, identity_metrics=not independent)
+                 match_cost=args.match_cost)
     if not rows:
         print('nothing scored')
         return
@@ -620,8 +483,7 @@ def main(argv: list[str] | None = None):
             cells = '  '.join(f'{k} {np.nanmean([m.get(k, np.nan) for m in block]):.3f}'
                               for k in pcts)
             print(f'[{mode}] err {cells} {unit}  (mean over {len(block)} group(s))')
-        for name, label in (('box_agree', 'pose centroid to its own crop box'),
-                            ('kpt_agree', 'pose to its own detector keypoints')):
+        for name, label in (('box_agree', 'pose centroid to its own crop box'),):
             vals = [m[name] for m in block if m.get(name) is not None]
             if vals:
                 p99 = [m[f'{name}_p99'] for m in block if m.get(f'{name}_p99') is not None]
@@ -682,12 +544,6 @@ def main(argv: list[str] | None = None):
 
     if args.vs:
         other, ometa = load_predictions(args.vs)
-        other_independent = False
-        if args.vs.suffix != '.npz':
-            _scatter_prediction_2d(args.vs, other, labels)
-            other_independent = _independent_slots(args.vs, other, labels)
-        if other_independent != independent:
-            raise SystemExit('--vs cannot pair independent-window predictions with ordinary IDs')
         other_range = (int(ometa.get('frame_start', 0)), int(ometa.get('frame_stop', 0)))
         if other_range != frame_range:
             raise SystemExit(f'--vs pairs two runs over different frame ranges ({frame_range} vs '
@@ -702,7 +558,7 @@ def main(argv: list[str] | None = None):
         print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
         by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,
                                               min_kpts_frac=args.min_match_kpts,
-                                              match_cost=args.match_cost, identity_metrics=not independent)}
+                                              match_cost=args.match_cost)}
         pairs = [(m, by_key[m['group']]) for m in rows if m['group'] in by_key]
         if not pairs:
             print('  no shared groups')
@@ -762,7 +618,6 @@ def main(argv: list[str] | None = None):
                              + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
                 print(f'[{mode}] {"motion_ratio":>13s} {dm["mean"]:+.4f}  {tail}')
             paired('box_agree', lambda m: m.get('box_agree'))
-            paired('kpt_agree', lambda m: m.get('kpt_agree'))
             for _k in _PCT_KEYS:
                 paired(f'err {_k}', (lambda k: lambda m: m.get(k))(_k))
             for name in ('mota', 'miss_rate', 'fp_rate', 'fp_dup_rate', 'fp_none_rate',

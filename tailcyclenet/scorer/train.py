@@ -648,11 +648,11 @@ def _frame_localization_counts(scores: torch.Tensor, trip: dict):
     if far is None:
         return 0, 0
     far = far.to(device=scores.device, dtype=torch.bool)
-    valid = trip.get('observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
-    valid &= trip.get('in_view_mask', torch.ones_like(far)).to(dtype=torch.bool)
-    valid &= trip.get('anchor_observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
-    valid &= ~trip.get('ambiguous_mask', torch.zeros_like(far)).to(dtype=torch.bool)
-    valid &= ~trip.get('reference_rejected_mask', torch.zeros_like(far)).to(dtype=torch.bool)
+    valid = (trip.get('observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
+             & trip.get('in_view_mask', torch.ones_like(far)).to(dtype=torch.bool)
+             & trip.get('anchor_observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
+             & ~trip.get('ambiguous_mask', torch.zeros_like(far)).to(dtype=torch.bool)
+             & ~trip.get('reference_rejected_mask', torch.zeros_like(far)).to(dtype=torch.bool))
     good = bad = 0
     for bi in range(scores.shape[0]):
         for ki in range(scores.shape[2]):

@@ -219,6 +219,44 @@ def test_evaluate_frame_metrics_use_active_rows_and_pointwise_labels(monkeypatch
     assert model.mode == 'train'
 
 
+def test_evaluate_frame_out_of_view_fraction_counts_out_of_view_slots(monkeypatch):
+    """The localization count must not erase out-of-view slots from `observed_mask` first."""
+    from tailcyclenet.scorer import train as st
+    from tailcyclenet.scorer.losses import FrameTripletScorerLoss
+
+    class FrameModel:
+        """A stub scorer returning fixed frame scores."""
+
+        def eval(self):
+            """No-op mode switch."""
+
+        def train(self):
+            """No-op mode switch."""
+
+        def score_triplet(self, _trip):
+            """Fixed scores, precisions and labels for two frames of one keypoint."""
+            scores = torch.tensor([[[[1.0, -1.0, 1.0]], [[1.0, 0.5, 1.0]]]])
+            labels = torch.tensor([[[[1.0, -1.0, 1.0]], [[1.0, -1.0, 1.0]]]])
+            return scores, torch.ones_like(scores), labels
+
+    trip = {
+        'active_mask': torch.tensor([[[True], [False]]]),
+        'observed_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'in_view_mask': torch.tensor([[[True], [False]]]),
+        'anchor_observed_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'far_mask': torch.tensor([[[True], [False]]]),
+        'near_mask': torch.tensor([[[False], [True]]]),
+        'ambiguous_mask': torch.zeros((1, 2, 1), dtype=torch.bool),
+        'corruption_type_mask': torch.zeros((1, 2, 1, 4), dtype=torch.bool),
+        'source_frame_weight': torch.ones((1, 2, 1)),
+        'anchor_label': 1.0,
+    }
+    monkeypatch.setattr(st, 'triplet_to_device', lambda value, device: value)
+    out = st.evaluate(FrameModel(), [trip], FrameTripletScorerLoss(score_reg_weight=0.0), 'cpu', 1,
+                      output_granularity='frame')
+    assert out['val/out_of_view_fraction'] == 0.5
+    assert bool(trip['observed_mask'].all())
+
 def test_evaluate_restores_train_mode_when_the_pass_raises(monkeypatch):
     """An exception mid-val must not leave the run training an eval-mode model."""
     from tailcyclenet.scorer import train as st

@@ -240,7 +240,8 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None,
                     state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0,
-                    assoc_res_max_sides=None, assoc_score_order=False):
+                    assoc_res_max_sides=None, assoc_score_order=False,
+                    track_age_decay=None, track_affinity_2d=0.0, track_camera_claims=False):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -262,6 +263,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             holds one (the tracker is built exactly once).
         assoc_res_max_sides / assoc_score_order -- `associate`'s `max_res_sides` (TR5) and
             `score_order` (TR6a), with or without a tracker; None / False are the shipped gates.
+        track_age_decay / track_affinity_2d / track_camera_claims -- the tracker's
+            `age_decay` (T2), `affinity_2d` (TR3) and `camera_claims` (TR2); inert without one.
     Outputs:
         The same pair re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -291,7 +294,10 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        duplicate_persist=duplicate_persist,
                                        frame_base=frame_base,
                                        max_res_sides=assoc_res_max_sides,
-                                       score_order=assoc_score_order)
+                                       score_order=assoc_score_order,
+                                       age_decay=track_age_decay,
+                                       affinity_2d=track_affinity_2d,
+                                       camera_claims=track_camera_claims)
         state['tracker'] = tracker
     tracker = state['tracker']
 
@@ -339,6 +345,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         stats['association_s'] = stats.get('association_s', 0.0) + time.perf_counter() - t_start
     if stats is not None and tracker is not None:
         stats['association_groups'] = tracker.n_groups
+        stats['association_camera_claims'] = tracker.n_camera_claims
     pre_link = int(np.isfinite(out).all(-1).sum())
     if link and tracker is None:
         out, sc = link_rows(out, sc, max_move=max_move, max_age=max_age,

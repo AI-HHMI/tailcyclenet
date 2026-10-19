@@ -141,6 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
     win.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
                      help="re-crop each window to the first pass's own prediction and predict "
                           'again. Default: on in 3D, off in 2D (on for a box model).')
+    win.add_argument('--refine-all-cams', action=argparse.BooleanOptionalAction, default=False,
+                     help="TR1, 3D --refine: pass 2 re-crops every calibrated camera from pass "
+                          "1's pose with a per-camera overlap test (drop a camera whose refined "
+                          'box misses its pass-1 box; add one with no pass-1 box when the pose '
+                          'reprojects into its frame). Default: off (all-or-nothing over the '
+                          'pass-1 cameras).')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')
@@ -215,6 +221,20 @@ def build_parser() -> argparse.ArgumentParser:
                        default=False,
                        help='TR6a: rank cross-view candidate pairs by (support, lower box score, '
                             'residual) instead of (support, residual). Default: off.')
+    ident.add_argument('--track-camera-claims', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='TR2, 3D --track: after the targets x groups match, let each live '
+                            'target claim one detection per camera that no seated group used '
+                            '(per-camera Hungarian, same box-side gate). Births still need 2 '
+                            'views. Default: off.')
+    ident.add_argument('--track-age-decay', type=float, default=None, metavar='LAMBDA',
+                       help="T2, 3D --track: replace the additive sticky-age term with the "
+                            "paper's multiplicative decay aff * exp(-LAMBDA * age). Default: "
+                            'off (additive).')
+    ident.add_argument('--track-affinity-2d', type=float, default=0.0, metavar='W2',
+                       help='TR3, 3D --track: blend a per-camera 2D continuity term into the '
+                            'target x group affinity, (1 - W2) * A_3D + W2 * A_2D. Default: 0 '
+                            '(A_3D only).')
     ident.add_argument('--identity-bridge', action='store_true',
                        help='OPT-IN post-pass repairing the slot permutation a hard interaction '
                             'leaves; TRADES MISSES FOR IDENTITY (quote miss and coverage with '

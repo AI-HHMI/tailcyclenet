@@ -159,7 +159,8 @@ class CrossViewTracker:
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
                  duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0,
-                 max_res_sides=None, score_order=False):
+                 max_res_sides=None, score_order=False, age_decay=None, affinity_2d=0.0,
+                 camera_claims=False):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -180,9 +181,11 @@ class CrossViewTracker:
                     on an aligned lead-in batch below `--start-frame`, so its step count alone is
                     not the source frame -- events must add this back, or a bridge/consumer that
                     reads them as source-absolute silently misreads a ranged run.
-                max_res_sides / score_order -- passed to every `associate` call (TR5 scale-free
-                    residual gate, TR6a objectness-first candidate order); None / False are the
-                    shipped behaviour.
+                max_res_sides / score_order (TR5, TR6a) -- passed to every `associate` call.
+                age_decay (T2) -- None: the additive sticky-age term; lambda: `aff*exp(-l*age)`.
+                affinity_2d (TR3) -- w2 in `(1-w2)*A_3D + w2*A_2D` (`_affinity_2d`); 0 = A_3D.
+                camera_claims (TR2) -- per-camera claims after matching (`_claim_per_camera`).
+                Every Phase-8 default is the shipped behaviour.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}. 'point' and 'age'
         keep their meaning throughout: the last TRIANGULATED point and frames since the last
@@ -201,6 +204,11 @@ class CrossViewTracker:
         self.max_res_sides = None if max_res_sides is None else float(max_res_sides)
         self.score_order = bool(score_order)
         self.n_groups = 0
+        self.age_decay = None if age_decay is None else float(age_decay)
+        self.affinity_2d = float(affinity_2d)
+        self.camera_claims = bool(camera_claims)
+        self.n_camera_claims = 0
+        self._cam_history = {}
         self._residuals = {}
         self._dup_contact = {}
         self._dup_shield = set()
@@ -271,6 +279,14 @@ class CrossViewTracker:
                        if np.isfinite(out[s, c]).all()}
             if claimed:
                 self._last_claims[s] = claimed
+        if self.affinity_2d:
+            for s in list(self._cam_history):
+                if s not in self.targets:
+                    del self._cam_history[s]
+            for s in self.targets:
+                for c in range(C):
+                    if np.isfinite(out[s, c]).all():
+                        self._cam_history.setdefault(s, {})[c] = (out[s, c].copy(), self._t)
         return out, sc, claimed_ix
 
     def _duplicate_evidence(self, cgroup, out, first, second):
@@ -535,7 +551,14 @@ class CrossViewTracker:
         for i in range(len(slots)):
             for k, g in enumerate(groups):
                 aff[i, k] = self._group_affinity(proj, centres, sides, i, g)
-        if aff.any():
+                if self.affinity_2d and aff[i, k] > 0:
+                    a2 = self._affinity_2d(slots[i], centres, sides, g)
+                    if a2 is not None:
+                        aff[i, k] = (1.0 - self.affinity_2d) * aff[i, k] + self.affinity_2d * a2
+                        aff[i, k] = max(aff[i, k], 1e-9)
+        if aff.any() and self.age_decay is not None:
+            aff = aff * np.exp(-self.age_decay * np.array([[ages[s] for s in slots]]).T)
+        elif aff.any():
             aff = np.where(aff > 0,
                           aff * 16.0 + np.array([[_age_term(ages[s]) for s in slots]]).T, 0.0)
         taken, matched = set(), {}
@@ -562,6 +585,7 @@ class CrossViewTracker:
 
         free = [s for s in range(self.n) if s not in self.targets]
         unclaimed = [k for k in range(len(groups)) if k not in taken]
+        born = set()
         gi = 0
         for s in free:
             while gi < len(unclaimed):
@@ -574,4 +598,90 @@ class CrossViewTracker:
                                         'detail': {'cameras': sorted(g.get('members', {}))}})
                     continue
                 self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam)
+                born.add(k)
                 break
+        if self.camera_claims:
+            self._claim_per_camera(cgroup, groups, taken | born, centres, sides, matched,
+                                   boxes_per_cam, scores_per_cam, out, sc, claimed_ix)
+
+    def _affinity_2d(self, slot, centres, sides, g):
+        """TR3's A_2D: how well group `g`'s detections continue `slot`'s own per-camera track.
+
+        Inputs: slot; per-camera detection centres/sides; g -- one `associate` group.
+        Outputs: the mean over the group's cameras the slot has claimed before of
+            `max(0, 1 - d / (side * max_move * dt))`, d = distance from the detection centre to
+            that camera's last claimed centre, dt = frames since that claim; None when the slot
+            has no claim history in any of the group's cameras (the caller keeps A_3D).
+        """
+        hist = self._cam_history.get(slot, {})
+        vals = []
+        for c, j in g['members'].items():
+            if c not in hist:
+                continue
+            box, t_claim = hist[c]
+            last = np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2], np.float64)
+            side = max(float(sides[c][j]), 1e-6)
+            dt = max(self._t - t_claim, 1)
+            d = float(np.linalg.norm(centres[c][j].numpy().astype(np.float64) - last))
+            vals.append(max(0.0, 1.0 - d / (side * self.max_move * dt)))
+        return float(np.mean(vals)) if vals else None
+
+    def _claim_per_camera(self, cgroup, groups, seated, centres, sides, matched,
+                          boxes_per_cam, scores_per_cam, out, sc, claimed_ix):
+        """TR2: per-camera Hungarians between live targets and the detections no seated group used.
+
+        Inputs: the frame's groups and the indices `seated` (matched or born); per-camera
+            centres/sides; `matched` -- slots matched to a group this frame; the frame's boxes,
+            scores and the output arrays (written in place).
+        Side effects: a target may take ONE detection per camera it did not already claim this
+            frame. A claim resets the target's age (it is evidence the animal is there). The
+            point is HELD unless an unmatched target takes claims in >= 2 cameras this frame, in
+            which case it is re-triangulated from those claims. Claims land in `out`, so the
+            duplicate backstop reads them as ordinary claim evidence. Births are untouched: they
+            still come only from >= 2-view groups.
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        from .associate import _triangulate
+
+        used = {(c, j) for k in seated for c, j in groups[k]['members'].items()}
+        live = [s for s in sorted(self.targets)
+                if bool(torch.isfinite(self.targets[s]['point']).all())]
+        if not live:
+            return
+        pts = torch.stack([self.targets[s]['point'] for s in live])
+        fresh = {}
+        for c in range(len(cgroup)):
+            free = [j for j in range(centres[c].shape[0]) if (c, j) not in used
+                    and bool(torch.isfinite(centres[c][j]).all())]
+            rows = [i for i, s in enumerate(live) if not np.isfinite(out[s, c]).all()]
+            if not free or not rows:
+                continue
+            proj = _project(cgroup[c], pts[rows])
+            aff = np.zeros((len(rows), len(free)), np.float64)
+            for r in range(len(rows)):
+                for f, j in enumerate(free):
+                    side = max(float(sides[c][j]), 1e-6)
+                    d = float(torch.linalg.norm(proj[r] - centres[c][j]))
+                    aff[r, f] = max(0.0, 1.0 - d / (self.max_move * side))
+            if not aff.any():
+                continue
+            ri, fi = linear_sum_assignment(-aff)
+            for r, f in zip(ri, fi):
+                if aff[r, f] <= 0:
+                    continue
+                s, j = live[rows[r]], free[f]
+                out[s, c] = boxes_per_cam[c][j].numpy()
+                sc[s, c] = float(scores_per_cam[c][j])
+                claimed_ix[s, c] = j
+                self.targets[s]['age'] = 0
+                fresh.setdefault(s, []).append((c, j))
+                self.n_camera_claims += 1
+        for s, claims in fresh.items():
+            if s in matched or len(claims) < 2:
+                continue
+            cams = tuple(c for c, _ in claims)
+            p = torch.stack([centres[c][j] for c, j in claims])
+            point = _triangulate(cgroup, cams, p)
+            if bool(torch.isfinite(point).all()):
+                self.targets[s]['point'] = point

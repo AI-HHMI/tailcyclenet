@@ -24,7 +24,7 @@ from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
 from .crops import (boxes_from_points, crop_views, fill_box_agreement, overlaps,
-                    to_device)
+                    refine_every_camera, to_device)
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
 from .traces import (FRAME_KEYS, WINDOW_KEYS, capture_model_confidence,
@@ -117,6 +117,11 @@ class InferConfig:
     prefetch_windows: int = 1
     # Retain block-local long-form pre-gate records for the optional window sidecar.
     capture_window_predictions: bool = False
+    # TR1 (3D, --refine): pass 2 re-crops EVERY calibrated camera from pass 1's pose, with a
+    # per-camera overlap test (a camera whose refined box misses its pass-1 box is dropped; a
+    # camera with no pass-1 box is added when the pose reprojects into its frame). False is the
+    # shipped all-or-nothing refine over the pass-1 cameras only.
+    refine_all_cams: bool = False
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -640,6 +645,20 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     refined.append(_at_image_size(plan))
                     continue
                 pts = torch.as_tensor(got[0], dtype=torch.float32)
+                if cfg.refine_all_cams and mode == '3d':
+                    use2, b2, cg2 = refine_every_camera(pts, use, boxes, cam_ix, window_cams,
+                                                        cfg.min_crop_dim)
+                    if not use2:
+                        refined.append(_at_image_size(plan))
+                        continue
+                    uncropped2, sc2 = list(cg2), []
+                    for i, cam in enumerate(cg2):
+                        cg2[i], s = resize_camera(cam, cfg.image_size)
+                        sc2.append(s)
+                    for i, ci in enumerate(use2):
+                        crop_refined[a, wi - w0, ci] = np.asarray(b2[i], np.float32)
+                    refined.append(WindowPlan(a, use2, b2, cg2, sc2, uncropped2))
+                    continue
                 cg2, b2 = boxes_from_points(pts, [window_cams[i] for i in use],
                                             cfg.min_crop_dim, mode)
                 if cg2 is None:

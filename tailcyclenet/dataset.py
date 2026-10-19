@@ -171,6 +171,33 @@ class LoaderConfig:
                 'a positive probability has no legal mode to draw')
         self.flip_2d_prob = probability
         self.flip_2d_modes = modes
+        self._check_values()
+
+    def _check_values(self) -> None:
+        """Refuse, at construction, the values the loader would otherwise first trip over inside a
+        worker at the first item -- or, for `box_prompt`, silently read as ON."""
+        from .box_prompt import BOX_PROMPT_FRAMES
+        from .query_encoder import BOX_MODES
+
+        sampling = ('true-2d-hybrid-v1', 'legacy-3d-single-view')
+        if self.two_d_sampling not in sampling:
+            raise ValueError(f'two_d_sampling must be one of {sampling}, '
+                             f'got {self.two_d_sampling!r}')
+        if self.box_prompt_frames not in BOX_PROMPT_FRAMES:
+            raise ValueError(f'box_prompt_frames must be one of {BOX_PROMPT_FRAMES}, '
+                             f'got {self.box_prompt_frames!r}')
+        if self.box_prompt != 'none' and self.box_prompt not in BOX_MODES:
+            raise ValueError(f"box_prompt must be 'none' or one of {BOX_MODES}, "
+                             f'got {self.box_prompt!r}')
+        for name in ('cams_to_sample', 'val_cams_to_sample', 'crop_inflate'):
+            spec = getattr(self, name)
+            if isinstance(spec, (list, tuple)):
+                if len(spec) < 2 or float(spec[0]) > float(spec[1]):
+                    raise ValueError(f'{name} must be a number or a [low, high] pair with '
+                                     f'low <= high, got {spec!r}')
+        p = self.aug_rotation_prob
+        if p is not None and not 0.0 <= float(p) <= 1.0:
+            raise ValueError(f'aug_rotation_prob must be None or in [0, 1], got {p!r}')
 
     # WIDE-CROP TRAINING: widen the crop-rule box about its centre by this factor BEFORE the
     # coords are shifted into it, so the animal sits off-centre in a wider crop and the box
@@ -652,6 +679,27 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
             out.append(im.copy() if i in seen else im)
         seen.add(i)
     return out
+
+
+def _decode_errors() -> tuple[type[BaseException], ...]:
+    """What a video decode raises for a frame it cannot deliver: `PyAVReader`'s own RuntimeError
+    (a frame that did not decode, an index past the table) and libav's errors."""
+    import av.error
+    return (RuntimeError, av.error.FFmpegError)
+
+
+def _warn_decode_failure(group, cam, err: BaseException) -> None:
+    """Say, once per (group, camera), that a loader item was skipped because its pixels did not
+    decode -- the image path's unreadable file returns None and is retried the same way."""
+    key = (getattr(group, 'group_id', None), cam, id(getattr(group, 'session', None)))
+    if key in _decode_warned:
+        return
+    _decode_warned.add(key)
+    warnings.warn(f'group {key[0]!r} camera {cam!r}: a frame did not decode, so this item is '
+                  f'skipped and another drawn ({err})', stacklevel=3)
+
+
+_decode_warned: set = set()
 
 
 def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation=None,
@@ -1583,9 +1631,15 @@ class PoseDataset(Dataset):
         with (ThreadPoolExecutor(max_workers=16) if use_pool else nullcontext()) as pool:
             views = []
             for cnum, cam_name in enumerate(cam_names):
-                imgs = read_frames(group, cam_name, frames, crop_coords=boxes[cnum],
-                                   target_size=cgroup[cnum]['size'].tolist(),
-                                   rotation=rotation_info[cnum], pool=pool)
+                try:
+                    imgs = read_frames(group, cam_name, frames, crop_coords=boxes[cnum],
+                                       target_size=cgroup[cnum]['size'].tolist(),
+                                       rotation=rotation_info[cnum], pool=pool)
+                except _decode_errors() as e:
+                    if use_pool:
+                        raise
+                    _warn_decode_failure(group, cam_name, e)
+                    return None
                 if any(im is None for im in imgs):
                     return None
                 if self._aug is not None:

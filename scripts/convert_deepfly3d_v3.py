@@ -912,9 +912,7 @@ def _same_policy(root: Path, policy: dict) -> bool:
             if fmt.validate_session(loaded, check_images=False):
                 return False
         return True
-    except Exception:
-
-
+    except (OSError, ValueError, fmt.FormatError):
         return False
 
 
@@ -979,10 +977,8 @@ def convert_command(args) -> int:
             try:
                 inventory.append(convert_record(record, split, root, force=False,
                                                  max_reprojection_px=args.max_reprojection_px))
-            except (AssertionError, OSError, ValueError, RuntimeError, KeyError, TypeError,
-                    EOFError, OverflowError) as exc:
-
-
+            except (AssertionError, OSError, ValueError, RuntimeError, EOFError,
+                    OverflowError) as exc:
                 inventory.append({'condition': record.condition, 'archive': record.archive,
                                   'split': split, 'status': 'quarantined',
                                   'reason': 'conversion_failed:' + str(exc),
@@ -1016,6 +1012,10 @@ def convert_command(args) -> int:
           f'quarantined {manifest["quarantined_source_sessions"]}')
     print('WARNING: units are scaled provisional mm; calibration remains provisional_unvalidated',
           file=sys.stderr)
+    if records and not manifest['converted_sessions']:
+        print(f'ERROR: every one of {len(records)} trials was quarantined; see '
+              f'{root / "conversion_manifest.json"}', file=sys.stderr)
+        return 1
     return 0
 
 

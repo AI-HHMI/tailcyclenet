@@ -101,14 +101,12 @@ def _is_symlink_farm(root_dir: Path) -> bool:
     """True if the root itself or every session directory under it is a symlink."""
     if root_dir.is_symlink():
         return True
+    sessions = []
     for split in ('train', 'val', 'test'):
         d = root_dir / split
-        if not d.is_dir():
-            continue
-        sessions = [p for p in d.iterdir() if p.is_dir() or p.is_symlink()]
-        if sessions:
-            return all(p.is_symlink() for p in sessions)
-    return False
+        if d.is_dir():
+            sessions += [p for p in d.iterdir() if p.is_dir() or p.is_symlink()]
+    return bool(sessions) and all(p.is_symlink() for p in sessions)
 
 
 def audit_session(sess: fmt.Session, root_name: str, hole_totals: Counter,

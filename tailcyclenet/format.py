@@ -1266,6 +1266,53 @@ class Registry:
 
 # validation -- docs/annotation_format.md §11
 
+def _rows_without_3d(tk, t3, sel: np.ndarray) -> int:
+    """How many `sel` rows of keypoints.pq have no points3d.pq row with the same
+    (group_id, frame, animal_id, bodypart) key (rule 10's coordinate-free exemption)."""
+    import pyarrow.compute as pc
+
+    cols = ('group_id', 'frame', 'animal_id', 'bodypart')
+
+    def keyed(table, mask=None) -> pa.Table:
+        """The key columns of `table` (rows `mask`), dictionary-decoded so they can be joined."""
+        table = getattr(table, 'table', table)
+        if mask is not None:
+            table = table.filter(pa.array(mask))
+        out = {}
+        for c in cols:
+            arr = table.column(c)
+            if pa.types.is_dictionary(arr.type):
+                arr = pc.cast(arr, arr.type.value_type)
+            out[c] = pc.cast(arr, pa.int64()) if c == 'frame' else pc.cast(arr, pa.string())
+        return pa.table(out)
+
+    if any(c not in t3.column_names for c in cols):
+        return int(sel.sum())
+    left = keyed(tk, sel)
+    right = keyed(t3).group_by(list(cols)).aggregate([])
+    return len(left.join(right, list(cols), join_type='left anti'))
+
+
+def _check_video(path: Path, n_frames: int, size, where: str, bad) -> None:
+    """Rules 7/8 for a video: its decodable frame count is `n_frames` and its frame size is the
+    calibration `size`. Opens the container (never decodes a frame)."""
+    from . import video
+    try:
+        reader = video.open_reader(str(path))
+    except Exception as e:
+        bad(7, f'{where}: cannot open {path.name}: {e}')
+        return
+    try:
+        n = len(reader)
+        h, w, _ = reader.frame_shape()
+    finally:
+        reader.close()
+    if n != n_frames:
+        bad(7, f'{where}: video has {n} frames, n_frames={n_frames}')
+    if size and (w, h) != tuple(size):
+        bad(8, f'{where}: video frame is {(w, h)}, calibration size is {tuple(size)}')
+
+
 def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     """Return a list of rule violations. Empty means the session is valid.
 
@@ -1273,14 +1320,18 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     rule 2 (names unique; skeleton/flip_pairs reference known names; flip is an involution --
     each pair is listed once, and the involution is the symmetric closure, so the only way to
     break it is to name a keypoint in two pairs with different partners); rules 4/5 (cameras
-    and calibration); rule 9 (no duplicate keys); rule 10 (a
-    positioned row -- visible or projected -- carries its coordinates); rule 11 (a `labeled`
+    and calibration; no camera dir/video under a group that calibration.toml does not declare);
+    rule 6 (every label-table `group_id` is in groups.pq); rule 9 (no duplicate keys); rule 10 (a
+    positioned row -- visible or projected -- carries its coordinates, a coordinate-free
+    keypoints.pq row only where points3d.pq has a row for the same key, and points3d.pq never
+    says `projected`, which §8 does not allow); rule 11 (a `labeled`
     instance row carries a finite, non-empty box; prediction sessions are exempt); rule 6 (no
     stale `regions.pq`); rule 13
     (extrinsics only for cameras declared moving, and EVERY frame of every moving camera -- a
     missing frame reads as a real pose at the world origin (eye(4) pre-fill); reported here as
     well as raised in `labels()` so a bulk validate lists every bad session); and rules 6/7/8
-    (per group: frames in range, pixels present and the right shape). `sess.labels(gid)` is
+    (per group: frames in range, pixels present and the right shape; with `check_images`, a
+    video's frame count and frame size too). `sess.labels(gid)` is
     also run per group and raises on unknown bodypart/camera/animal or bad frame. Label tables
     are optional; `points2d.pq` is accepted only for marked prediction sessions and is checked
     independently of annotation status/scatter rules.
@@ -1359,6 +1410,16 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if n and len(table.select(cols).group_by(list(cols)).aggregate([])) != n:
             bad(9, f'{stem}.pq has duplicate keys')
 
+    for stem in ('keypoints', 'points3d', 'instances', 'extrinsics'):
+        table = sess._tables[stem]
+        if table is None or not len(table) or 'group_id' not in table.column_names:
+            continue
+        codes, values = _codes(table, 'group_id')
+        unknown = sorted({values[c] for c in np.unique(codes)} - set(sess.groups))
+        if unknown:
+            bad(6, f'{stem}.pq has {len(unknown)} group_id(s) not in groups.pq, e.g. '
+                   f'{unknown[0]!r}; their rows are never read')
+
     t2p = sess._tables['points2d']
     if t2p is not None:
         if not sess.prediction_session:
@@ -1407,6 +1468,10 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     t3 = sess._tables['points3d']
     if t3 is not None and len(t3):
         st, vals = _codes(t3, 'status')
+        used = {vals[c] for c in np.unique(st)}
+        if 'projected' in used:
+            bad(10, 'points3d.pq has a status=projected row; the 3D layer is visible | missing | '
+                    'unlabeled (projected is a per-camera 2D state)')
         vis = np.isin(st, [i for i, v in enumerate(vals) if v in positioned])
         xyz = np.stack([_floats(t3, c, len(t3)) for c in 'xyz'], -1)
         if vis.any() and not np.isfinite(xyz[vis]).all():
@@ -1425,8 +1490,14 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         st, vals = _codes(tk, 'status')
         vis = np.isin(st, [i for i, v in enumerate(vals) if v in positioned])
         xy = np.stack([_floats(tk, c, len(tk)) for c in 'xy'], -1)
-        if vis.any() and not np.isfinite(xy[vis]).all() and t3 is None:
+        free = vis & ~np.isfinite(xy).all(-1)
+        if free.any() and t3 is None:
             bad(10, 'keypoints.pq has a visible row without x,y and there is no 3D layer')
+        elif free.any():
+            n = _rows_without_3d(tk, t3, free)
+            if n:
+                bad(10, f'keypoints.pq has {n} positioned row(s) without x,y and no points3d row '
+                        'for the same (group_id, frame, animal_id, bodypart)')
         if (~vis).any() and np.isfinite(xy[~vis]).any():
             bad(10, 'keypoints.pq has a missing/unlabeled row carrying coordinates')
 
@@ -1454,7 +1525,7 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         gcodes, gvals = _codes(te, 'group_id')
         frames = te.column('frame').combine_chunks().to_numpy(zero_copy_only=False)
         ccodes, cvals = _codes(te, 'camera')
-        for gid, g in sess.groups.items():
+        for gid, g in (sess.groups.items() if moving else ()):
             if gid not in gvals:
                 bad(13, f'group {gid!r}: cameras {sorted(moving)} are moving=true but '
                         f'extrinsics.pq has no rows for it')
@@ -1471,7 +1542,14 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     elif moving:
         bad(13, f'cameras {sorted(moving)} are moving=true but extrinsics.pq is absent/empty')
 
+    cams = set(sess.cam_names)
     for gid, g in sess.groups.items():
+        if g.dir.is_dir():
+            extra = sorted(e.name for e in g.dir.iterdir()
+                           if (e.is_dir() and e.name not in cams)
+                           or (e.suffix in VIDEO_EXTS and e.stem not in cams))
+            if extra:
+                bad(4, f'group {gid!r}: camera dirs/videos not in calibration.toml: {extra}')
         for cname in sess.cam_names:
             try:
                 kind, p = g.pixels(cname)
@@ -1479,6 +1557,9 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
                 bad(7, str(e))
                 continue
             if kind != 'frames':
+                if check_images:
+                    _check_video(p, g.n_frames, sess.rig.size(cname),
+                                 f'group {gid!r} camera {cname!r}', bad)
                 continue
             files = g.frame_paths(cname)
             if len(files) != g.n_frames:

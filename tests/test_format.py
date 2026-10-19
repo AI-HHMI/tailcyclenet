@@ -760,3 +760,103 @@ def test_a_video_session_never_reads_a_table(tmp_path):
     sess.preload()
     assert sess.labels('g0') is lab or sess.labels('g0').points3d.shape == lab.points3d.shape
     assert sess._table('points3d') is None
+
+
+def _rule_errs(path, check_images=True):
+    """validate_session's errors for the session at `path`."""
+    return fmt.validate_session(fmt.Session.load(path), check_images=check_images)
+
+
+def test_rule_6_rows_with_an_unknown_group_id_are_an_error(tmp_path):
+    """A typo'd group id used to vanish silently: `labels()` scatters only known groups."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(s)
+    assert not _rule(_rule_errs(s, False), 6)
+    t = pq.read_table(s / 'keypoints.pq').to_pydict()
+    t = {k: v + (['no_such_group'] if k == 'group_id' else v[:1]) for k, v in t.items()}
+    pq.write_table(pa.table(t), s / 'keypoints.pq')
+    errs = _rule(_rule_errs(s, False), 6)
+    assert errs and 'no_such_group' in errs[0]
+
+
+def test_rule_13_is_quiet_for_a_static_rig_with_a_partial_extrinsics_table(tmp_path):
+    """No camera is moving, so the only error is the one naming the static camera."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_3d(s)
+    g = pq.read_table(s / 'groups.pq').to_pydict()
+    g = {k: v + ['g001' if k == 'group_id' else v[0]] for k, v in g.items()}
+    pq.write_table(pa.table(g), s / 'groups.pq')
+    pq.write_table(pa.table({'group_id': ['g000'], 'frame': [0], 'camera': ['cam0'],
+                             'ext': [np.eye(4).ravel().tolist()]}), s / 'extrinsics.pq')
+    errs = _rule(_rule_errs(s, False), 13)
+    assert len(errs) == 1 and 'not moving=true' in errs[0], errs
+
+
+def test_rule_4_flags_a_camera_dir_or_video_calibration_does_not_declare(tmp_path):
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(s)
+    assert not _rule(_rule_errs(s, False), 4)
+    (s / 'groups' / 'g000' / 'cam9').mkdir()
+    (s / 'groups' / 'g000' / 'cam8.mp4').write_bytes(b'')
+    errs = _rule(_rule_errs(s, False), 4)
+    assert errs and 'cam9' in errs[0] and 'cam8.mp4' in errs[0]
+
+
+@pytest.mark.parametrize('n_extra, size, rule', [(0, (64, 48), None), (1, (64, 48), 7),
+                                                 (0, (32, 48), 8)])
+def test_rules_7_8_check_a_videos_frame_count_and_size(tmp_path, n_extra, size, rule):
+    import shutil
+
+    from .conftest import _write_video
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(s, T=4)
+    shutil.rmtree(s / 'groups' / 'g000' / 'cam0')
+    _write_video(s / 'groups' / 'g000' / 'cam0.mp4', 0, 4 + n_extra, size)
+    errs = _rule_errs(s)
+    for r in (7, 8):
+        assert bool(_rule(errs, r)) == (r == rule), errs
+    assert not _rule(_rule_errs(s, check_images=False), 7)
+
+
+def test_rule_10_a_coordinate_free_row_needs_a_3d_row_for_the_same_key(tmp_path):
+    """The exemption is per key: a points3d.pq row for SOME key used to excuse every row."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_3d(s)
+    assert not _rule(_rule_errs(s, False), 10)
+    t3 = pq.read_table(s / 'points3d.pq')
+    tk = pq.read_table(s / 'keypoints.pq')
+    free = np.isnan(tk.column('x').to_numpy(zero_copy_only=False))
+    assert free.any()
+    first = tk.filter(pa.array(free)).slice(0, 1).to_pydict()
+    gone = np.ones(len(t3), bool)
+    for i, row in enumerate(t3.select(['frame', 'animal_id', 'bodypart']).to_pylist()):
+        if (row['frame'], row['animal_id'], row['bodypart']) == (
+                first['frame'][0], first['animal_id'][0], first['bodypart'][0]):
+            gone[i] = False
+    assert (~gone).sum() == 1
+    pq.write_table(t3.filter(pa.array(gone)), s / 'points3d.pq')
+    errs = _rule(_rule_errs(s, False), 10)
+    assert errs and 'no points3d row' in errs[0], errs
+
+
+def test_rule_10_points3d_refuses_status_projected(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    s = tmp_path / 'ds' / 'train' / 'a'
+    _session_3d(s)
+    t3 = pq.read_table(s / 'points3d.pq').to_pydict()
+    t3['status'] = ['projected'] + t3['status'][1:]
+    pq.write_table(pa.table(t3), s / 'points3d.pq')
+    errs = _rule(_rule_errs(s, False), 10)
+    assert errs and 'projected' in errs[0]

@@ -643,3 +643,65 @@ def test_plan_windows_matches_run_blocks_on_a_real_group(tmp_path):
     starts, blocks, cam_decode, pipeline_det = _plan_windows(
         sess.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, group.n_frames, 0)
     assert starts and blocks
+
+
+def test_a_stated_budget_above_the_cap_gets_the_fraction_of_the_cap(monkeypatch):
+    """Asking for MORE than the machine has must not hand buffers more than asking for exactly
+    the cap: both clamp the PROCESS ceiling to the cap and give buffers the same fraction of it.
+    """
+    gb = memory.GB
+    monkeypatch.setattr(memory, '_meminfo', lambda: {'MemTotal': 512 * gb, 'MemAvailable': 400 * gb})
+    monkeypatch.setattr(memory, '_cgroup', lambda: (64 * gb, 0.0))
+    monkeypatch.setattr(memory, '_lsf_limit', lambda: None)
+    exact = memory.host_budget(64.0)
+    over = memory.host_budget(100.0)
+    assert over.budget_gb == pytest.approx(exact.budget_gb)
+    assert over.budget_gb == pytest.approx(64.0 * memory.DEFAULT_FRACTION)
+    assert over.ceiling == pytest.approx(64.0) and 'clamped' in over.source
+    memory.reset()
+
+
+def test_the_peak_check_measures_against_the_stated_figure_after_rebudget(monkeypatch):
+    """`rebudget` subtracts the process floor from the buffers, not from the user's ceiling, so
+    a peak below `--max-ram` must stay quiet and one above it must warn.
+    """
+    import warnings as _w
+
+    gb = memory.GB
+    monkeypatch.setattr(memory, '_meminfo', lambda: {'MemTotal': 512 * gb, 'MemAvailable': 400 * gb})
+    monkeypatch.setattr(memory, '_cgroup', lambda: (None, 0.0))
+    monkeypatch.setattr(memory, '_lsf_limit', lambda: None)
+    monkeypatch.setattr(memory, 'rss_gb', lambda: 5.0)
+    b = memory.rebudget(24.0)
+    assert b.ceiling == pytest.approx(24.0)
+    for peak, n_warn in ((23.0, 0), (25.0, 1)):
+        memory._peak_warned = False
+        monkeypatch.setattr(memory, 'peak_gb', lambda peak=peak: peak)
+        with _w.catch_warnings(record=True) as got:
+            _w.simplefilter('always')
+            memory.check_peak('a phase', b)
+        assert len(got) == n_warn, peak
+    memory._peak_warned = False
+    memory.reset()
+
+
+def test_cgroup_v1_limit_is_read_from_the_memory_hierarchy(tmp_path):
+    """On cgroup v1 the memory controller is mounted at `/sys/fs/cgroup/memory/<rel>` and its
+    line is usually not the last one in `/proc/self/cgroup`.
+    """
+    proc = tmp_path / 'cgroup'
+    proc.write_text('12:pids:/job\n4:memory:/lsf/job7\n1:name=systemd:/job\n')
+    leaf = tmp_path / 'sys' / 'memory' / 'lsf' / 'job7'
+    leaf.mkdir(parents=True)
+    (leaf / 'memory.limit_in_bytes').write_text(str(8 << 30))
+    (leaf / 'memory.usage_in_bytes').write_text(str(1 << 30))
+    (tmp_path / 'sys' / 'memory' / 'memory.limit_in_bytes').write_text(str(1 << 63))
+    assert memory._cgroup(proc, tmp_path / 'sys') == (float(8 << 30), float(1 << 30))
+
+    proc.write_text('0::/user.slice/s.scope\n')
+    v2 = tmp_path / 'sys' / 'user.slice'
+    (v2 / 's.scope').mkdir(parents=True)
+    (v2 / 'memory.max').write_text(str(4 << 30))
+    (v2 / 's.scope' / 'memory.max').write_text('max')
+    (v2 / 's.scope' / 'memory.current').write_text('7')
+    assert memory._cgroup(proc, tmp_path / 'sys') == (float(4 << 30), 7.0)

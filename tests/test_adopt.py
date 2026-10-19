@@ -456,3 +456,30 @@ def test_the_in_memory_session_matches_the_written_one(tmp_path):
         for cam in mem.cam_names:
             assert (Path(disk.groups[gid].pixels(cam)[1]).resolve()
                     == Path(mem.groups[gid].source(cam)[1]).resolve())
+
+
+def test_a_prediction_groups_table_without_fps_reconstructs(tmp_path):
+    """`fps` is optional in groups.pq; its fallback used to be sized by the COLUMN count, so three
+    groups and two columns raised IndexError."""
+    import math
+
+    import toml
+
+    cal = _calib(tmp_path, ['0', '1'])
+    gids = ['t', 'u', 'v']
+    _touch(tmp_path / 'rec', *[f'cam{c}_{g}.mp4' for g in gids for c in (0, 1)])
+    p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
+    pred = tmp_path / 'pred'
+    pred.mkdir()
+    prov = adopt.provenance_of(p)
+    prov['source_session_id'] = p.session_id
+    (pred / 'session.toml').write_text(toml.dumps(
+        {'mode': '3d', 'units': 'mm', 'labels': 'tracked', 'names': list(KPTS_3D),
+         'provenance': prov}))
+    fmt.dump_calibration(pred / 'calibration.toml', p.rig)
+    fmt.write_table(pred / 'groups.pq', {'group_id': np.array(gids, dtype=object),
+                                         'n_frames': np.array([6, 6, 6], np.int32)},
+                    dict_cols=())
+    back = adopt.session_from_prediction(pred)
+    assert sorted(back.groups) == gids
+    assert all(math.isnan(g.fps) for g in back.groups.values())

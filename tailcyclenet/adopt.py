@@ -543,11 +543,11 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
     names = list(cfg['names'])
     K, C = len(names), len(p.rig)
     groups, empty = {}, {}
+    fps = gt.get('fps') or [None] * len(want_groups)
     for i, gid in enumerate(want_groups):
         n = int(gt['n_frames'][i])
         groups[gid] = fmt.video_group(gid, n, p.videos[gid],
-                                      fps=float(gt.get('fps', [float('nan')] * len(gt))[i]
-                                                or float('nan')))
+                                      fps=float(fps[i] or float('nan')))
         empty[gid] = fmt.empty_labels(0, n, K, C, mode3d=(cfg['mode'] == '3d'))
     sess = fmt.VideoSession(
         path=_common_parent([Path(f) for f in files]) / p.session_id,

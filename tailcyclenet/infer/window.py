@@ -136,6 +136,20 @@ def window_starts(span: int, window: int, overlap: int, start: int = 0):
     return starts
 
 
+def last_window_start(starts, window: int, t: int) -> int | None:
+    """The seam rule: frame `t` belongs to the LAST window containing it -> that window's start.
+
+    `starts` are ascending window starts and `window` the window length. None when no window
+    covers `t` (before the first start, past the last window's end, or no windows at all).
+    """
+    starts = np.asarray(starts)
+    pos = int(np.searchsorted(starts, t, side='right'))
+    if pos == 0:
+        return None
+    start = int(starts[pos - 1])
+    return start if t < start + window else None
+
+
 def boxes_from_points(points, cgroup, min_crop_dim, mode):
     """Crop boxes for one animal in one window, from points -- the crop rule, shared with training.
 

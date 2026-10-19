@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt
 from tailcyclenet.dataset import read_frames
+from tailcyclenet.infer.window import last_window_start
 from tailcyclenet.video import H264Writer
 
 
@@ -111,24 +112,6 @@ SCORE_RANGE = (-0.5, 0.5)
 BAD = (0, 0, 255)
 GOOD = (0, 255, 0)
 UNSCORED = (128, 128, 128)
-
-
-def frame_to_window(starts: np.ndarray, n_frames: int, t: int) -> int | None:
-    """The window a frame belongs to: the LAST one containing it, or None outside the scored set.
-
-    Inputs: starts -- the scored window starts, ascending; n_frames -- the window length;
-            t -- a frame index.
-    Outputs: the chosen window start, or None when no scored window covers `t`.
-    A frame before the first window must return None rather than indexing the final window.
-    Side effects: none.
-    """
-    pos = int(np.searchsorted(starts, t, side='right'))
-    if pos == 0:
-        return None
-    start = int(starts[pos - 1])
-    if t >= start + n_frames:
-        return None
-    return start
 
 
 def _colour(score: float, lo: float, hi: float):
@@ -294,7 +277,7 @@ def main() -> int:
                     note = (f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  '
                             f'framewise score {"available" if score_key is not None else "missing"}')
                 else:
-                    score_key = frame_to_window(starts, n_frames, t)
+                    score_key = last_window_start(starts, n_frames, t)
                     note = f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  window {score_key}'
                 out_im = draw_scored(im, labels, animal, t, ci, session.names, session.skeleton,
                                      scores, score_key, lo, hi, note, stats)

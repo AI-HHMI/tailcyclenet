@@ -34,21 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
 from tailcyclenet.checkpoints import load_config, _SCORER_CONFIG  # noqa: E402
-
-
-def _frame_to_window(starts, n_frames, T):
-    """Map every source frame to the LAST window containing it.
-
-    Inputs: starts -- sorted window start frames; n_frames -- the group's length; T -- window
-            length.
-    Outputs: {frame: start}.
-    Side effects: none.
-    """
-    assign = {}
-    for s in sorted(starts):
-        for f in range(int(s), min(int(s) + T, n_frames)):
-            assign[f] = int(s)
-    return assign
+from tailcyclenet.infer.window import last_window_start  # noqa: E402
 
 
 def _animal_index(lab, animal_id):
@@ -93,10 +79,11 @@ def _per_window_error(pred_sess, ref_sess, group_id, animal_id, starts, T, keypo
     r = rlab.points3d[ra, :, rnames.index(keypoint), :]
     n = min(p.shape[0], r.shape[0], n_frames)
     d = np.linalg.norm(p[:n] - r[:n], axis=-1)
-    assign = _frame_to_window(starts, n, T)
+    starts = sorted(starts)
     buckets: dict[int, list] = {}
-    for f, s in assign.items():
-        if np.isfinite(d[f]):
+    for f in range(n):
+        s = last_window_start(starts, T, f)
+        if s is not None and np.isfinite(d[f]):
             buckets.setdefault(s, []).append(float(d[f]))
     return {s: float(np.mean(v)) for s, v in buckets.items() if v}
 

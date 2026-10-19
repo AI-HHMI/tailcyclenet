@@ -554,3 +554,15 @@ def test_a_failing_optimizer_restore_still_puts_the_model_back_in_train_mode(mon
         st.evaluate(model, _fake_loader(), lambda *a: None, 'cpu', 1, opt)
     assert opt.calls == ['eval', 'train']
     assert model.mode == 'train', 'the model must be restored even when the optimizer is not'
+
+
+def test_an_all_rejected_epoch_raises_even_though_rejections_advance_the_step():
+    """A skipped triplet still advances `step`, so the guard must count optimizer steps."""
+    from tailcyclenet.scorer.train import require_progress
+
+    with pytest.raises(RuntimeError, match='all samples were rejected'):
+        require_progress(stepped_this_epoch=0, stepped_this_run=0, step=50, local_target=100)
+    with pytest.raises(RuntimeError, match='all samples were rejected'):
+        require_progress(stepped_this_epoch=0, stepped_this_run=0, step=100, local_target=100)
+    require_progress(stepped_this_epoch=3, stepped_this_run=3, step=50, local_target=100)
+    require_progress(stepped_this_epoch=0, stepped_this_run=7, step=100, local_target=100)

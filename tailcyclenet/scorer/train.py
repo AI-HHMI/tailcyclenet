@@ -884,6 +884,23 @@ def scorer_checkpoint_mode_mismatch(requested: str, checkpoint: dict) -> bool:
     """Whether a scorer checkpoint must take the weights-only warm-start branch."""
     return scorer_checkpoint_granularity(checkpoint) != str(requested).lower()
 
+
+def require_progress(stepped_this_epoch: int, stepped_this_run: int, step: int,
+                     local_target: int) -> None:
+    """Refuse an epoch that took no optimizer step, or a run that reached its budget without one.
+
+    A rejected triplet or a non-finite loss/gradient still advances `step`, so the step counter
+    alone cannot tell an all-rejecting recipe from a training one. An epoch cut short by the
+    budget is excused unless the whole run never stepped.
+    """
+    if stepped_this_epoch or (step >= local_target and stepped_this_run):
+        return
+    raise RuntimeError(
+        'scorer DataLoader produced no successful triplets in an epoch; all samples were '
+        'rejected. Check corruption magnitudes, distance thresholds, segment settings, '
+        'visibility, and the training split instead of retrying forever.')
+
+
 def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         max_iterations: int | None, no_wandb: bool, fresh: bool = False, fabric=None,
         num_workers: int | None = None, devices_arg: int | None = None) -> None:
@@ -1095,6 +1112,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         optimizer.train()
     step = dist_utils.ceil_div(start_iter, world)
     skipped = 0
+    stepped_this_run = 0
     local_val_freq = dist_utils.per_rank(val_freq, world) if val_freq else 0
     local_ckpt_freq = dist_utils.per_rank(ckpt_freq, world)
     local_print_freq = dist_utils.per_rank(print_freq, world)
@@ -1139,7 +1157,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         return None
     local_target = dist_utils.ceil_div(n_target, world)
     while step < local_target:
-        epoch_start = step
+        stepped_this_epoch = 0
         for trip in timed(train_loader, waited):
             if step >= local_target:
                 break
@@ -1174,6 +1192,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 continue
             optimizer.step()
             step += 1
+            stepped_this_epoch += 1
+            stepped_this_run += 1
             iteration = step * world
             hist = loss_fn.collapse_history(prefix='')
             loss_fn.reset_history()
@@ -1259,11 +1279,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 if fabric is not None:
                     fabric.barrier()
                 ckpted[0] += time.time() - started
-        if step == epoch_start:
-            raise RuntimeError(
-                'scorer DataLoader produced no successful triplets in an epoch; all samples were '
-                'rejected. Check corruption magnitudes, distance thresholds, segment settings, '
-                'visibility, and the training split instead of retrying forever.')
+        require_progress(stepped_this_epoch, stepped_this_run, step, local_target)
     if wb is not None:
         wb.finish()
     if is0:

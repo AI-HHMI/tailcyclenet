@@ -3,15 +3,16 @@
 import pytest
 import torch
 
+from tailcyclenet.config import SCORER_CONFIG, load_config
 from tailcyclenet.scorer.checkpoint import save_scorer_checkpoint
 from tailcyclenet.scorer.contract import (
+    require_scorer_contract,
     require_scorer_granularity,
     scorer_checkpoint_granularity,
     scorer_contract,
     scorer_contract_mismatches,
     scorer_output_granularity,
 )
-from tailcyclenet.config import SCORER_CONFIG, load_config
 from tailcyclenet.scorer.losses import FrameTripletScorerLoss
 from tailcyclenet.scorer.train import validate_scorer_config
 
@@ -23,28 +24,19 @@ def test_new_family_config_defaults_to_frame_but_absent_run_key_is_sequence():
     assert validate_scorer_config({'scorer': {}, 'model': {}, 'data': {}}) == 'sequence'
 
 
-def test_old_and_new_checkpoint_modes_are_refused_crosswise():
-    old = {'kind': 'scorer', 'config': {'scorer': {}}}
-    new = {'kind': 'scorer', 'output_granularity': 'frame'}
-    assert scorer_checkpoint_granularity(old) == 'sequence'
-    assert scorer_checkpoint_granularity(new) == 'frame'
-    require_scorer_granularity('sequence', 'sequence')
+def test_checkpoint_granularity_is_read_and_refused_crosswise():
+    assert scorer_checkpoint_granularity({'kind': 'scorer', 'config': {'scorer': {}}}) == 'sequence'
+    assert scorer_checkpoint_granularity({'kind': 'scorer', 'output_granularity': 'frame'}) == 'frame'
     require_scorer_granularity('frame', 'frame')
-    with pytest.raises(ValueError, match='output_granularity mismatch'):
-        require_scorer_granularity('frame', 'sequence')
-    with pytest.raises(ValueError, match='output_granularity mismatch'):
-        require_scorer_granularity('sequence', 'frame')
-
-
-def test_conflicting_checkpoint_mode_metadata_is_refused():
+    for want, got in (('frame', 'sequence'), ('sequence', 'frame')):
+        with pytest.raises(ValueError, match='output_granularity mismatch'):
+            require_scorer_granularity(want, got)
     with pytest.raises(ValueError, match='conflicting output_granularity'):
-        scorer_checkpoint_granularity({
-            'output_granularity': 'frame',
-            'scorer_output_granularity': 'sequence',
-        })
+        scorer_checkpoint_granularity({'output_granularity': 'frame',
+                                       'scorer_output_granularity': 'sequence'})
 
 
-def test_sequence_contract_normalizes_inherited_frame_defaults_and_ranges():
+def test_contract_normalises_sequence_defaults_and_keeps_frame_ranges():
     config = {
         'scorer': {
             'output_granularity': 'sequence',
@@ -60,85 +52,59 @@ def test_sequence_contract_normalizes_inherited_frame_defaults_and_ranges():
     assert contract['source_frame_duplicate_policy'] == 'legacy'
     assert contract['segment_count'] == 1
     assert not scorer_contract_mismatches(config, {'scorer_metadata': {'contract': contract}})
+    frame = {'scorer': {'output_granularity': 'frame', 'corruption': {'segment_count': [1, 2]}}}
+    assert scorer_contract(frame)['segment_count'] == [1, 2]
 
 
-def test_true_2d_sampling_semantics_are_part_of_scorer_contract():
-    config = {'scorer': {'output_granularity': 'frame',
-                         'two_d_sampling': 'true-2d-hybrid-v1'},
+def test_true_2d_sampling_is_in_the_contract_and_legacy_checkpoints_fall_back_to_config():
+    config = {'scorer': {'output_granularity': 'frame', 'two_d_sampling': 'true-2d-hybrid-v1'},
               'data': {'prob_2d_only': 0.2}}
-    old = {'config': {'scorer': {'output_granularity': 'frame'},
-                      'data': {'prob_2d_only': 0.2}}}
-    mismatches = scorer_contract_mismatches(config, old)
-    assert 'config.two_d_sampling' in mismatches
+    old = {'config': {'scorer': {'output_granularity': 'frame'}, 'data': {'prob_2d_only': 0.2}}}
+    assert 'config.two_d_sampling' in scorer_contract_mismatches(config, old)
 
-
-def test_legacy_frame_checkpoint_uses_embedded_config_for_new_contract_fields():
-    config = {'scorer': {'output_granularity': 'frame',
-                         'two_d_sampling': 'legacy-3d-single-view'},
-              'data': {'prob_2d_only': 0.2}}
-    embedded = {'scorer': {'output_granularity': 'frame'},
-                'data': {'prob_2d_only': 0.2}}
-    metadata_contract = scorer_contract(embedded)
+    config['scorer']['two_d_sampling'] = 'legacy-3d-single-view'
+    metadata_contract = scorer_contract(old['config'])
     metadata_contract.pop('two_d_sampling')
     metadata_contract.pop('prob_2d_only')
-    from tailcyclenet.scorer.contract import require_scorer_contract
-    require_scorer_contract(
-        config,
-        {'config': embedded, 'scorer_metadata': {'contract': metadata_contract}},
-    )
+    require_scorer_contract(config, {**old, 'scorer_metadata': {'contract': metadata_contract}})
 
 
-def test_scorer_window_length_may_differ_from_model_stride():
-    """`n_frames` and `stride_length` may differ (owner decision 2026-10-19), as on the pose path."""
-    config = {'scorer': {}, 'data': {'n_frames': 12}, 'model': {'stride_length': 24}}
-    assert validate_scorer_config(config) == 'sequence'
+_DELETED = [('sequence_far_gate', False, True), ('reference_margin_px', 0.0, 2.0),
+            ('n_segments', 1, [1, 2]), ('segment_length_frames', [1, 1], [2, 6]),
+            ('segment_full_window_share', 0.0, 0.1), ('segment_full_window_prob', 0.0, 0.1)]
 
 
-@pytest.mark.parametrize('key, inert, live', [
-    ('sequence_far_gate', False, True), ('reference_margin_px', 0.0, 2.0),
-    ('n_segments', 1, [1, 2]), ('segment_length_frames', [1, 1], [2, 6]),
-    ('segment_full_window_share', 0.0, 0.1), ('segment_full_window_prob', 0.0, 0.1)])
-def test_a_deleted_corruption_key_is_refused_by_name_unless_inert(key, inert, live):
-    """A deleted key at its inert value (an old run folder's config) loads; any other raises."""
-    config = {'scorer': {'output_granularity': 'frame', 'corruption': {key: inert}}}
-    assert validate_scorer_config(config) == 'frame'
-    config['scorer']['corruption'][key] = live
-    with pytest.raises(SystemExit, match=rf'\[scorer\.corruption\]\.{key} is deleted'):
-        validate_scorer_config(config)
+def _frame(**corruption):
+    return {'scorer': {'output_granularity': 'frame', 'corruption': corruption}}
 
 
-def test_the_deleted_independent_far_gate_is_refused_by_name():
-    """`reference_gate = "independent_far"` is deleted; `source_far` and `none` remain."""
-    config = {'scorer': {'output_granularity': 'frame',
-                         'corruption': {'reference_gate': 'independent_far'}}}
-    with pytest.raises(SystemExit, match='independent_far" is deleted'):
-        validate_scorer_config(config)
+def test_validate_scorer_config_refusals():
+    """Deleted keys at live values, the deleted gate, a shadowed `min_valid_frames`, and a
+    positive clean band with a zero corrupt threshold all raise by name."""
+    cases = [(_frame(**{k: live}), rf'\[scorer\.corruption\]\.{k} is deleted')
+             for k, _inert, live in _DELETED]
+    cases += [
+        (_frame(reference_gate='independent_far'), 'independent_far" is deleted'),
+        ({'scorer': {'output_granularity': 'frame', 'min_valid_frames': 6,
+                     'corruption': {'min_valid_frames': 2}}}, r'\[scorer\]\.min_valid_frames'),
+        (_frame(min_corrupt_px=0.0, max_clean_px=0.5), 'both zero'),
+    ]
+    for config, match in cases:
+        with pytest.raises(SystemExit, match=match):
+            validate_scorer_config(config)
+
+
+def test_validate_scorer_config_accepts_inert_and_live_values():
+    """Old run-folder configs carry deleted keys at inert values; those must still load."""
+    for key, inert, _live in _DELETED:
+        assert validate_scorer_config(_frame(**{key: inert})) == 'frame', key
     for gate in ('source_far', 'none'):
-        config['scorer']['corruption']['reference_gate'] = gate
-        assert validate_scorer_config(config) == 'frame'
-
-
-def test_min_valid_frames_under_corruption_is_refused_not_silently_overridden():
-    """The nested key would be overwritten by `[scorer].min_valid_frames`, so it is refused."""
-    config = {'scorer': {'output_granularity': 'frame', 'min_valid_frames': 6,
-                         'corruption': {'min_valid_frames': 2}}}
-    with pytest.raises(SystemExit, match=r'\[scorer\]\.min_valid_frames'):
-        validate_scorer_config(config)
-    del config['scorer']['corruption']['min_valid_frames']
-    validate_scorer_config(config)
-
-
-def test_zero_min_corrupt_threshold_cannot_have_positive_clean_band():
-    config = {'scorer': {'output_granularity': 'frame',
-                         'corruption': {'min_corrupt_px': 0.0, 'max_clean_px': 0.5}}}
-    with pytest.raises(SystemExit, match='both zero'):
-        validate_scorer_config(config)
-
-
-def test_frame_contract_preserves_ranged_segment_count():
-    config = {'scorer': {'output_granularity': 'frame',
-                         'corruption': {'segment_count': [1, 2]}}}
-    assert scorer_contract(config)['segment_count'] == [1, 2]
+        assert validate_scorer_config(_frame(reference_gate=gate)) == 'frame'
+    validate_scorer_config({'scorer': {'output_granularity': 'frame', 'min_valid_frames': 6,
+                                       'corruption': {}}})
+    # `n_frames` and `stride_length` may differ (owner decision 2026-10-19).
+    assert validate_scorer_config({'scorer': {}, 'data': {'n_frames': 12},
+                                   'model': {'stride_length': 24}}) == 'sequence'
 
 
 def test_frame_checkpoint_stamps_and_saves_the_loss_scale(tmp_path):

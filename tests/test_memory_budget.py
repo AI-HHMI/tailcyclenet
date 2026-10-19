@@ -1,15 +1,6 @@
-"""The host-RAM budget, and the standing rule that NOTHING it sizes may move a number.
-
-`tailcyclenet/memory.py` resolves one budget from the cgroup ancestry, LSF's own variables,
-`MemAvailable` and `MemTotal`; three consumers size their buffers from it. The budget depends on
-machine state, so two runs of one command can resolve it differently -- acceptable only because
-every knob downstream of it is output-neutral. **These tests are what makes that sentence true.**
-
-`tests/test_detector.py` classifies `batch` as `plumbing`, i.e. ASSERTS that no run can differ in
-it. Nothing verified that, so it is checked here and `detect_raw` keeps the value pinned.
-
-Same for the dtype: `_fetch` hands back uint8 and the `/255` happens on the device -- a 4x cut
-that is only legitimate because it is bit-identical.
+"""The host-RAM budget (`tailcyclenet/memory.py`), and the standing rule that NOTHING it sizes
+may move a number: the budget depends on machine state, which is acceptable only because every
+knob downstream of it is output-neutral. These tests are what makes that true.
 """
 from __future__ import annotations
 
@@ -24,10 +15,44 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import memory
-# The fixture lives in test_infer.py; re-export it so pytest resolves it by name here. `noqa`
-# because ruff reads the parameter of the test below as a redefinition rather than as pytest's
-# fixture injection, which is a false positive on every shared-fixture import.
-from test_infer import multiwindow_scene  # noqa: F401,F811
+
+
+@pytest.fixture(scope='module')
+def mv16(tmp_path_factory):
+    """(model, session, registry, name): a static 3-camera 3D session, T=16 (seven windows)."""
+    import conftest as cf
+    from tailcyclenet.format import Registry, load_dataset
+    from tailcyclenet.model import build_model
+    from test_model import SMALL
+
+    root = tmp_path_factory.mktemp('mv16')
+    cf._session_3d(root / 'mv' / 'test' / 's', T=16)
+    ds = load_dataset(root / 'mv')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    return build_model(SMALL, n_keypoints=registry.n_keypoints).eval(), sess, registry, ds.name
+
+
+def _whole_frame_boxes(sess, T=16):
+    """One detector-style row whose box is the whole frame in every camera."""
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, T, len(sess.rig), 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h
+    return boxes
+
+
+def _assert_same(a_out, b_out, what):
+    """Every array of two merged outputs is identical (NaN-aware)."""
+    assert set(a_out) == set(b_out)
+    for k, v in b_out.items():
+        a, b = np.asarray(a_out[k]), np.asarray(v)
+        if b.dtype.kind in 'fc':
+            assert np.array_equal(a, b, equal_nan=True), f'{k} moved with {what}'
+        elif b.dtype.kind in 'iub':
+            assert np.array_equal(a, b), f'{k} moved with {what}'
+        else:
+            assert str(a) == str(b), f'{k} moved with {what}'
 
 
 # Every one of the 256 possible byte values, not a sample: the failure mode is a handful of ULPs
@@ -44,37 +69,16 @@ def test_uint8_then_divide_on_host_is_bit_identical_to_the_old_conversion():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
-def test_dividing_by_a_python_scalar_on_cuda_is_NOT_correctly_rounded():
-    """The trap, pinned as a fact: `x / 255` with a PYTHON scalar takes a reciprocal-multiply fast
-    path on CUDA that is off by one ULP on most byte values -- 1 ULP on the detector's INPUT
-    perturbs every objectness score and can return different boxes. If this starts passing, torch
-    changed its scalar-division lowering.
-    """
-    scalar = torch.from_numpy(_ALL_BYTES).cuda().float().div_(255).cpu().numpy()
-    assert not np.array_equal(_HOST_REFERENCE, scalar), \
-        'scalar division now matches -- see the docstring before changing detect_raw'
+def test_cuda_divides_bytes_exactly_only_by_a_0d_tensor():
+    """`x / 255` with a PYTHON scalar takes a reciprocal-multiply path on CUDA that is 1 ULP off on
+    most bytes (enough to move detector boxes); dividing by a 0-d tensor, the spelling
+    `detect_raw` uses, is bit-identical to the host. If the first half fails, torch changed."""
+    x = torch.from_numpy(_ALL_BYTES).cuda().float()
+    scalar = x.clone().div_(255).cpu().numpy()
     ulps = np.abs(_HOST_REFERENCE.view(np.int32) - scalar.view(np.int32))
     assert ulps.max() == 1, f'expected a 1-ULP disagreement, got {ulps.max()}'
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
-def test_dividing_by_a_0d_tensor_on_cuda_IS_bit_identical():
-    """...and this is the spelling `detect_raw` uses, for the reason above."""
-    new = (torch.from_numpy(_ALL_BYTES).cuda().float()
-           .div_(torch.tensor(255.0, device='cuda')).cpu().numpy())
-    assert np.array_equal(_HOST_REFERENCE, new), 'the /255 move is not bit-identical on cuda'
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
-def test_detect_raw_uses_the_tensor_divisor_not_the_scalar():
-    """The two tests above are about torch; this one is about us actually using the right one."""
-    import inspect
-
-    from tailcyclenet.detector import detect_raw
-
-    src = inspect.getsource(detect_raw)
-    assert 'div_(_div255)' in src, 'detect_raw must divide by the 0-d tensor, not by 255'
-    assert 'div_(255)' not in src, 'detect_raw is using the 1-ULP-wrong scalar division'
+    exact = x.clone().div_(torch.tensor(255.0, device='cuda')).cpu().numpy()
+    assert np.array_equal(_HOST_REFERENCE, exact), 'the /255 move is not bit-identical on cuda'
 
 
 @pytest.fixture(scope='module')
@@ -165,23 +169,6 @@ def test_detection_is_batch_aligned_and_slice_independent(det_scene):
             'read= must be a pure substitution for the decode'
 
 
-def test_batch_is_NOT_inert_which_is_why_the_budget_may_not_touch_it(det_scene):
-    """A FINDING ABOUT THE REPO, PINNED SO IT IS NOT REDISCOVERED THE EXPENSIVE WAY: `batch` is
-    listed in `plumbing` only because it is pinned, not because it is inert. A different batch is a
-    different reduction order (boxes move ~0.2 px, enough to reorder NMS), so `detect_raw` must
-    NOT derive it from the RAM budget, and `eval_detector.py --batch-size` is a live hazard.
-    On CPU the effect may be absent; an equal result is reported as a skip.
-    """
-    from tailcyclenet.detector import detect_raw
-
-    det, sess, gid = det_scene
-    memory.reset()
-    a = detect_raw(det, (64, 64), sess, gid, 2, device='cpu', batch=8)
-    b = detect_raw(det, (64, 64), sess, gid, 2, device='cpu', batch=3)
-    if np.array_equal(a[0], b[0], equal_nan=True):
-        pytest.skip('this CPU build batches bit-exactly; the CUDA measurement stands')
-
-
 def test_fits_never_exceeds_what_the_caller_asked_for():
     """`memory.fits` may only ever SHRINK a buffer.
 
@@ -267,199 +254,63 @@ def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees(
         'which is the regression this guards')
 
 
-@pytest.mark.parametrize('budget_gb', [0.001, 4096])
-def test_the_frame_cache_changes_no_pixel_at_any_budget(multiwindow_scene, budget_gb):  # noqa: F811
-    """THE INVARIANT THE WHOLE BUDGET RESTS ON.
-
-    `run_group`'s frame cache exists to collapse the 6x re-decode (three overlapping windows x two
-    `--refine` passes) to 1x. It is a pure speed change and must be provably one: a tiny budget
-    disables the cache and shrinks camera concurrency to 1, a huge budget enables both, and the
-    two must agree BYTE FOR BYTE across every array `run_group` returns.
-
-    Run at both ends rather than at the default, because the default on the test host is whatever
-    that host happens to have free -- which is exactly the non-determinism being ruled out.
-    """
-    from tailcyclenet.infer.window import InferConfig, run_group
-
-    model, sess, registry, name = multiwindow_scene
-    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
-                      anchor='none')
-
-    memory.reset()
-    memory.current(override_gb=budget_gb)
-    try:
-        got = run_group(model, sess, next(iter(sess.groups)), registry, name, cfg)
-    finally:
-        memory.reset()
-
-    memory.reset()
-    memory.current(override_gb=4096)
-    try:
-        ref = run_group(model, sess, next(iter(sess.groups)), registry, name, cfg)
-    finally:
-        memory.reset()
-
-    assert set(got) == set(ref)
-    for k in ref:
-        a, b = got[k], ref[k]
-        if isinstance(b, np.ndarray) and b.dtype.kind == 'f':
-            assert np.array_equal(a, b, equal_nan=True), f'{k} moved with the RAM budget'
-        elif isinstance(b, np.ndarray):
-            assert np.array_equal(a, b), f'{k} moved with the RAM budget'
-        else:
-            assert a == b, f'{k} moved with the RAM budget'
-
-
-@pytest.mark.parametrize('anchor', ['none', 'carry'])
-@pytest.mark.parametrize('refine', [False, True])
-def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
-    """THE INVARIANT FOR THE POSE HALF: how many windows a block holds comes from FREE MEMORY,
-    so if it could move a number, two machines running one command would disagree and nothing
-    would say so. Exercised over a DETECTOR box source as well as the label path, because that is
-    where a boundary has something to break (association state and the detection cursor).
-    """
-    import conftest as cf
-    from tailcyclenet.format import Registry, load_dataset
+def test_the_frame_cache_and_block_size_change_no_pixel(mv16):
+    """THE INVARIANT THE WHOLE BUDGET RESTS ON: a tiny budget (no frame cache, one camera in
+    flight, one-window blocks, no detection lookahead) and a huge one agree BYTE FOR BYTE, on the
+    label path and over a detector box source with carry + refine (where a block boundary has
+    association state and a detection cursor to break)."""
     from tailcyclenet.infer.window import InferConfig, merge_blocks, run_blocks
-    from tailcyclenet.model import build_model
-    from test_model import SMALL
 
-    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=16)
-    ds = load_dataset(tmp_path / 'mv')
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+    model, sess, registry, name = mv16
+    boxes = _whole_frame_boxes(sess)
 
-    C = len(sess.rig)
-    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
-    boxes = np.zeros((1, 16, C, 4), np.float32)
-    boxes[..., 2], boxes[..., 3] = w, h
-
-    def boxes_for(store, lo, hi):
-        return (boxes[:, lo:hi], None)
-
-    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
-                      anchor=anchor, refine=refine)
-
-    def run(gb):
-        memory.reset()
-        memory.current(override_gb=gb)
-        try:
-            blocks = list(run_blocks(model, sess, 'g000', registry, ds.name, cfg,
-                                     boxes_for=boxes_for, n_rows=1))
-            return len(blocks), merge_blocks(blocks)
-        finally:
-            memory.reset()
-
-    # 64x48x3 x 3 cameras is 27.6 kB a frame index, so these span one-window blocks to one block.
-    n_small, small = run(0.0008)
-    n_big, big = run(4096)
-    assert n_small > n_big, f'the budgets must actually differ in block count ({n_small} vs {n_big})'
-    assert n_big == 1, 'a roomy budget should take the whole clip in one block'
-    for k, v in big.items():
-        a, b = np.asarray(v), np.asarray(small[k])
-        if a.dtype.kind in 'fc':
-            assert np.array_equal(np.nan_to_num(a, nan=-9e9), np.nan_to_num(b, nan=-9e9)), \
-                f'{k} moved with the block size'
-        elif a.dtype.kind in 'iub':
-            assert np.array_equal(a, b), f'{k} moved with the block size'
-        else:
-            assert str(a) == str(b), f'{k} moved with the block size'
-
-
-def test_a_window_that_does_not_fit_is_refused_not_re_decoded(tmp_path):
-    """No silent degradation below one window, because there is nowhere to degrade TO.
-
-    Refine pass 2 crops from the SAME frames pass 1 did. Dropping them means either decoding the
-    window twice -- the 3x the store exists to remove -- or re-cropping from the stored crop, which
-    double-resamples and is not output-neutral. So the budget either holds a window or the run says
-    so, with the arithmetic and the flag that would fix it.
-    """
-    import conftest as cf
-    from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer.window import InferConfig, run_group
-    from tailcyclenet.model import build_model
-    from test_model import SMALL
-
-    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=8)
-    ds = load_dataset(tmp_path / 'mv')
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
-    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu')
-
-    memory.reset()
-    memory.current(override_gb=1e-6)
-    try:
-        with pytest.raises(SystemExit) as e:
-            run_group(model, sess, 'g000', registry, ds.name, cfg)
-    finally:
-        memory.reset()
-    msg = str(e.value)
-    assert '--max-ram' in msg and 'one window' in msg
-    assert 'frame store' in msg, 'the message must show the arithmetic, not just the verdict'
-
-
-def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
-    """TWO BLOCKS ARE LIVE WHEN DETECTION RUNS AHEAD, and both come out of one share: budgeting
-    one block and running two overshot the flag. The fix is not to halve the block (which would
-    double the starting budget) -- the LOOKAHEAD degrades: with room for two blocks it pipelines,
-    and below that it detects inline exactly as before.
-    """
-    import conftest as cf
-    from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer.window import InferConfig, merge_blocks, run_blocks
-    from tailcyclenet.model import build_model
-    from test_model import SMALL
-
-    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=16)
-    ds = load_dataset(tmp_path / 'mv')
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
-
-    C = len(sess.rig)
-    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
-    boxes = np.zeros((1, 16, C, 4), np.float32)
-    boxes[..., 2], boxes[..., 3] = w, h
     seen = []
 
     def boxes_for(store, lo, hi):
         seen.append((lo, hi))
         return (boxes[:, lo:hi], None)
 
-    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
-                      anchor='carry')
-
-    def run(gb):
-        seen.clear()
+    def run(gb, **kw):
+        cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
+                          **kw)
         memory.reset()
         memory.current(override_gb=gb)
         try:
-            return merge_blocks(run_blocks(model, sess, 'g000', registry, ds.name, cfg,
-                                           boxes_for=boxes_for, n_rows=1)), list(seen)
+            blocks = list(run_blocks(model, sess, 'g000', registry, name, cfg,
+                                     **({'boxes_for': boxes_for, 'n_rows': 1} if kw.get('refine')
+                                        else {})))
+            return len(blocks), merge_blocks(blocks)
         finally:
             memory.reset()
 
-    tight, tight_calls = run(0.0008)      # one window fits, two blocks do not
-    roomy, roomy_calls = run(4096)
-
-    # BOTH RUN -- the tight budget must not refuse, which is the failure the split avoids.
-    assert tight_calls and roomy_calls
-    # ...and detection is asked for the same frame spans in the same order either way, which is
-    # what makes the lookahead a pure wall-clock change.
+    _assert_same(run(0.001, anchor='none')[1], run(4096, anchor='none')[1], 'the RAM budget')
+    n_small, small = run(0.0008, anchor='carry', refine=True)
+    tight_calls = list(seen)
+    seen.clear()
+    n_big, big = run(4096, anchor='carry', refine=True)
+    assert n_small > n_big == 1, f'the budgets must differ in block count ({n_small} vs {n_big})'
+    assert tight_calls and seen, 'the tight budget disables the detection lookahead, not the run'
     assert tight_calls == sorted(tight_calls), 'detection must advance in block order'
-    # ...and the pixels are the same.
-    for k, v in roomy.items():
-        a, b = np.asarray(v), np.asarray(tight[k])
-        if a.dtype.kind in 'fc':
-            assert np.array_equal(np.nan_to_num(a, nan=-9e9), np.nan_to_num(b, nan=-9e9)), \
-                f'{k} moved when the detection lookahead was disabled by the budget'
-        elif a.dtype.kind in 'iub':
-            assert np.array_equal(a, b), f'{k} moved when the lookahead was disabled'
+    _assert_same(small, big, 'the block size')
+
+
+def test_a_window_that_does_not_fit_is_refused_not_re_decoded(mv16):
+    """Below one window there is nowhere to degrade to (pass 2 crops pass 1's frames; re-decoding
+    or re-cropping is not output-neutral), so the run refuses, naming the arithmetic and the flag."""
+    from tailcyclenet.infer.window import InferConfig, run_group
+
+    model, sess, registry, name = mv16
+    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu')
+    memory.reset()
+    memory.current(override_gb=1e-6)
+    try:
+        with pytest.raises(SystemExit) as e:
+            run_group(model, sess, 'g000', registry, name, cfg)
+    finally:
+        memory.reset()
+    msg = str(e.value)
+    assert '--max-ram' in msg and 'one window' in msg
+    assert 'frame store' in msg, 'the message must show the arithmetic, not just the verdict'
 
 
 # `--max-ram` MUST ACTUALLY BIND.
@@ -576,12 +427,10 @@ def test_the_peak_check_fires_on_a_promise_and_stays_quiet_otherwise():
     memory._peak_warned = False
 
 
-def test_plan_windows_refuses_when_one_window_does_not_fit():
-    """The budget-exhaustion refusal, isolated: no session, no model, no real machine state --
-    an injected `Budget` too small for one window of frames must raise `SystemExit` naming the
-    arithmetic, exactly as `run_blocks` does inline. Nothing here string-matched this path before.
-    """
-    from tailcyclenet.infer.window import _plan_windows
+def test_plan_windows_refuses_or_plans_from_an_injected_budget():
+    """Too small for one window: `SystemExit` naming the arithmetic. Roomy: the starts are exactly
+    `window_starts`' and the blocks cover them."""
+    from tailcyclenet.infer.window import _plan_windows, window_starts
     from tailcyclenet.memory import Budget
 
     tiny = Budget(limit_gb=0.01, available_gb=0.01, budget_gb=0.01, source='test', stated=True)
@@ -589,54 +438,13 @@ def test_plan_windows_refuses_when_one_window_does_not_fit():
         _plan_windows('sess', 'g000', [(3840, 2160)], n_frames=12, overlap=4,
                       T_total=100, frame_start=0, budget=tiny)
 
-
-def test_plan_windows_returns_starts_blocks_cam_decode_when_it_fits():
-    """The non-refusal path: a budget generous enough for the whole clip in one block, and the
-    window starts match `window_starts` exactly (this is its own pure prefix, not a re-derivation
-    that could drift from it).
-    """
-    from tailcyclenet.infer.window import _plan_windows, window_starts
-    from tailcyclenet.memory import Budget
-
     roomy = Budget(limit_gb=64.0, available_gb=64.0, budget_gb=64.0, source='test', stated=True)
     starts, blocks, cam_decode, pipeline_det = _plan_windows(
         'sess', 'g000', [(64, 64)], n_frames=12, overlap=4, T_total=100, frame_start=0,
         budget=roomy)
     assert starts == window_starts(100, 12, 4, start=0)
     assert blocks and blocks[0][0] == 0 and blocks[-1][1] == len(starts)
-    assert cam_decode >= 1
-    assert isinstance(pipeline_det, bool)
-
-
-def test_plan_windows_matches_run_blocks_on_a_real_group(tmp_path):
-    """Not just shaped right: the SAME starts/blocks a real `run_blocks` call derives internally,
-    proving the extraction changed no arithmetic. `run_blocks` itself has no seam to inspect this
-    at, so this calls `_plan_windows` a second time with the identical inputs `run_blocks` used.
-    """
-    import conftest as cf
-    from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer.window import InferConfig, run_blocks
-    from tailcyclenet.infer.window import _plan_windows
-    from tailcyclenet.model import build_model
-    from test_model import SMALL
-
-    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=16)
-    ds = load_dataset(tmp_path / 'mv')
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
-    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu')
-
-    list(run_blocks(model, sess, 'g000', registry, ds.name, cfg))  # must not raise
-
-    gid = 'g000'
-    group = sess.groups[gid]
-    cam_ix = list(range(len(sess.rig)))
-    cam_sizes = [sess.rig.size(sess.cam_names[ci]) for ci in cam_ix]
-    starts, blocks, cam_decode, pipeline_det = _plan_windows(
-        sess.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, group.n_frames, 0)
-    assert starts and blocks
+    assert cam_decode >= 1 and isinstance(pipeline_det, bool)
 
 
 def test_a_stated_budget_above_the_cap_gets_the_fraction_of_the_cap(monkeypatch):

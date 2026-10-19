@@ -245,7 +245,7 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
             print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
                   f'norms {info["norms"]}, {info["n_params"]:,} params)')
         opt.load_state_dict(plan.state['optimizer_state'])
-        print(f'resuming {plan.path} at iteration {plan.start_it} ({_OVERWRITES})')
+        print(f'resuming {plan.path} at iteration {plan.start_it}; {_OVERWRITES}')
     return Started(model, opt, fresh, replace(plan, state=None))
 
 

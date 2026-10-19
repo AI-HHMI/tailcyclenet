@@ -86,7 +86,7 @@ def cli():
     return mod
 
 
-def _boxes_for(boxes, kpts=None):
+def _boxes_for(boxes):
     """Adapt a whole-clip (S,T,C,4) array to `run_blocks`' `boxes_for` callback.
 
     The tests build the box array up front because that is the clearest way to state a scenario;
@@ -95,7 +95,7 @@ def _boxes_for(boxes, kpts=None):
     exercising the adapter instead of the loop.
     """
     def f(store, lo, hi):
-        return (boxes[:, lo:hi], None, None if kpts is None else kpts[:, lo:hi])
+        return (boxes[:, lo:hi], None)
     return f
 
 
@@ -185,7 +185,7 @@ def test_independent_windows_propagate_exact_owner_and_window_descriptors(multiw
         b = np.zeros((S, hi - lo, C, 4), np.float32)
         x = 8 + int(ordinal)
         b[..., 0], b[..., 1], b[..., 2], b[..., 3] = x, 8, x + 24, 32
-        return b, np.ones((S, hi - lo, C), np.float32), None
+        return b, np.ones((S, hi - lo, C), np.float32)
 
     boxes_for.for_window = for_window
     cfg = _cfg(anchor='none', independent_windows=True, refine=False,
@@ -238,7 +238,7 @@ def test_independent_detector_batches_raw_globally_but_associates_each_window_fr
         boxes = np.zeros((1, len(frames), C, 4), np.float32)
         boxes[0, :, :, 0] = frames[:, None]
         scores = np.ones((1, len(frames), C), np.float32)
-        return boxes, scores, None
+        return boxes, scores
 
     def associate_group(raw, _sess, _gid, n_want, **kw):
         raw_frames = raw[0][0, :, 0, 0].copy()
@@ -246,14 +246,14 @@ def test_independent_detector_batches_raw_globally_but_associates_each_window_fr
         n = len(raw_frames)
         boxes = np.zeros((n_want, n, C, 4), np.float32)
         boxes[..., 0] = kw['frame_base']
-        return boxes, np.ones((n_want, n, C), np.float32), None
+        return boxes, np.ones((n_want, n, C), np.float32)
 
     monkeypatch.setattr(detector, 'detect_raw', detect_raw)
     monkeypatch.setattr(detector, 'associate_group', associate_group)
     args = SimpleNamespace(
         frame_start=3, frame_stop=0, det_score=0.01, det_nms_iou=0.5,
         det_nms_center_dist=0.3, det_trace=None, link_boxes=True, min_views=2,
-        track=True, max_move=1.0, max_age=8, pose_nms=None,
+        track=True, max_move=1.0, max_age=8,
         duplicate_radius=0.75, duplicate_persist=5)
     store = object()
     default_boxes = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False, None,
@@ -294,7 +294,7 @@ def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, 
         frames = np.asarray(kw['frames'], np.int32)
         boxes = np.zeros((1, len(frames), C, 4), np.float32)
         boxes[0, :, :, 0] = frames[:, None]
-        return boxes, np.ones((1, len(frames), C), np.float32), None
+        return boxes, np.ones((1, len(frames), C), np.float32)
 
     def associate_group(raw, _sess, _gid, n_want, **kw):
         raw_boxes = raw[0]
@@ -305,7 +305,7 @@ def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, 
         boxes[0, :, :, 1] = 6.0
         boxes[0, :, :, 2] = np.minimum(x0 + 32.0, 63.0)[:, None]
         boxes[0, :, :, 3] = 42.0
-        return boxes, np.ones((n_want, n, C), np.float32), None
+        return boxes, np.ones((n_want, n, C), np.float32)
 
     monkeypatch.setattr(detector, 'detect_raw', detect_raw)
     monkeypatch.setattr(detector, 'associate_group', associate_group)
@@ -315,7 +315,7 @@ def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, 
             'frame_start': start, 'frame_stop': 16, 'det_score': 0.01,
             'det_nms_iou': 0.5, 'det_nms_center_dist': 0.3, 'det_trace': None,
             'link_boxes': True, 'min_views': 2, 'track': True, 'max_move': 1.0,
-            'max_age': 8, 'pose_nms': None, 'duplicate_radius': 0.75,
+            'max_age': 8, 'duplicate_radius': 0.75,
             'duplicate_persist': 5,
         })()
         boxes_for = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False,
@@ -1400,10 +1400,9 @@ def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
     import conftest as cf
     from tailcyclenet.detector.yolox import YOLOXNano
 
-    m = YOLOXNano(version='tiny')
+    m = YOLOXNano(version='hybrid')
     ckpt = cf._detector_checkpoint(
-        m, input_wh=(64, 48), n_keypoints=0, yolox_version='tiny', bottleneck_expansion=0.5,
-        p2=False, dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
+        m, input_wh=(64, 48), dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
     p = tmp_path / 'det.pth'
     torch.save(ckpt, p)
     return p
@@ -2270,18 +2269,18 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
         seen.append((int(fr[0]), int(fr[-1])))
         C, D = len(session.rig), max(1, top_k)
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32), None)
+                np.full((D, len(fr), C), np.nan, np.float32))
 
     def fake_associate(raw, session, gid, n, **kw):
-        b, s, _ = raw
-        return b[:n], s[:n], None
+        b, s = raw
+        return b[:n], s[:n]
 
     import tailcyclenet.detector as detmod
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw, detmod.associate_group = fake_detect_raw, fake_associate
     try:
         args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
-                                  max_move=1.0, pose_nms=None, max_frames=0,
+                                  max_move=1.0, max_frames=0,
                                   frame_start=37, frame_stop=64)
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
@@ -2328,15 +2327,15 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
         seen.append((int(fr[0]), int(fr[-1])))
         C, D = len(session.rig), max(1, top_k)
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32), None)
+                np.full((D, len(fr), C), np.nan, np.float32))
 
     import tailcyclenet.detector as detmod
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw = fake_detect_raw
-    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n], None)
+    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
     try:
         args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
-                                  max_move=1.0, pose_nms=None, max_frames=0,
+                                  max_move=1.0, max_frames=0,
                                   frame_start=start, frame_stop=stop)
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)

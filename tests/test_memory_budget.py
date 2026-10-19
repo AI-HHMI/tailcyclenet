@@ -93,7 +93,7 @@ def det_scene(tmp_path_factory):
     _, sessions = sessions_for(root / 'ds', 'test')
     sess = sessions[0]
     sess.preload()
-    return YOLOXNano(n_keypoints=0).eval(), sess, next(iter(sess.groups))
+    return YOLOXNano(version='hybrid').eval(), sess, next(iter(sess.groups))
 
 
 def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
@@ -115,7 +115,7 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
         finally:
             memory.reset()
 
-    for name, a, b in zip(('boxes', 'scores', 'kpts'), run(4096), run(1e-6)):
+    for name, a, b in zip(('boxes', 'scores'), run(4096), run(1e-6)):
         if a is None:
             continue
         assert np.array_equal(a, b, equal_nan=True), f'{name} moved with the RAM budget'
@@ -134,9 +134,7 @@ def test_detection_is_batch_aligned_and_slice_independent(det_scene):
 
     parts = [detect_raw(det, (64, 64), sess, gid, 2, frames=np.arange(lo, hi), **kw)
              for lo, hi in ((0, 4), (4, 8))]
-    for i, name in enumerate(('boxes', 'scores', 'kpts')):
-        if whole[i] is None:
-            continue
+    for i, name in enumerate(('boxes', 'scores')):
         joined = np.concatenate([p[i] for p in parts], axis=1)
         assert np.array_equal(joined, whole[i], equal_nan=True), \
             f'{name} moved when the clip was detected in aligned slices'
@@ -339,7 +337,7 @@ def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
     boxes[..., 2], boxes[..., 3] = w, h
 
     def boxes_for(store, lo, hi):
-        return (boxes[:, lo:hi], None, None)
+        return (boxes[:, lo:hi], None)
 
     cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
                       anchor=anchor, refine=refine)
@@ -431,7 +429,7 @@ def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
 
     def boxes_for(store, lo, hi):
         seen.append((lo, hi))
-        return (boxes[:, lo:hi], None, None)
+        return (boxes[:, lo:hi], None)
 
     cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
                       anchor='carry')

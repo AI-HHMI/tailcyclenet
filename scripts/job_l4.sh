@@ -23,10 +23,9 @@ case "$KIND" in
     infer)             SCRIPT=scripts/infer.py ;;
     train)             SCRIPT=scripts/train.py ;;
     train_detector)    SCRIPT=scripts/train_detector.py ;;
-    train_detector_eval) SCRIPT='' ;;
     eval)              SCRIPT=scripts/eval.py ;;
     run)               SCRIPT=$1; shift ;;
-    *) echo "FATAL: expected infer|train|train_detector|train_detector_eval|eval|run, got $KIND" >&2
+    *) echo "FATAL: expected infer|train|train_detector|eval|run, got $KIND" >&2
        exit 2 ;;
 esac
 
@@ -42,29 +41,4 @@ export PYTHONUNBUFFERED=1
 
 echo "host $(hostname)  kind: $KIND  argv: $*"
 nvidia-smi || true
-if [[ "$KIND" == train_detector_eval ]]; then
-    CONFIG=$1; OUT=$2; EVALSPEC=$3
-    shift 3
-    pixi run --frozen python scripts/train_detector.py --config "$CONFIG" --out "$OUT" "$@"
-    pixi run --frozen python - "$OUT" "$EVALSPEC" <<'PY'
-import sys, tomllib
-from pathlib import Path
-out, spec = Path(sys.argv[1]), tomllib.loads(Path(sys.argv[2]).read_text())
-for entry in spec.get('eval', []):
-    name, data, split, evalset = (entry[k] for k in ('name', 'data', 'split', 'evalset'))
-    extra = entry.get('extra', [])
-    for ckpt in (f"detector_it{int(tomllib.loads((out / 'config.toml').read_text())['training']['iters']):06d}.pth", 'detector_it004000.pth'):
-        path = out / ckpt
-        if not path.exists():
-            continue
-        dest = out / 'eval' / f'{name}__{path.stem}.json'
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        import subprocess
-        cmd = ['pixi', 'run', '--frozen', 'python', 'scripts/eval_detector.py', '--run', str(out), '--checkpoint', ckpt, '--data', data, '--split', split, '--evalset', evalset, '--out', str(dest), '--boxes', 'keypoints', *extra]
-        with dest.with_suffix('.log').open('w') as log:
-            rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
-        print(f'eval {name} {ckpt}: exit {rc} -> {dest}', flush=True)
-PY
-else
-    exec pixi run --frozen python "$SCRIPT" "$@"
-fi
+exec pixi run --frozen python "$SCRIPT" "$@"

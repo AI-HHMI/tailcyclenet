@@ -28,9 +28,34 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from ..detector.boxes import NMS_CENTER_DIST_DEPLOY
 from .window import ANCHORS, CARRY_SOURCES
 
 
+
+
+REMOVED_FLAGS = {
+    '--pose-nms': 'it pruned rows by detector-keypoint containment, and the detector keypoint '
+                  'branch is deleted (every shipped detector had n_keypoints = 0); v0.3.4 is the '
+                  'last release that has it',
+    '--crop-source': "its only other value, 'keypoints', needed the deleted detector keypoint "
+                     'branch; crops always come from boxes; v0.3.4 is the last release that has '
+                     'it',
+}
+
+
+class _RemovedFlag(argparse.Action):
+    """A deleted flag: passing it exits naming the flag and why, never silently ignored."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        """Refuse the flag by name with its `REMOVED_FLAGS` reason."""
+        raise SystemExit(f'{option_string} is deleted: {REMOVED_FLAGS[option_string]}.')
+
+
+def _add_removed_flags(ap):
+    """Register every `REMOVED_FLAGS` entry as a hidden flag that refuses itself by name."""
+    for flag in REMOVED_FLAGS:
+        ap.add_argument(flag, action=_RemovedFlag, nargs='?', help=argparse.SUPPRESS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,9 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     expands every help string as `help % params`, so a bare `%Y` would be a format spec and
     `--help` would die for every flag at once. `--det-top-k` is a separate detection budget from
     the row count -- `--max-animals` used to set both, so neither lever could be read alone (0
-    follows `--max-animals`). The keypoint identity cues (`--pose-nms`) are all default-off
-    VETOES over an unchanged centroid cost: each may only remove an edge the centre gate already
-    accepted, and a detection with too few keypoints abstains. The frame-range flags sit outside
+    follows `--max-animals`). Deleted flags stay registered (`REMOVED_FLAGS`) and exit naming
+    themselves and why. The frame-range flags sit outside
     any input-specific group because the range serves both input paths -- it is a window-loop
     lever, not an input-format one.
     """
@@ -233,14 +257,13 @@ def build_parser() -> argparse.ArgumentParser:
                          '(centre-distance + IoU) already suppresses duplicates before it: a '
                          'looser floor feeds MORE candidates into filters that already exist, not '
                          'an unfiltered flood. 2D single-camera has no reprojection check to fall '
-                         'back on -- `--pose-nms` is the nearest lever (off by default, helps '
-                         'rat-city 2D, hurts calms21; sweep per root). Still sweep per checkpoint.')
+                         'back on. Still sweep per checkpoint.')
     ap.add_argument('--det-nms-iou', type=float, default=0.5,
                     help="decode's box-NMS IoU threshold. 0.5 was HARDCODED and unreachable "
                          'before detector_v2 plan A1; every external detector (RTMDet 0.65, '
                          'DLC/SLEAP instance-level 0.8) ships higher -- sweep upward, not around '
                          '0.5.')
-    ap.add_argument('--det-nms-center-dist', type=float, default=0.3,
+    ap.add_argument('--det-nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
                     help='SECOND, independent NMS survival test in units of box side (scale-free): '
                          'a candidate is also suppressed if its centre sits within this many box '
                          'sides of an already-kept box, regardless of IoU -- catches '
@@ -267,11 +290,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--crop-inflate', type=float, default=None,
                     help='inflate every crop about its centre. DEFAULT 1.5 when the box is on, '
                          'else 1.0.')
-    ap.add_argument('--crop-source', default='boxes', choices=('boxes', 'keypoints'),
-                    help="where the window's crop comes from. 'boxes' (default) unions the "
-                         "detector's per-frame boxes; 'keypoints' runs THE CROP RULE on the "
-                         'detector\'s own keypoints (needs a keypoint-trained detector, ignored '
-                         'without one).')
     ap.add_argument('--max-move', type=float, default=1.25,
                     help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a pair '
                          'further apart than this is not the same animal. 1.25 is the measured '
@@ -305,10 +323,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help='consecutive in-band frames before a duplicate pair is resolved by the '
                          '3D --track backstop (always on). Measured default 5 on 3dpop '
                          'Sequence 59 (report 53); not yet swept on a second root.')
-    ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
-                    help='INSTANCE-LEVEL NMS on the seated rows: drop the lower-scored of two rows '
-                         'whose keypoint-containment overlap exceeds FRAC. NOT IoU. QUANTISED by K '
-                         '(at K=4 there are five settings). Default off.')
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group (a PREFIX, so `carry` '
                          'stays contiguous). = --start-frame 0 --end-frame N; refused together '
@@ -408,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
                          'inert (16 vs 3 moves boxes 0.204 px, scores 1.7e-03), see '
                          'tests/test_memory_budget.py. '
                          'TAILCYCLENET_MAX_RAM_GB does the same for paths with no CLI.')
+    _add_removed_flags(ap)
     return ap
 
 

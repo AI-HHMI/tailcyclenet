@@ -21,7 +21,8 @@ import numpy as np
 import torch
 
 from ..metrics import mota
-from .assign import box_iou, decode
+from .assign import decode
+from .boxes import NMS_CENTER_DIST_SELECT, box_iou
 from .data import ChunkShuffle, box_collate
 
 
@@ -130,7 +131,8 @@ def _summarise(s):
 @torch.no_grad()
 def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_thresh=0.05,
                   num_workers=4, max_animals=None, out_scores=None, iou_thresh=0.5,
-                  center_dist_thresh=0.5, subset_indices=None, root_qualified_keys=False):
+                  center_dist_thresh=NMS_CENTER_DIST_SELECT, subset_indices=None,
+                  root_qualified_keys=False):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
     Inputs:
@@ -154,8 +156,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
         compare warped predictions against unwarped `instances.pq` boxes.
     Notes:
         Per-(group, camera) state is keyed by the ITEM index, not the frame `f` (tiling makes
-        one frame several views). The head output is INDEXED, not unpacked -- fixed-arity
-        unpacking crashed eval when the head grew an extra return.
+        one frame several views).
     """
     was_training = model.training
     model.eval()
@@ -177,8 +178,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     sessions, n_want = {}, {}
     for bi, batch in enumerate(loader):
         x, gt = batch['x'], batch['boxes']
-        _out = model(x.to(device))
-        obj, pred_boxes = _out[0], _out[1]
+        obj, pred_boxes = model(x.to(device))
         for j in range(x.shape[0]):
             item = order[bi * batch_size + j]
             sess, gid, f, ci = ds.index[item]
@@ -218,47 +218,6 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
 
 
 @torch.no_grad()
-def score_fixed_views(model, ds, indices, device, score_thresh=0.05, batch_size=16,
-                      max_animals=None, iou_thresh=0.5, center_dist_thresh=0.5):
-    """Return detailed decoded metrics for selected dataset item indices.
-
-    Scores unaugmented, as `score_dataset` does, and restores the model mode and `ds.augment`.
-    """
-    was_training = model.training
-    model.eval()
-    aug_was = ds.augment
-    ds.augment = False
-    indices = sorted(int(i) for i in indices)
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, sampler=indices,
-                                         num_workers=0, collate_fn=box_collate)
-    rows = []
-    offset = 0
-    for batch in loader:
-        out = model(batch['x'].to(device))
-        for j in range(batch['x'].shape[0]):
-            i = indices[offset]
-            offset += 1
-            sess, gid, frame, ci = ds.index[i]
-            gt_all = batch['boxes'][j]
-            gt = gt_all[torch.isfinite(gt_all).all(-1)]
-            k = max_animals or max(1, len(sess.labels(gid).animal_ids))
-            pred, scores = decode(out[0][j], out[1][j], top_k=k,
-                                  score_thresh=score_thresh, iou_thresh=iou_thresh,
-                                  center_dist_thresh=center_dist_thresh)
-            ious, fp = greedy_match(gt, pred.cpu())
-            mota_row = box_mota({0: (pred.cpu().numpy(), gt_all.numpy(),
-                                     *ds.ignore_for(i))})
-            rows.append({'session': sess.session_id, 'group': gid, 'frame': frame,
-                         'camera': sess.cam_names[ci], 'n_gt': int(gt.shape[0]),
-                         'matched': int((ious >= 0.5).sum()),
-                         'miss': int(mota_row['misses']), 'fp': int(fp),
-                         'fp_dup': int(mota_row['fp_dup']), 'fp_none': int(mota_row['fp_none']),
-                         'scores': scores.detach().cpu().tolist()})
-    ds.augment = aug_was
-    if was_training:
-        model.train()
-    return rows
-
 def overall(rows):
     """Weight groups by their labelled-box count. The per-group table is the unweighted view.
 
@@ -345,7 +304,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      det_score=0.01, track=True, link=False, min_views=2, max_move=1.25,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
                      n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
-                     center_dist_thresh=0.5, box_source=None):
+                     center_dist_thresh=NMS_CENTER_DIST_SELECT, box_source=None):
     """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
 
     `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",
@@ -384,11 +343,11 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      batch=batch, score_thresh=det_score, reduce=reduce, max_frames=max_frames,
                      tile_scale=tile_scale, iou_thresh=iou_thresh,
                      center_dist_thresh=center_dist_thresh, box_source=box_source)
-    r_box, r_sc, r_kp = raw
+    r_box, r_sc = raw
     D, T, C = r_sc.shape
     det_fill = float(np.isfinite(r_sc[0]).mean()) if D else 0.0
 
-    out, sc, kp = _associate_group(raw, sess, gid, n_animals, link=link, min_views=min_views,
+    out, sc = _associate_group(raw, sess, gid, n_animals, link=link, min_views=min_views,
                                    track=track, max_move=max_move)
     S, T, C = sc.shape
     slot_fill = float(np.isfinite(sc).mean())

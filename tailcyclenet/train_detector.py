@@ -405,7 +405,8 @@ def main(argv: list[str] | None = None):
         print(f'  thinnest: {", ".join(thin)}', flush=True)
     combined_w = train.train_weights(data_cfg['annot_frac'], data_cfg['alpha'],
                                      data_cfg['balance_datasets'])
-    sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
+    sampler = CohortSampler(combined_w, num_samples=max(len(combined_w), train_cfg['batch_size']),
+                            seed=train_cfg['seed'])
     was = train.cohort_mix()
     now = train.cohort_mix(combined_w)
     root_mix = train.root_mix(combined_w)
@@ -508,6 +509,7 @@ def main(argv: list[str] | None = None):
     }
     history = []
     best_score = -float('inf')
+    best_iteration = None
     it, t0, running = 0, time.time(), []
     model.train()
     if hasattr(opt, 'train'):
@@ -651,6 +653,7 @@ def main(argv: list[str] | None = None):
                 sel = selected_score
                 if sel >= best_score:
                     best_score = sel
+                    best_iteration = it
                     torch.save(ckpt, run / 'detector.pth')
                 history.append({'iteration': it, 'selection_metric': selection_metric,
                                 'selection_score': selected_score,
@@ -663,7 +666,7 @@ def main(argv: list[str] | None = None):
                           f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
                           flush=True)
                 t0 = time.time()
-    best = max(history, key=lambda h: h.get('val_r50', h['train_r50'])) if history else None
+    best = next((h for h in history if h['iteration'] == best_iteration), None)
     print(f'done: {it} iterations -> {run}')
     if best:
         print(f'best: it {best["iteration"]} (this is what detector.pth holds)  ' +

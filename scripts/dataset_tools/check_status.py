@@ -1,0 +1,233 @@
+#!/usr/bin/env python
+"""Audit the `status` policy across every tailcycle-dataset root.
+
+    pixi run python scripts/dataset_tools/check_status.py [root ...] [--report]
+
+Policy: `missing` claims a real assessment (only on roots in `MISSING_OK`); holes are checked
+only on `annotated` sessions against exact `HOLE_EXEMPTIONS` counts; `projected` never mixes with
+`visible`. Keyed on the session's declared `labels`, not the folder name. Symlink-farm roots are
+skipped by structure, not by name.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import Counter
+from pathlib import Path
+
+
+import numpy as np
+import polars as pl
+
+from tailcyclenet import format as fmt
+
+ROOT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets')
+
+# Roots that may carry a `missing` row; every other root's tables must be `missing`-free.
+MISSING_OK = {
+    # Written from the npz's own per-camera `vis`, only where the 3D point is finite.
+    'allen-mouse-tracked': ('keypoints',),
+    # points3d `missing` only where 0 views were visible and every camera assessed the point.
+    'allen-mouse-annotated': ('keypoints', 'points3d'),
+    # Human-annotated (not predicted): its `missing` rows are annotator occlusion judgements (owner, 2026-10-19).
+    'allen-mouse-annotated-outliers': ('keypoints',),
+    # APT's Inf sentinel (fully occluded) stays `missing`; its NaN skip stays absent.
+    'rat-city-annotated': ('keypoints',),
+    'rat-city-annotated-present': ('keypoints',),
+    # SLEAP's per-point `visible=False` is an annotator occlusion judgement; the position it
+    # keeps is stale, so the row is `missing` rather than `projected`.
+    'comrie-minimaze': ('keypoints',),
+    # Native deeperfly's pathway plan explicitly assesses which fly38 points each view can
+    # predict: finite 2D output is visible and NaN/unassigned output is missing.
+    'deepfly3d-v3': ('keypoints',),
+    # v4 preserves native deeperfly's assessed missing views and adds scorer-masked unlabeled rows.
+    'deepfly3d-v4': ('keypoints',),
+}
+
+# root -> {table: exact hole count}, summed over every session in the root, checked only for
+# `annotated` roots. A moved count is a silent re-conversion, not noise.
+HOLE_EXEMPTIONS = {
+    # APT's `NaN` (annotator skip) stays absent -- `missing` would claim an assessment nobody
+    # made; the `Inf` sentinel is already counted in MISSING_OK.
+    'rat-city-annotated': {'keypoints': 220},
+    'rat-city-annotated-present': {'keypoints': 220},
+    # APTv2 COCO v==0 is a zero triplet that asserts nothing was assessed; it becomes no row.
+    'apt-v2': {'keypoints': 387928},
+    # 1-view and over-gate triangulations are left as no row; the 0-view-all-assessed case is the
+    # 178 `missing` rows counted in MISSING_OK, not a hole.
+    'allen-mouse-annotated': {'points3d': 211},
+    # Outlier 2D is dropped as no row -- a rejected measurement, not an occlusion.
+    'johnson-mouse-annotated': {'keypoints': 18},
+    # The aug root re-runs the same gate over its own variant set, independently; its count can
+    # differ from the standard root.
+    'johnson-mouse-annotated-aug': {'keypoints': 18},
+    # The v2 Tailcycle export preserves the same 18 rejected 2D outliers as no-row holes.
+    'johnson-mouse-annotated-aug-v2': {'keypoints': 18},
+    # Facemap's blank DLC x,y cells are unassessed and intentionally omitted.
+    'facemap': {'keypoints': 2196},
+    # RP-5.7K has one partial LabelMe pose with two absent point shapes.
+    'rat-rp-5.7k': {'keypoints': 2},
+    # UDARP's two out-of-bounds tail_root coordinates and 350 `0_0` unlabelled-point sentinels
+    # are omitted and noted per frame.
+    'rat-udarp-9.4k': {'keypoints': 352},
+}
+
+
+def _status_counts(table) -> Counter:
+    """Counts of each dictionary-encoded status value in a table's `status` column."""
+    arr = table.column('status').combine_chunks()
+    codes = arr.indices.to_numpy(zero_copy_only=False)
+    vocab = arr.dictionary.to_pylist()
+    c = Counter()
+    for v, n in zip(*np.unique(codes, return_counts=True)):
+        c[vocab[int(v)]] += int(n)
+    return c
+
+
+def _holes(table, key_cols: list[str]) -> int:
+    """Rows with NO entry inside a (key_cols) group that has >= 1 entry, per bodypart.
+
+    `key_cols` is `(group_id, frame, animal_id[, camera])`; the missing axis is `bodypart`.
+    Null bodyparts are excluded from the distinct-keypoint count, and null grouping keys are
+    excluded explicitly to match the previous pandas behavior.
+    """
+    df = pl.from_arrow(table.select([*key_cols, 'bodypart']))
+    n_kpts = df.get_column('bodypart').drop_nulls().n_unique()
+    complete_keys = df.drop_nulls(subset=key_cols)
+    live_keys = complete_keys.group_by(key_cols).len().height
+    return int(live_keys * n_kpts - df.height)
+
+
+def _is_symlink_farm(root_dir: Path) -> bool:
+    """True if the root itself or every session directory under it is a symlink."""
+    if root_dir.is_symlink():
+        return True
+    sessions = []
+    for split in ('train', 'val', 'test'):
+        d = root_dir / split
+        if d.is_dir():
+            sessions += [p for p in d.iterdir() if p.is_dir() or p.is_symlink()]
+    return bool(sessions) and all(p.is_symlink() for p in sessions)
+
+
+def audit_session(sess: fmt.Session, root_name: str, hole_totals: Counter,
+                  report: list[str]) -> list[str]:
+    """Check one session's status policy, appending table lines to `report`.
+
+    Inputs: sess -- the loaded session.
+            root_name -- the root's folder name (the policy keys on this).
+            hole_totals -- Counter((root, stem)) accumulating hole counts.
+            report -- per-session table lines appended here.
+    Outputs: list of policy problem strings for this session.
+    """
+    problems = []
+    is_annotated = sess.label_source == 'annotated'
+    for stem, key_cols in (('keypoints', ['group_id', 'frame', 'animal_id', 'camera']),
+                           ('points3d', ['group_id', 'frame', 'animal_id'])):
+        table = sess._tables[stem]
+        if table is None:
+            continue
+        counts = _status_counts(table)
+        if counts['missing'] and stem not in MISSING_OK.get(root_name, ()):
+            problems.append(f'{root_name}/{sess.session_id}: {stem}.pq carries '
+                            f'{counts["missing"]} `missing` row(s) but {root_name!r} is not in '
+                            f'MISSING_OK for {stem!r}')
+        if counts['projected'] and counts['visible']:
+            problems.append(f'{root_name}/{sess.session_id}: {stem}.pq mixes `projected` '
+                            f'({counts["projected"]}) with `visible` ({counts["visible"]})')
+
+        line = (f'   {sess.session_id:<40} {stem:<10} '
+               + ', '.join(f'{k}={v}' for k, v in sorted(counts.items()) if v))
+        if is_annotated:
+            holes = _holes(table, key_cols)
+            hole_totals[(root_name, stem)] += holes
+            line += f'  holes={holes}'
+        report.append(line)
+    return problems
+
+
+def audit_root(root_dir: Path, report: list[str]) -> list[str]:
+    """Audit every session under a dataset root against the status policy.
+
+    Inputs: root_dir -- the dataset root.
+            report -- per-session table lines appended here.
+    Outputs: list of policy problem strings for the root.
+    """
+    name = root_dir.name
+    problems = []
+    hole_totals: Counter = Counter()
+    report.append(f'== {name}')
+    for split in ('train', 'val', 'test'):
+        d = root_dir / split
+        if not d.is_dir():
+            continue
+        for sp in sorted(p for p in d.iterdir() if p.is_dir()):
+            try:
+                sess = fmt.Session.load(sp)
+            except fmt.FormatError as e:
+                problems.append(f'{name}/{split}/{sp.name}: {e}')
+                continue
+            if sess.label_source not in ('annotated', 'tracked'):
+                problems.append(f'{name}/{split}/{sp.name}: unknown label_source '
+                                f'{sess.label_source!r}')
+            problems.extend(audit_session(sess, name, hole_totals, report))
+
+    want = HOLE_EXEMPTIONS.get(name, {})
+    seen_tables = {stem for (r, stem) in hole_totals if r == name}
+    for stem in seen_tables | set(want):
+        got, exp = hole_totals.get((name, stem), 0), want.get(stem, 0)
+        if got != exp:
+            problems.append(f'{name}: {stem}.pq has {got} hole(s) across annotated sessions, '
+                            f'HOLE_EXEMPTIONS says {exp} -- a re-conversion silently changed '
+                            f'this. Update HOLE_EXEMPTIONS deliberately if the change is wanted.')
+    if want:
+        report.append('   TOTAL holes (annotated sessions only): '
+                      + ', '.join(f'{k}={hole_totals.get((name, k), 0)} (want {v})'
+                                  for k, v in sorted(want.items())))
+    return problems
+
+
+def main():
+    """Audit status policy across dataset roots; exit 0/1/2.
+
+    Inputs: argv (via argparse): roots, --data, --report.
+    Side effects: prints the per-session report and any problems; exits 2 on a
+                  missing root, 1 on a violation without --report.
+    """
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('roots', nargs='*', help='root name(s); default is every non-symlink-farm '
+                                              'root under --data')
+    ap.add_argument('--data', type=Path, default=ROOT)
+    ap.add_argument('--report', action='store_true',
+                    help='print the per-session table and exit 0 even on a violation')
+    args = ap.parse_args()
+
+    if args.roots:
+        names = args.roots
+    else:
+        names = sorted(p.name for p in args.data.iterdir()
+                       if p.is_dir() and not _is_symlink_farm(p))
+
+    report: list[str] = []
+    problems: list[str] = []
+    for name in names:
+        root_dir = args.data / name
+        if not root_dir.is_dir():
+            print(f'{name}: not a directory under {args.data}', file=sys.stderr)
+            sys.exit(2)
+        problems.extend(audit_root(root_dir, report))
+
+    print('\n'.join(report))
+    if problems:
+        print(f'\n{len(problems)} problem(s):', file=sys.stderr)
+        for p in problems:
+            print(f'  ! {p}', file=sys.stderr)
+        if not args.report:
+            sys.exit(1)
+    else:
+        print('\nOK: every root matches the status policy.')
+
+
+if __name__ == '__main__':
+    main()

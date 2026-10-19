@@ -8,7 +8,7 @@ import sys
 import pytest
 import torch
 
-from scripts import eval_detector, eval_detector_trace
+from scripts.diagnostics import eval_detector, eval_detector_trace
 from tailcyclenet.detector import train as train_detector
 
 from .conftest import _session_2d

@@ -5,7 +5,7 @@
 # ground truth.
 #
 # `names` is in the npz's own (name-sorted) order, NOT the anatomical order the annotated root
-# uses, because convert_v4.build_labels indexes `pose` positionally against this list. No name is
+# uses, because scripts/convert/v4.py build_labels indexes `pose` positionally against this list. No name is
 # a prefix of another, so the allen `npz_column_sorted` repair does not apply -- do not add it.
 #
 # `Snout` and `TailTip` are all-NaN in all three trials; they stay so the pose axis stays 24 wide.

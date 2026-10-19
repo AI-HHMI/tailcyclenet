@@ -2014,7 +2014,7 @@ def test_eval_detector_deploy_prints_the_scored_t_under_det_max_frames(tmp_path,
     """`eval_detector.py --deploy` runs end to end on a saved checkpoint, and its T column is the
     `--det-max-frames` prefix actually scored, not the group's raw length (a 3dpop run printed
     T=899..2680 while scoring 120)."""
-    from scripts import eval_detector
+    from scripts.diagnostics import eval_detector
 
     root = tmp_path / 'root'
     cf._session_2d(root / 'test' / 's1', T=4, S=2)

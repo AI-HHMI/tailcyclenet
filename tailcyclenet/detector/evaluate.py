@@ -1,4 +1,4 @@
-"""Scoring a box predictor. Shared by `scripts/eval_detector.py` and the training loop.
+"""Scoring a box predictor. Shared by `scripts/diagnostics/eval_detector.py` and the training loop.
 
 Here rather than in either script because the two must not disagree: the number training selects
 a checkpoint on and the number a run is reported with have to be the same number.

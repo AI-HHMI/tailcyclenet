@@ -1,4 +1,4 @@
-"""scripts/combine_roots.py -- the collision rule and the refusal to clobber.
+"""scripts/dataset_tools/combine_roots.py -- the collision rule and the refusal to clobber.
 
 Two things here would be silently wrong rather than loud: the SPLIT-INVARIANCE of the
 suffix (one session name appears in train, val AND test, so a suffix applied in only one
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts import combine_roots
+from scripts.dataset_tools import combine_roots
 
 
 @pytest.fixture(scope='module')

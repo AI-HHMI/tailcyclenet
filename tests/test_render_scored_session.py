@@ -1,4 +1,4 @@
-"""`scripts/render_scored_session.py`: a frame is coloured by the LAST window containing it
+"""`scripts/diagnostics/render_scored_session.py`: a frame is coloured by the LAST window containing it
 (evaluation rule 11), on a fixed colour scale, for the selected animal."""
 import importlib.util
 import sys
@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parent.parent
 def _mod():
     """Import the renderer without running main()."""
     spec = importlib.util.spec_from_file_location(
-        'tcn_render_scored', REPO / 'scripts' / 'render_scored_session.py')
+        'tcn_render_scored', REPO / 'scripts' / 'diagnostics' / 'render_scored_session.py')
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)

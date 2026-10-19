@@ -74,7 +74,25 @@ class ScorerDataset(torch.utils.data.Dataset):
         if frozen:
             torch.manual_seed((int(self.base.seed) * 1000003 + int(idx)) % (2 ** 31))
         return rng, shape_rng, frozen
+
     def __getitem__(self, idx):
+        """Build one triplet; on val/test the per-item torch seeding is confined to this call.
+
+        `_streams` seeds the ambient torch RNG for a frozen item. With `val_num_workers = 0` that
+        runs in the training process, so the CPU and (initialised) CUDA RNG states are forked and
+        restored around the build: the triplet is unchanged, the trainer's stream is untouched.
+
+        Inputs: idx -- as `_build`.
+        Outputs: as `_build`.
+        Side effects: as `_build`, minus any lasting change to the ambient torch RNG on val/test.
+        """
+        if self.base.train:
+            return self._build(idx)
+        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_initialized() else []
+        with torch.random.fork_rng(devices=devices):
+            return self._build(idx)
+
+    def _build(self, idx):
         """Build one triplet, retrying other windows on a failed build.
 
         Inputs: idx -- the requested window index (or `(ordinal, idx)` from `StepSampler`, which

@@ -566,3 +566,26 @@ def test_an_all_rejected_epoch_raises_even_though_rejections_advance_the_step():
         require_progress(stepped_this_epoch=0, stepped_this_run=0, step=100, local_target=100)
     require_progress(stepped_this_epoch=3, stepped_this_run=3, step=50, local_target=100)
     require_progress(stepped_this_epoch=0, stepped_this_run=7, step=100, local_target=100)
+
+
+def test_a_val_item_leaves_the_trainers_torch_rng_untouched(scorer_root):
+    """With `val_num_workers = 0` val items run in the trainer; their per-item seed must not leak."""
+    from tailcyclenet.scorer.dataset import ScorerDataset
+
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                       crop_jitter=0.0)
+    corr = {'const_offset_prob': 1.0, 'frame_noise_prob': 0.0, 'gradual_drift_prob': 0.0,
+            'sinusoid_prob': 0.0, 'point_drop_prob': 0.0, 'min_valid_frames': 2,
+            'mag_3d': {'const_offset': 15.0}, 'mag_2d': {'const_offset': 10.0}}
+    val = ScorerDataset(PoseDataset(scorer_root, 'val', cfg, train=False), corr)
+    torch.manual_seed(1234)
+    expected = torch.rand(8)
+    torch.manual_seed(1234)
+    first = val[0]
+    assert torch.equal(torch.rand(8), expected), 'the val item reseeded the global torch RNG'
+    torch.manual_seed(999)
+    second = val[0]
+    assert first is not None and second is not None
+    for key, value in first.items():
+        if torch.is_tensor(value):
+            assert torch.allclose(value, second[key], rtol=0, atol=0, equal_nan=True), key

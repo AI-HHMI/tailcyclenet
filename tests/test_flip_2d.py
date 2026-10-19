@@ -82,8 +82,9 @@ def test_flip_affine_matches_pixels_and_projection(mode):
     np.testing.assert_array_equal(got, want)
 
 
-@pytest.mark.parametrize('mode', ['horizontal', 'vertical'])
-def test_flip_permutates_labels_visibility_and_view_pixels(tiny_root, mode):
+def test_flip_permutates_labels_visibility_and_view_pixels(tiny_root):
+    """A flip mirrors pixels and coords, swaps the declared pairs, and leaves the selection intact."""
+    mode = 'horizontal'                 # the vertical axis is covered by the affine test
     plain_cfg = _cfg(flip_2d_prob=0.0)
     flip_cfg = _cfg(flip_2d_prob=1.0, flip_2d_modes=[mode])
     plain_ds = PoseDataset(tiny_root / 'ratlike', 'train', plain_cfg, train=True, seed=3)
@@ -117,7 +118,9 @@ def test_flip_permutates_labels_visibility_and_view_pixels(tiny_root, mode):
     assert sel_flip.sess.flip_pairs == [['left_ear', 'right_ear']]
 
 
-def test_flip_preflight_requires_declaration_and_accepts_explicit_empty(tmp_path):
+def test_flip_preflight_requires_declaration_and_accepts_explicit_empty(tmp_path, tiny_root):
+    """2D flip needs a declared `flip_pairs` key (`[]` is a declaration); a 3D session that never
+    takes the 2D path needs none."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     import conftest as C
@@ -137,6 +140,12 @@ def test_flip_preflight_requires_declaration_and_accepts_explicit_empty(tmp_path
     assert explicit_loaded.flip_pairs_declared and explicit_loaded.flip_pairs == []
     ds = PoseDataset(explicit.parent.parent, 'train', _cfg(flip_2d_prob=1.0), train=True)
     assert ds._flip_perm
+
+    ds = PoseDataset(tiny_root / 'mouselike', 'train',
+                     _cfg(flip_2d_prob=1.0, prob_2d_only=0.0), train=True)
+    assert ds._flip_perm == {}
+    sel = ds.select(0, np.random.default_rng(1), ds.shape(np.random.default_rng(2)))
+    assert sel is not None and not sel.true_2d
 
 
 def test_forced_2d_flip_handles_moving_camera(tmp_path):
@@ -160,15 +169,8 @@ def test_forced_2d_flip_handles_moving_camera(tmp_path):
     assert view.cgroup[0]['ext'].ndim == 3
 
 
-def test_flip_preflight_is_not_needed_for_3d_when_prob_2d_only_is_zero(tiny_root):
-    ds = PoseDataset(tiny_root / 'mouselike', 'train',
-                     _cfg(flip_2d_prob=1.0, prob_2d_only=0.0), train=True)
-    assert ds._flip_perm == {}
-    sel = ds.select(0, np.random.default_rng(1), ds.shape(np.random.default_rng(2)))
-    assert sel is not None and not sel.true_2d
-
-
 def test_flip_rng_draws_are_pinned(tiny_root):
+    """The flip draws exactly coin + mode index after the rotation coin; off, it draws nothing."""
     cfg = _cfg(flip_2d_prob=1.0, flip_2d_modes=['horizontal'])
     ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg, train=True)
     sel = ds.select(0, np.random.default_rng(8), ds.shape(np.random.default_rng(9)))

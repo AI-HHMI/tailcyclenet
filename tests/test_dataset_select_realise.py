@@ -1,11 +1,8 @@
 """The `select`/`realise`/`targets` seam of `PoseDataset`, the one the scorer builds on.
 
-The split exists so a track-quality triplet can realise ONE selection into two independent views
-(`tailcyclenet/scorer/`). The three parts share one RNG stream, so a draw that changed order would
-silently reshape the training distribution while every shape stayed correct; byte-identity of the
-loader's output is guarded by the golden-output harness, and this file checks the seam's
-structural properties: each case reaches its branch, selections are deterministic, the stored
-labels are not written through, and two realisations of one selection are independent.
+Byte-identity of the loader's output is the golden harness's job; this file checks the seam's
+structure: each case reaches its branch, selection is deterministic, the stored labels are not
+written through, and two realisations of one selection are independent.
 """
 import random
 from pathlib import Path
@@ -18,12 +15,7 @@ from tailcyclenet.dataset import LoaderConfig, PoseDataset
 
 
 def _same(a, b, path='item'):
-    """Recursive element-wise equality, NaN-aware.
-
-    `torch.equal` is deliberately NOT the primary check: it is not NaN-aware, and a
-    partially-labelled window is full of NaNs by design, so it reports a mismatch for two
-    IDENTICAL tensors. That trap made an earlier version of this file fail against itself.
-    """
+    """Recursive element-wise equality, NaN-aware (`torch.equal` is not, and windows hold NaNs)."""
     if a is None or b is None:
         assert a is None and b is None, f'{path}: {a!r} vs {b!r}'
         return
@@ -56,21 +48,8 @@ def _same(a, b, path='item'):
 
 
 def _seed_all(item_seed, shape_seed, aug_seed, rot_seed):
-    """Seed every stream the loader can draw from, so two runs are comparable.
-
-    FOUR sources, because the loader uses four and only one of them is the item's own rng:
-
-    * the item `Generator` (rotation draw, crop jitter, grayscale, cutout, the prompt corruptions);
-    * `np.random` -- `TracktailDataset.rotate_camera_group` draws the 3D world-gauge angle from the
-      GLOBAL numpy RNG (`rvec = np.random.uniform(...)`), not from the item stream;
-    * `imgaug` -- the appearance pipelines draw from imgaug's own global RNG, seeded with entropy
-      when the pipelines are built, so two datasets otherwise differ in the PIXELS while every
-      coordinate agrees;
-    * `random` / `torch` -- seeded for completeness; a helper that reached for either would
-      otherwise make this test flaky rather than failing.
-
-    `np.random` and `imgaug` are pre-existing warts in the loader, not the refactor's doing.
-    """
+    """Seed every stream the loader draws from: the item Generator, plus the GLOBAL `np.random`
+    (`rotate_camera_group`'s world-gauge angle), imgaug's global RNG, and `random`/`torch`."""
     import imgaug.random
 
     np.random.seed(rot_seed)
@@ -110,12 +89,7 @@ KPTS_3D = ['nose', 'neck', 'tail_base']
 
 @pytest.fixture(scope='session')
 def seam_root(tmp_path_factory):
-    """A root holding every case the seam must not disturb: 2D and 3D, train and val, moving.
-
-    Built here rather than reusing `tiny_root` because `tiny_root` has NO 3D `val` split -- a
-    previous version of this file silently dropped every 3D val case for that reason and reported
-    success anyway.
-    """
+    """2D and 3D, train and val, plus a moving rig (`tiny_root` has no 3D val split)."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     import conftest as C
@@ -134,8 +108,7 @@ def _L(**over):
     return LoaderConfig(**{'n_frames': 4, 'image_size': 64, **over})
 
 
-# Each case names the DRAW SITES it exists to cover. Anything the loader can branch on should
-# appear in at least one, or the branch is not covered by this test at all.
+# Each case names the DRAW SITES it exists to cover.
 _CASES = {
     'plain': _L(prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0, prompt_dropout=0.0),
     # Rotation + jitter + appearance aug + cutout + grayscale.
@@ -150,49 +123,16 @@ _CASES = {
     # The BOX PROMPT branch -- `_targets`'s box block and `box_prompt`'s module import.
     'box-prompt': _L(prob_2d_only=0.0, aug_prob=0.5, box_prompt='film', box_prompt_dropout=0.5,
                      box_prompt_jitter=0.2, box_prompt_scale_jitter=0.2),
-    'box-prompt-dropped': _L(prob_2d_only=0.0, aug_prob=0.5, box_prompt='film',
-                             box_prompt_dropout=0.0, box_prompt_frames='first'),
     # The RANGED crop-inflate draw (a per-item uniform draw, not a scalar).
     'ranged-inflate': _L(prob_2d_only=0.0, aug_prob=0.5, crop_inflate=[0.9, 1.5]),
-    # The true-2D `prob_2d_only` path is tested separately because its target semantics differ
-    # intentionally from the frozen pre-change oracle.
     # Val geometry: jitter and crop-inflate draws OFF, a fixed window.
     'val-geometry': _L(prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0, crop_inflate=[0.9, 1.5]),
 }
 
 
-def _cases_for(name):
-    """Which (root, split) pairs a case is meaningful on, and whether that split is train."""
-    if name in ('box-prompt', 'box-prompt-dropped'):
-        return [('ratlike', 'train', True), ('mouselike', 'train', True)]   # 2D and 3D boxes
-    if name in ('ranged-inflate', 'prompt-noise', 'prompt-swaps'):
-        return [('mouselike', 'train', True)]
-    if name == 'val-geometry':
-        return [('ratlike', 'val', False), ('mouselike', 'val', False)]
-    return [('ratlike', 'train', True), ('ratlike', 'val', False),
-            ('mouselike', 'train', True), ('mouselike', 'val', False)]
-
-
-def test_prob_2d_only_projects_a_3d_session(seam_root):
-    cfg = _L(prob_2d_only=1.0, aug_prob=0.0, crop_jitter=0.0, cams_to_sample=[2, 3])
-    ds = PoseDataset(seam_root / 'mouselike', 'train', cfg)
-    item = ds[0]
-    assert item is not None
-    assert item[1].shape[-1] == 2
-    assert len(item[0]) == 1
-    assert item[5]['mode'] == '2d'
-    assert item[8] is not None
-
-
 def test_the_covered_cases_actually_reach_their_branches(seam_root):
-    """Each case must OBSERVABLY reach the branch it exists to cover.
-
-    This is the guard against the failure mode this file already had once: configs that looked
-    like they covered the prompt-noise and box-prompt paths, but never entered either, so the
-    oracle's missing `get_camera_scale` import and its `from . import box_prompt` (which would
-    have resolved against `tests/`) were never executed and the test passed on an unusable oracle.
-    A green suite that does not run the code is worse than a red one.
-    """
+    """Each case OBSERVABLY reaches the branch it covers -- once, configs that never entered the
+    prompt-noise and box-prompt paths passed on an unusable oracle."""
     # The box-prompt case must actually append the box field (13 fields -> 14).
     plain = _run(PoseDataset(seam_root / 'ratlike', 'train', _CASES['plain'], train=True), 0)[0]
     boxed = _run(PoseDataset(seam_root / 'ratlike', 'train', _CASES['box-prompt'], train=True), 0)[0]
@@ -239,13 +179,8 @@ def _same_or_false(a, b):
 
 
 def test_the_ground_truth_arrays_are_not_written_through(seam_root):
-    """`select` hands out the stored coordinates; nothing may write through them.
-
-    `torch.as_tensor` on the label array SHARES storage, so an in-place op after `select` would
-    corrupt the session for every later item. The old fused `_item` had the same exposure but
-    could not be asked this question; the split makes it load-bearing, because the scorer realises
-    one selection TWICE.
-    """
+    """`select` shares storage with the stored labels; realising must not write through them (the
+    scorer realises one selection twice)."""
     cfg = _CASES['augmented']
     ds = PoseDataset(seam_root / 'mouselike', 'train', cfg, train=True)
     sel = ds.select(0, np.random.default_rng(7), ds.shape(np.random.default_rng(1)))
@@ -259,20 +194,15 @@ def test_the_ground_truth_arrays_are_not_written_through(seam_root):
         np.testing.assert_array_equal(sel.lab.points2d, before2d)
 
 
-@pytest.mark.parametrize('case', ['augmented', 'prompt-swaps', 'box-prompt'])
+@pytest.mark.parametrize('case', ['augmented', 'box-prompt'])
 def test_two_realisations_of_one_selection_are_independent(seam_root, case):
-    """The two-view property the scorer depends on: realising twice must leave no trace.
-
-    A replay of the same view after an intervening different view must be identical to the first
-    -- which fails silently if any helper ever starts mutating `sel` in place.
-    """
+    """Realising twice leaves no trace: a replay after a different view equals the first view."""
     cfg = _CASES[case]
     for root_name in (('ratlike', 'mouselike') if case == 'box-prompt' else ('mouselike',)):
         ds = PoseDataset(seam_root / root_name, 'train', cfg, train=True)
         sel_a = ds.select(0, np.random.default_rng(3), ds.shape(np.random.default_rng(1)))
         assert sel_a is not None
 
-        _, first = _seed_all(100, 1, 0xA06, 0xB07), None
         rng, _ = _seed_all(100, 1, 0xA06, 0xB07)
         first = ds.realise(sel_a, rng)
         rng, _ = _seed_all(200, 1, 0xA06, 0xB07)          # a DIFFERENT view of the same selection

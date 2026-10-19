@@ -62,7 +62,9 @@ def test_skew_projection_sensitivity_matches_autograd():
     torch.testing.assert_close(got[0], oracle, rtol=1e-5, atol=1e-7)
 
 
-def test_skew_image_rotation_keeps_projection_in_warp_frame():
+def test_image_rotation_keeps_projection_in_warp_frame():
+    """An image-plane rotation moves projections by exactly its 2x3, under skew and under an
+    anisotropic focal with tangential distortion."""
     from tracktail.model.cube import project_cam
     from tailcyclenet.dataset import rotate_camera_image_plane_3d
 
@@ -76,6 +78,15 @@ def test_skew_image_rotation_keeps_projection_in_warp_frame():
     expected = before @ affine[:, :2].T + affine[:, 2]
     torch.testing.assert_close(after, expected, rtol=0.0, atol=1e-4)
     torch.testing.assert_close(cam_rot['ext'], cam['ext'])
+
+    cam['mat'] = cam['mat'].clone()
+    cam['mat'][0, 0], cam['mat'][0, 1] = 900.0, 0.0
+    cam['dist'] = torch.tensor([0.01, -0.001, 0.0002, -0.0001, 0.0003])
+    before = project_cam(cam, world)
+    cam_rot, (matrix, _) = rotate_camera_image_plane_3d(cam, 27.0)
+    affine = torch.as_tensor(matrix, dtype=before.dtype)
+    expected = before @ affine[:, :2].T + affine[:, 2]
+    torch.testing.assert_close(project_cam(cam_rot, world), expected, rtol=0.0, atol=2e-4)
 
 
 def test_skew_rotate_crop_resize_matches_pixel_affine():
@@ -98,22 +109,6 @@ def test_skew_rotate_crop_resize_matches_pixel_affine():
     torch.testing.assert_close(got, expected, rtol=0.0, atol=2e-4)
 
 
-def test_image_rotation_supports_anisotropic_focal_and_tangential_distortion():
-    from tracktail.model.cube import project_cam
-    from tailcyclenet.dataset import rotate_camera_image_plane_3d
-
-    cam = _rig(offset=(7.0, -4.0)).tracktail()[0]
-    cam['mat'] = cam['mat'].clone()
-    cam['mat'][0, 0], cam['mat'][0, 1] = 900.0, 0.0
-    cam['dist'] = torch.tensor([0.01, -0.001, 0.0002, -0.0001, 0.0003])
-    world = torch.tensor([[0.2, -0.1, 10.0]], dtype=torch.float32)
-    before = project_cam(cam, world)
-    cam_rot, (matrix, _) = rotate_camera_image_plane_3d(cam, 27.0)
-    affine = torch.as_tensor(matrix, dtype=before.dtype)
-    expected = before @ affine[:, :2].T + affine[:, 2]
-    torch.testing.assert_close(project_cam(cam_rot, world), expected, rtol=0.0, atol=2e-4)
-
-
 def test_skew_detector_association_triangulates_with_full_intrinsics():
     from tracktail.model.cube import project_points_torch
     from tailcyclenet.detector.associate import _triangulate
@@ -127,6 +122,7 @@ def test_skew_detector_association_triangulates_with_full_intrinsics():
 
 
 def test_all_production_inverse_aliases_use_full_intrinsics():
+    """`install_full_intrinsics` ran before tracktail bound `undistort_points` (plan §4)."""
     import tracktail.model.tracker_encoder as tracker_encoder
     import tracktail.model.cube as cube
 

@@ -234,16 +234,17 @@ class CrossViewTracker:
             Mutates `self.targets`: points re-triangulated from what each target claimed,
             ages advanced, births and retirements applied.
         Notes:
-            A target with no 3D point cannot be matched but must still expire; it is filtered
-            out of `slots`, so its age is never touched and its row goes dead for the clip
-            (`--min-views 1` creates exactly this). The gate is the algorithm, not a tie-break:
+            Every target holds a finite 3D point (a single-view `--min-views 1` row is written
+            for its frame but never seated as a target, see `_birth`); a target without one
+            would be left out of `slots`, aged here and retired at `max_age` like any other.
+            The gate is the algorithm, not a tie-break:
             a pair beyond one box side is not the same animal, so it must be unavailable to
             Hungarian rather than merely expensive; a NaN box is unavailable, not unrankable
             (NaN affinity made `linear_sum_assignment` raise). The affinity uses the detection's
             own side (not the mean with the target's remembered side -- measured worse). A
-            one-camera target never expires or updates its 3D point; retiring it was measured
-            worse (+2.72 mm MPJPE) because output boxes come from the claimed detection, never
-            the reprojection.
+            target matched to a group without a triangulated point keeps its 3D point (its age
+            resets, so it does not expire); retiring it was measured worse (+2.72 mm MPJPE)
+            because output boxes come from the claimed detection, never the reprojection.
         """
         self._t += 1
         C = len(cgroup)
@@ -441,13 +442,23 @@ class CrossViewTracker:
 
         Inputs: s -- a slot with no target; g -- an `associate` group; the three output arrays;
             the frame's boxes and scores; remap -- (camera, group-local index) -> raw detection
-            index, since the per-camera path hands `associate` a filtered leftover pool.
+            index (`_joint` passes the identity: `associate` saw the whole pool).
         Outputs: None.
-        Side effects: creates `self.targets[s]` and writes its row.
+        Side effects: writes slot `s`'s row; creates `self.targets[s]` when `g` has a point.
 
-        A `min_views = 1` group has an all-NaN point BY DESIGN; it is seated anyway, exactly as
-        before, and ages out through the `slots` filter in `step`.
+        A `min_views = 1` single-view group has an all-NaN point BY DESIGN: no target can ever
+        match it, so seating one would hold its slot dead for `max_age` frames while the same
+        detection re-births into the next free slot every frame (one animal rotating through
+        every slot). Its row is written for this frame only and the slot stays free, so the
+        next frame re-seats it in the same lowest free slot.
         """
+        if not bool(torch.isfinite(g['point']).all()):
+            for c, j in g['members'].items():
+                det = remap(c, j)
+                out[s, c] = boxes_per_cam[c][det].numpy()
+                sc[s, c] = float(scores_per_cam[c][det])
+                claimed_ix[s, c] = det
+            return
         self.targets[s] = {'point': g['point'], 'age': 0}
         self._residuals[s] = float(g.get('residual', float('inf')))
         self.events.append({'frame': self._t + self._frame_base, 'slot': s, 'event': 'born',

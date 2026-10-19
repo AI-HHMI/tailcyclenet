@@ -158,7 +158,8 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
-                 duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0):
+                 duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0,
+                 max_res_sides=None, score_order=False):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -179,6 +180,9 @@ class CrossViewTracker:
                     on an aligned lead-in batch below `--start-frame`, so its step count alone is
                     not the source frame -- events must add this back, or a bridge/consumer that
                     reads them as source-absolute silently misreads a ranged run.
+                max_res_sides / score_order -- passed to every `associate` call (TR5 scale-free
+                    residual gate, TR6a objectness-first candidate order); None / False are the
+                    shipped behaviour.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}. 'point' and 'age'
         keep their meaning throughout: the last TRIANGULATED point and frames since the last
@@ -194,6 +198,9 @@ class CrossViewTracker:
             raise ValueError('duplicate_radius must be non-negative')
         self.duplicate_radius = float(duplicate_radius)
         self.duplicate_persist = int(duplicate_persist)
+        self.max_res_sides = None if max_res_sides is None else float(max_res_sides)
+        self.score_order = bool(score_order)
+        self.n_groups = 0
         self._residuals = {}
         self._dup_contact = {}
         self._dup_shield = set()
@@ -519,7 +526,9 @@ class CrossViewTracker:
 
         C = len(cgroup)
         groups = associate(cgroup, boxes_per_cam, max_res_px=self.max_res_px,
-                           min_views=self.min_views)
+                           min_views=self.min_views, max_res_sides=self.max_res_sides,
+                           scores_per_cam=scores_per_cam, score_order=self.score_order)
+        self.n_groups += len(groups)
         proj = {c: (_project(cgroup[c], pts) if slots else None) for c in range(C)}
         ages = {s: float(self.targets[s].get('age', 0)) for s in slots}
         aff = np.zeros((len(slots), len(groups)), np.float64)

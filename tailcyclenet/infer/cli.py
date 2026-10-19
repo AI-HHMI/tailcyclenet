@@ -205,6 +205,16 @@ def build_parser() -> argparse.ArgumentParser:
     ident.add_argument('--assoc-res-max-px', type=float, default=None,
                        help="override the session's reprojection gate (a PIXEL gate: sweep per "
                             "rig). Default: the session's own value.")
+    ident.add_argument('--assoc-res-max-sides', type=float, default=None,
+                       help='TR5: gate cross-view grouping on the reprojection residual in BOX '
+                            'SIDES (median over views of residual / that view\'s box side) '
+                            'instead of pixels; when set it REPLACES the pixel gate for '
+                            'association only (the GT triangulation keeps assoc_res_max_px). '
+                            'Default: off (pixel gate).')
+    ident.add_argument('--assoc-score-order', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='TR6a: rank cross-view candidate pairs by (support, lower box score, '
+                            'residual) instead of (support, residual). Default: off.')
     ident.add_argument('--identity-bridge', action='store_true',
                        help='OPT-IN post-pass repairing the slot permutation a hard interaction '
                             'leaves; TRADES MISSES FOR IDENTITY (quote miss and coverage with '

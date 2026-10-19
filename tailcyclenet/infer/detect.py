@@ -258,6 +258,8 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                                    state=assoc_state,
                                    duplicate_radius=args.duplicate_radius,
                                    duplicate_persist=args.duplicate_persist,
+                                   assoc_res_max_sides=args.assoc_res_max_sides,
+                                   assoc_score_order=args.assoc_score_order,
                                    frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j])

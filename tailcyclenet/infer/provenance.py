@@ -63,6 +63,9 @@ def identity_provenance(args):
         'identity_bridge': bool(args.identity_bridge),
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
+        'assoc_res_max_sides': (float(args.assoc_res_max_sides)
+                                if args.assoc_res_max_sides is not None else 0.0),
+        'assoc_score_order': bool(args.assoc_score_order),
     }
 
 

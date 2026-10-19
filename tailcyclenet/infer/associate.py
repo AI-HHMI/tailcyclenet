@@ -26,6 +26,7 @@ import torch
 from tracktail.model.cube import project_points_torch
 
 from ..detector.boxes import centres as box_centres
+from ..detector.boxes import sides as box_sides
 
 
 def _triangulate(cgroup, cams, pts):
@@ -60,7 +61,19 @@ def _residual(cgroup, cams, pts, p3d):
     return float(torch.linalg.norm(proj - pts, dim=-1).median())
 
 
-def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
+def _residuals(cgroup, cams, pts, p3d, sides=None):
+    """Per-view reprojection residuals of `p3d`: pixels, or box sides when `sides` is given.
+
+    Inputs: as `_residual`, plus sides -- (n_views,) box sides of the observed detections, or
+            None for pixels.
+    Outputs: (n_views,) tensor.
+    """
+    proj = project_points_torch([cgroup[c] for c in cams], p3d.reshape(1, 1, 3))[:, 0, 0]
+    d = torch.linalg.norm(proj - pts, dim=-1)
+    return d if sides is None else d / sides.clamp_min(1e-6)
+
+
+def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px, sides=None):
     """How many cameras OTHER than `cams_excl` have an UNUSED detection within `max_res_px` of
     `p3d`'s reprojection. detector_v2 plan E1a/E3.
 
@@ -83,6 +96,9 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
     which is a measure-zero coincidence unless cameras are near-collinear, where a real occluded
     animal only needs ITS OWN other views to have detected it at all.
 
+    `sides` (TR5) makes `max_res_px` a gate in box sides: each distance is divided by its own
+    detection's side.
+
     Only DISTANCE is used here (nearest live detection in that camera to the projected point),
     not yet a refit -- see plan SS2.2 item 3 ('growth still matches against the pair's un-refit
     p3d'), left as a separate, un-landed item.
@@ -96,12 +112,15 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
             continue
         proj = project_points_torch([cgroup[c]], p3d.reshape(1, 1, 3))[0, 0]
         d = torch.linalg.norm(centres[c][idx] - proj, dim=-1)
+        if sides is not None:
+            d = d / sides[c][idx].clamp_min(1e-6)
         if bool((d < max_res_px).any()):
             count += 1
     return count
 
 
-def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0):
+def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
+              max_res_sides=None, scores_per_cam=None, score_order=False):
     """Group boxes across cameras into 3D instances.
 
     Inputs:
@@ -112,6 +131,13 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             algorithm, not a parameter (every group starts from a cross-camera PAIR); `1`
             emits each leftover box as its own single-view instance with no triangulated point.
         max_instances -- cap on returned groups (0 = uncapped).
+        max_res_sides -- TR5, None (default) = the pixel gate. A float REPLACES `max_res_px` with
+            a scale-free gate: each view's residual is divided by that view's own box side, and
+            the pair, growth, support and refit gates all compare the median of those ratios.
+        scores_per_cam / score_order -- TR6a: with `score_order`, candidates rank by
+            (-support, -pair_score, residual), pair_score = the lower of the pair's two box
+            scores (a real reorder: residual is continuous, so a key after it never fires).
+            False (default) is the shipped (-support, residual).
     Candidates rank by all-camera support count first, pair residual as tie-break (plan
     E1a/E3), never by the seeding pair's residual alone (which a phantom can always satisfy).
     Outputs:
@@ -132,6 +158,19 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
 
     used = {(c, i) for c in range(n_cams)
             for i in range(centres[c].shape[0]) if not bool(torch.isfinite(centres[c][i]).all())}
+    if score_order and scores_per_cam is None:
+        raise ValueError('score_order needs scores_per_cam')
+    sides = None
+    if max_res_sides is not None:
+        sides = [box_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
+        max_res_px = float(max_res_sides)
+
+    def res(cams, pts, p3d, idx):
+        """The gated residual: pixels, or (TR5) box sides of the members `idx`."""
+        if sides is None:
+            return _residual(cgroup, cams, pts, p3d)
+        s = torch.stack([sides[c][i] for c, i in zip(cams, idx)])
+        return float(_residuals(cgroup, cams, pts, p3d, s).median())
 
     cands = []
     for ca, cb in itertools.combinations(range(n_cams), 2):
@@ -143,13 +182,19 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
                 p3d = _triangulate(cgroup, (ca, cb), pts)
                 if not torch.isfinite(p3d).all():
                     continue
-                res = _residual(cgroup, (ca, cb), pts, p3d)
-                support = _support_count(cgroup, (ca, cb), centres, used, p3d, max_res_px)
-                cands.append((support, res, (ca, ia), (cb, ib), p3d))
-    cands.sort(key=lambda c: (-c[0], c[1]))
+                r = res((ca, cb), pts, p3d, (ia, ib))
+                support = _support_count(cgroup, (ca, cb), centres, used, p3d, max_res_px,
+                                         sides)
+                pair = (min(float(scores_per_cam[ca][ia]), float(scores_per_cam[cb][ib]))
+                        if score_order else 0.0)
+                cands.append((support, r, (ca, ia), (cb, ib), p3d, pair))
+    if score_order:
+        cands.sort(key=lambda c: (-c[0], -c[5], c[1]))
+    else:
+        cands.sort(key=lambda c: (-c[0], c[1]))
     out = []
-    for _support, res, a, b, p3d in cands:
-        if a in used or b in used or res > max_res_px:
+    for _support, r, a, b, p3d, _pair in cands:
+        if a in used or b in used or r > max_res_px:
             continue
         members = {a[0]: a[1], b[0]: b[1]}
         for c in range(n_cams):
@@ -159,9 +204,9 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             for i in range(centres[c].shape[0]):
                 if (c, i) in used:
                     continue
-                r = _residual(cgroup, (c,), centres[c][i].reshape(1, 2), p3d)
-                if r < best_res:
-                    best, best_res = i, r
+                ri = res((c,), centres[c][i].reshape(1, 2), p3d, (i,))
+                if ri < best_res:
+                    best, best_res = i, ri
             if best is not None:
                 members[c] = best
         if len(members) < min_views:
@@ -169,7 +214,7 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         cams = tuple(sorted(members))
         pts = torch.stack([centres[c][members[c]] for c in cams])
         refined = _triangulate(cgroup, cams, pts)
-        res_fit = _residual(cgroup, cams, pts, refined)
+        res_fit = res(cams, pts, refined, tuple(members[c] for c in cams))
         if not res_fit <= max_res_px:
             continue
         out.append({'point': refined, 'residual': res_fit,
@@ -194,7 +239,8 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None,
-                    state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0):
+                    state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0,
+                    assoc_res_max_sides=None, assoc_score_order=False):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -214,6 +260,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             tracker so its `identity_events` are source-absolute even on a ranged run whose
             tracker is first built on an aligned lead-in batch; inert once `state` already
             holds one (the tracker is built exactly once).
+        assoc_res_max_sides / assoc_score_order -- `associate`'s `max_res_sides` (TR5) and
+            `score_order` (TR6a), with or without a tracker; None / False are the shipped gates.
     Outputs:
         The same pair re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -241,7 +289,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        max_move=max_move, max_age=max_age,
                                        duplicate_radius=duplicate_radius,
                                        duplicate_persist=duplicate_persist,
-                                       frame_base=frame_base)
+                                       frame_base=frame_base,
+                                       max_res_sides=assoc_res_max_sides,
+                                       score_order=assoc_score_order)
         state['tracker'] = tracker
     tracker = state['tracker']
 
@@ -255,6 +305,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         ok = np.flatnonzero(np.isfinite(r_sc[:, t, c]))
         return torch.from_numpy(r_box[ok, t, c]), torch.from_numpy(r_sc[ok, t, c]), ok
 
+    import time
+
+    t_start = time.perf_counter()
     raw_offered = 0
     for t in range(T):
         per_cam = [_cam(t, c) for c in range(C)]
@@ -272,12 +325,20 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             continue
         groups = associate(cams, [p[0] for p in per_cam],
                            max_res_px=session.assoc_res_max_px, max_instances=S,
-                           min_views=min_views)
+                           min_views=min_views, max_res_sides=assoc_res_max_sides,
+                           scores_per_cam=[p[1] for p in per_cam],
+                           score_order=assoc_score_order)
+        if stats is not None:
+            stats['association_groups'] = stats.get('association_groups', 0) + len(groups)
         for a, g in enumerate(groups[:S]):
             for c, box in g['boxes'].items():
                 d = g['members'][c]
                 out[a, t, c] = box.numpy()
                 sc[a, t, c] = float(per_cam[c][1][d])
+    if stats is not None:
+        stats['association_s'] = stats.get('association_s', 0.0) + time.perf_counter() - t_start
+    if stats is not None and tracker is not None:
+        stats['association_groups'] = tracker.n_groups
     pre_link = int(np.isfinite(out).all(-1).sum())
     if link and tracker is None:
         out, sc = link_rows(out, sc, max_move=max_move, max_age=max_age,

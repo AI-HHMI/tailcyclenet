@@ -152,57 +152,6 @@ def assign(anchors, gt_boxes, max_pos_per_gt=None):
     return out
 
 
-def keypoint_loss(pred, target, gt_boxes):
-    """L1 over box sides + BCE on the score channel, both masked by the LABEL, not by K.
-
-    `pred` (P,K,3) at the assigned positives, `target` (P,K,3) of (x, y, vis), `gt_boxes` (P,4).
-
-    PREDICT ALL K ALWAYS, SUPERVISE ONLY WHERE THE LABEL IS FINITE. Four things here are silent
-    if got wrong:
-
-    1. **Mask, never fill.** `nan_to_num(target)` then L1 would supervise every unlabelled
-       keypoint toward (0, 0) with a healthy-looking loss curve. A non-finite target is the OFF
-       SWITCH for that element; and do not multiply a filled tensor by the mask either: `0 * NaN`
-       is `NaN` and poisons the whole batch's gradient.
-    2. **Normalise by the FINITE COUNT, not by K.** Otherwise an animal with 2 of 9 points
-       labelled contributes 2/9 the gradient of a fully-labelled one and the term's magnitude
-       rides on label density rather than on error.
-    3. **The score channel trains against `status`, not against coordinate-finiteness.** They
-       come apart in both directions -- the format permits `x, y` null on a VISIBLE row -- so the
-       two masks cannot be the same tensor. `data.py` already NaNs `vis` where the session made
-       no assessment, and a NaN there withholds the score loss rather than asserting "not
-       visible".
-    4. **L1 over the box side, not OKS.** OKS buys scale-invariance through a per-keypoint sigma
-       table we would have to invent per dataset; dividing by the side gets the same invariance
-       with no table.
-
-    Notes.
-
-    The finite coordinates are SELECTED, not multiplied by a mask (see note 1 above):
-    `target[xy_ok]` is (n_finite, 2) with no NaN in it, so `0 * NaN` can never poison the
-    gradient. The normaliser is the per-animal box side `(P,1)`.
-    """
-    if pred.numel() == 0:
-        z = pred.sum() * 0.0
-        return z, z, 0, 0
-    side = (0.5 * ((gt_boxes[:, 2] - gt_boxes[:, 0]) + (gt_boxes[:, 3] - gt_boxes[:, 1]))
-            ).clamp_min(1.0)[:, None]
-    xy_ok = torch.isfinite(target[..., :2]).all(-1)
-    if xy_ok.any():
-        d = (pred[..., :2][xy_ok] - target[..., :2][xy_ok]).abs().sum(-1)
-        reg = d / side.expand_as(xy_ok)[xy_ok]
-        reg = reg.sum() / xy_ok.sum()
-    else:
-        reg = pred.sum() * 0.0
-    v_ok = torch.isfinite(target[..., 2])
-    if v_ok.any():
-        sc = F.binary_cross_entropy_with_logits(
-            pred[..., 2][v_ok], target[..., 2][v_ok], reduction='mean')
-    else:
-        sc = pred.sum() * 0.0
-    return reg, sc, int(xy_ok.sum()), int(v_ok.sum())
-
-
 def ciou_loss(pred, target, eps=1e-7):
     """1 - CIoU, elementwise over matched ``xyxy`` box pairs."""
     import math
@@ -232,7 +181,6 @@ def ciou_loss(pred, target, eps=1e-7):
 
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
-                  kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
                   negative_supervision=None, iou_aware=False, iou_aware_warmup=2000, it=None,
                   max_pos_per_gt=None, assignment='center', box_loss_fn='giou',
                   tal_topk=13, tal_alpha=1.0, tal_beta=6.0):
@@ -240,8 +188,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
 
     Inputs:
         obj_logits (B,A), boxes (B,A,4), anchors (A,3), gt_boxes (B,G,4).
-        kpts / gt_kpts -- add the keypoint branch's terms over the SAME positives the box term
-            uses; absent, nothing about this function changes.
         iou_aware -- at a positive anchor the BCE target becomes the DETACHED predicted/GT IoU
             instead of a hard 1.0, so the score becomes a localisation-quality estimate. False
             (default) is byte-identical to every checkpoint on record.
@@ -251,12 +197,12 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         negative_supervision (B,) bool -- whether each image's non-positive anchors are known
             background. False keeps only positive objectness terms; it is reported as
             `parts['negative_frames']`.
-        box_weight / kpt_weight / kpt_score_weight -- term weights; max_pos_per_gt -- `assign`'s
+        box_weight -- the box term's weight; max_pos_per_gt -- `assign`'s
             cap, passed straight through; assignment / box_loss_fn / tal_* -- assigner and loss
             selection.
     Outputs:
-        (total, parts): total = obj + box_weight*box (+ keypoint terms); parts carries obj,
-        box, n_pos and any optional diagnostics (negative_frames, iou_target, kpt, kpt_score).
+        (total, parts): total = obj + box_weight*box; parts carries obj, box, n_pos and any
+        optional diagnostics (negative_frames, iou_target).
     Side effects:
         None.
     Notes:
@@ -279,7 +225,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                              f'for batch size {B}')
     weight = None if negative_supervision is None else torch.ones_like(obj_logits)
     losses_box, n_pos = [], 0
-    kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
         if assignment == 'tal':
             pos, gix = assign_tal(anchors, gt_boxes[b], obj_logits[b].detach(),
@@ -299,12 +244,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             loss_fn = ciou_loss if box_loss_fn == 'ciou' else giou_loss
             losses_box.append(loss_fn(boxes[b, pos], gt_boxes[b][gix]))
             n_pos += pos.numel()
-            if kpts is not None and gt_kpts is not None:
-                r, s, nk, nv = keypoint_loss(kpts[b, pos], gt_kpts[b][gix], gt_boxes[b][gix])
-                kpt_reg.append(r)
-                kpt_sc.append(s)
-                n_kpt += nk
-                n_vis += nv
     if weight is None:
         obj_all = F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
     else:
@@ -320,12 +259,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         parts['negative_frames'] = float(negative_supervision.float().mean())
     if iou_aware:
         parts['iou_target'] = float(target[pos_mask].mean()) if bool(pos_mask.any()) else 0.0
-    if kpts is not None and gt_kpts is not None:
-        kr = (torch.stack(kpt_reg).mean() if kpt_reg else torch.zeros((), device=device))
-        ks = (torch.stack(kpt_sc).mean() if kpt_sc else torch.zeros((), device=device))
-        total = total + kpt_weight * kr + kpt_score_weight * ks
-        parts |= {'kpt': float(kr.detach()), 'kpt_score': float(ks.detach()),
-                  'n_kpt': n_kpt, 'n_vis': n_vis}
     return total, parts
 
 
@@ -352,7 +285,7 @@ def box_center_dist(a, b, eps=1e-7):
 
 
 def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
-          center_dist_thresh=0.5, return_index=False, return_trace=False):
+          center_dist_thresh=0.5, return_trace=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     Inputs:
@@ -367,12 +300,10 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
             `box_center_dist`): suppresses near-concentric duplicates IoU alone lets through.
             Default 0.5 (plan A5, CONFIRMED -- a deliberate break from older checkpoints); pass
             None for the pre-A5 byte-identical behaviour.
-        return_index -- adds each kept box's ANCHOR index (the only way to pair a surviving
-            box with its own per-anchor keypoints).
         return_trace -- adds an output-neutral diagnostic dict (candidate counts, pre/post-NMS
             boxes and scores); opt-in because it retains tensors.
     Outputs:
-        (boxes (N,4), scores (N,)), plus the anchor index and/or trace when requested.
+        (boxes (N,4), scores (N,)), plus the trace when requested.
     Side effects:
         None.
     Notes:
@@ -392,8 +323,7 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
                  'score_boxes': boxes.new_zeros((0, 4)), 'score_scores': scores.new_zeros((0,)),
                  'nms_boxes': boxes.new_zeros((0, 4)), 'nms_scores': scores.new_zeros((0,)),
                  'nms_index': index}
-        out = (*empty, index) if return_index else empty
-        return (*out, trace) if return_trace else out
+        return (*empty, trace) if return_trace else empty
     order = scores[keep].argsort(descending=True, stable=True)
     b, s = boxes[keep][order], scores[keep][order]
     ix = keep.nonzero().flatten()[order]
@@ -410,8 +340,6 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
         b, s, ix = b[survives], s[survives], ix[survives]
     nms_b, nms_s, nms_i = torch.cat(kept_b), torch.cat(kept_s), torch.cat(kept_i)
     out = (nms_b[:top_k], nms_s[:top_k])
-    if return_index:
-        out = (*out, nms_i[:top_k])
     if return_trace:
         all_order = scores.argsort(descending=True, stable=True)
         trace = {'n_total': int(scores.numel()), 'n_score': int(keep.sum()),

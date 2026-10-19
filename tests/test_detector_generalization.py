@@ -116,12 +116,6 @@ def test_shipped_detector_rotation_is_the_full_circle(tmp_path):
     assert min(angles) < -170 and max(angles) > 170
 
 
-def test_vflip_is_off_under_keypoints(tiny_root):
-    """A vertical mirror swaps left/right keypoints exactly as a horizontal one does."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 64), keypoints=True, vflip=0.5)
-    assert ds.vflip == 0.0 and ds.hflip == 0.0
-
-
 def _checker(n=256):
     """A 1-px checkerboard: the worst case for a bilinear shrink."""
     yy, xx = np.mgrid[:n, :n]
@@ -192,7 +186,7 @@ def det_scene(tmp_path_factory):
     _, sessions = sessions_for(root / 'ds', 'test')
     sess = sessions[0]
     sess.preload()
-    return YOLOXNano(n_keypoints=0).eval(), sess, next(iter(sess.groups))
+    return YOLOXNano(version='hybrid').eval(), sess, next(iter(sess.groups))
 
 
 def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
@@ -202,12 +196,12 @@ def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
 
     det, sess, gid = det_scene
     det.box_target = 'crop'
-    raw, sc, _ = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
+    raw, sc = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
                             score_thresh=0.0)
     det.box_target, det.min_crop_dim = 'extent', 16
     try:
         for source, pad in (('keypoints', 20), ('instances', 0)):
-            got, sc2, _ = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
+            got, sc2 = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
                                      score_thresh=0.0, box_source=source)
             assert np.array_equal(sc, sc2, equal_nan=True)
             assert np.isfinite(raw).any()
@@ -250,7 +244,7 @@ input_wh = [48, 48]
 min_box_px = 0
 val_frames_per_group = 4
 [model]
-yolox = "tiny"
+yolox = "hybrid"
 [training]
 out = "{out}"
 iters = 4
@@ -274,5 +268,5 @@ warmup_steps = 0
                for n, t in ckpt['model_state'].items()), 'x == y: the test checked nothing'
 
     from tailcyclenet.detector import load_detector
-    det = load_detector(out, checkpoint='detector_it000004.pth')[0]
+    det = load_detector(out, checkpoint='detector_it000004.pth').model
     assert det.box_target == 'extent' and det.antialias and det.min_crop_dim == 16

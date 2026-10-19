@@ -154,8 +154,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
         compare warped predictions against unwarped `instances.pq` boxes.
     Notes:
         Per-(group, camera) state is keyed by the ITEM index, not the frame `f` (tiling makes
-        one frame several views). The head output is INDEXED, not unpacked -- fixed-arity
-        unpacking crashed eval when the head grew an extra return.
+        one frame several views).
     """
     was_training = model.training
     model.eval()
@@ -177,8 +176,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     sessions, n_want = {}, {}
     for bi, batch in enumerate(loader):
         x, gt = batch['x'], batch['boxes']
-        _out = model(x.to(device))
-        obj, pred_boxes = _out[0], _out[1]
+        obj, pred_boxes = model(x.to(device))
         for j in range(x.shape[0]):
             item = order[bi * batch_size + j]
             sess, gid, f, ci = ds.index[item]
@@ -234,7 +232,7 @@ def score_fixed_views(model, ds, indices, device, score_thresh=0.05, batch_size=
     rows = []
     offset = 0
     for batch in loader:
-        out = model(batch['x'].to(device))
+        obj, pred_boxes = model(batch['x'].to(device))
         for j in range(batch['x'].shape[0]):
             i = indices[offset]
             offset += 1
@@ -242,7 +240,7 @@ def score_fixed_views(model, ds, indices, device, score_thresh=0.05, batch_size=
             gt_all = batch['boxes'][j]
             gt = gt_all[torch.isfinite(gt_all).all(-1)]
             k = max_animals or max(1, len(sess.labels(gid).animal_ids))
-            pred, scores = decode(out[0][j], out[1][j], top_k=k,
+            pred, scores = decode(obj[j], pred_boxes[j], top_k=k,
                                   score_thresh=score_thresh, iou_thresh=iou_thresh,
                                   center_dist_thresh=center_dist_thresh)
             ious, fp = greedy_match(gt, pred.cpu())
@@ -384,11 +382,11 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      batch=batch, score_thresh=det_score, reduce=reduce, max_frames=max_frames,
                      tile_scale=tile_scale, iou_thresh=iou_thresh,
                      center_dist_thresh=center_dist_thresh, box_source=box_source)
-    r_box, r_sc, r_kp = raw
+    r_box, r_sc = raw
     D, T, C = r_sc.shape
     det_fill = float(np.isfinite(r_sc[0]).mean()) if D else 0.0
 
-    out, sc, kp = _associate_group(raw, sess, gid, n_animals, link=link, min_views=min_views,
+    out, sc = _associate_group(raw, sess, gid, n_animals, link=link, min_views=min_views,
                                    track=track, max_move=max_move)
     S, T, C = sc.shape
     slot_fill = float(np.isfinite(sc).mean())

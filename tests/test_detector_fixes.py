@@ -21,7 +21,7 @@ def _module(relpath, name):
     return mod
 
 
-def _train(tmp_path, root, monkeypatch, *, batch_size, iters, eval_every, yolox='trimmed',
+def _train(tmp_path, root, monkeypatch, *, batch_size, iters, eval_every, yolox='hybrid',
            input_wh='[48, 48]'):
     """Run `train_detector.main()` in-process on `root`; return the run folder."""
     out = tmp_path / 'run'
@@ -97,21 +97,22 @@ def test_convnext_config_refuses_an_input_side_not_divisible_by_32(tmp_path, key
     cfg.write_text(f'[data]\npath = "{tmp_path}"\n{key} = [128, 96]\n' + body.format(o=tmp_path))
     assert load_detector_config(cfg)['data'][key] == [128, 96]
     cfg.write_text(f'[data]\npath = "{tmp_path}"\n{key} = [120, 96]\n'
-                   + body.replace('convnext-t', 'trimmed').format(o=tmp_path))
+                   + body.replace('convnext-t', 'hybrid').format(o=tmp_path))
     assert load_detector_config(cfg)['data'][key] == [120, 96]
 
 
-def test_load_detector_refuses_a_convnext_override_not_divisible_by_32(tmp_path):
-    """detector B3: an `input_wh` override reaching a convnext-t checkpoint is refused at load,
-    not by an opaque RuntimeError in `detect_raw`'s first forward."""
+def test_load_detector_refuses_a_convnext_size_not_divisible_by_32(tmp_path):
+    """detector B3: a convnext-t checkpoint recording an input side not divisible by 32 is
+    refused at load, not by an opaque RuntimeError in `detect_raw`'s first forward."""
     from tailcyclenet.detector import YOLOXNano, load_detector
-    model = YOLOXNano(version='convnext-t', pretrained='')
-    path = tmp_path / 'det.pth'
-    torch.save({'kind': 'detector', 'input_wh': [128, 96], 'norm': 'gn',
-                'yolox_version': 'convnext-t', 'model_state': model.state_dict()}, path)
-    assert load_detector(path)[1] == (128, 96)
+    model = YOLOXNano(version='convnext-t')
+    for wh in ([128, 96], [120, 96]):
+        torch.save({'kind': 'detector', 'input_wh': wh, 'norm': 'gn',
+                    'yolox_version': 'convnext-t', 'model_state': model.state_dict()},
+                   tmp_path / f'det{wh[0]}.pth')
+    assert load_detector(tmp_path / 'det128.pth').input_wh == (128, 96)
     with pytest.raises(ValueError, match='divisible by 32'):
-        load_detector(path, input_wh=(120, 96))
+        load_detector(tmp_path / 'det120.pth')
 
 
 def test_score_fixed_views_restores_augment(tmp_path):
@@ -122,17 +123,17 @@ def test_score_fixed_views_restores_augment(tmp_path):
     from tailcyclenet.detector.evaluate import score_fixed_views
     _session_2d(tmp_path / 'r' / 'train' / 's0', T=4, S=2)
     ds = BoxDataset(tmp_path / 'r', 'train', input_wh=(64, 64), augment=True)
-    rows = score_fixed_views(YOLOXNano(version='trimmed', pretrained=''), ds, [0, 1], 'cpu')
+    rows = score_fixed_views(YOLOXNano(version='hybrid'), ds, [0, 1], 'cpu')
     assert len(rows) == 2
     assert ds.augment is True
 
 
 def _saved_detector(tmp_path, **meta):
-    """A fresh trimmed detector saved as a checkpoint dict with `meta` on top."""
+    """A fresh hybrid detector saved as a checkpoint dict with `meta` on top."""
     from tailcyclenet.detector import YOLOXNano
     path = tmp_path / 'det.pth'
-    torch.save({'kind': 'detector', 'input_wh': [64, 64], 'norm': 'gn', 'yolox_version': 'trimmed',
-                'model_state': YOLOXNano(version='trimmed', pretrained='').state_dict(), **meta},
+    torch.save({'kind': 'detector', 'input_wh': [64, 64], 'norm': 'gn', 'yolox_version': 'hybrid',
+                'model_state': YOLOXNano(version='hybrid').state_dict(), **meta},
                path)
     return path
 
@@ -224,3 +225,19 @@ def test_eval_detector_compare_scores_the_same_views(tmp_path, monkeypatch, caps
         mod.main()
         assert calls[-1] == calls[-2]
         assert 'PAIRED' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('flag', ['--pose-nms', '--crop-source'])
+def test_deleted_infer_flags_raise_by_name(flag):
+    """`--pose-nms` and `--crop-source` died with the detector keypoint branch; passing one exits
+    naming it and why instead of argparse's bare "unrecognized arguments"."""
+    from tailcyclenet.infer.cli import build_parser
+    with pytest.raises(SystemExit, match=f'{flag} is deleted.*keypoint'):
+        build_parser().parse_args(['--pose', 'r', '--data', 'd', '--out', 'o', flag, '0.5'])
+
+
+def test_train_detector_weights_dir_raises_by_name():
+    """`--weights-dir` cached the deleted COCO backbone."""
+    from tailcyclenet import train_detector
+    with pytest.raises(SystemExit, match='--weights-dir is deleted.*COCO'):
+        train_detector.main(['--weights-dir', '/tmp/w'])

@@ -165,9 +165,7 @@ def main():
             --det-max-frames.
     Side effects: prints the per-group table and bootstrapped aggregates.
 
-    A temporal-input checkpoint's BoxDataset must supply the same stacked-frame shape it was
-    trained on; `model.in_channels` (part of the weights) is the source of truth, not a CLI
-    flag. A fixed `--evalset` is scored IN-PROCESS throughout (`num_workers` forced to 0):
+    A fixed `--evalset` is scored IN-PROCESS throughout (`num_workers` forced to 0):
     `score_fixed_views` decodes in the parent, and a later forked loader worker would inherit a
     decoder mid-state and deadlock on a video root (gotcha 10; qdmouse hung for hours at 0% CPU).
     `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED,
@@ -245,7 +243,9 @@ def main():
     device = args.device if torch.cuda.is_available() else 'cpu'
     if args.deploy:
         return main_deploy(args, device)
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
+    ld = load_detector(args.run, device=device, checkpoint=args.checkpoint)
+    model, wh, mcd, red, trained_on, tile_scale = (ld.model, ld.input_wh, ld.min_crop_dim,
+                                                   ld.reduce, ld.box_source, ld.tile_scale)
     if args.det_input_wh:
         wh = tuple(args.det_input_wh)
     score_thresh = args.score_thresh[0]
@@ -316,8 +316,9 @@ def main():
     print(f'fp_ignored (raw count, quote beside MOTA on any 3D root -- CLAUDE.md): {fp_ig}')
 
     if args.compare:
-        m2, wh2, _, mcd2, red2, trained_on2, tile2, _ = load_detector(
-            args.compare, device=device, checkpoint=args.checkpoint)
+        ld2 = load_detector(args.compare, device=device, checkpoint=args.checkpoint)
+        m2, wh2, mcd2, red2, trained_on2, tile2 = (ld2.model, ld2.input_wh, ld2.min_crop_dim,
+                                                   ld2.reduce, ld2.box_source, ld2.tile_scale)
         _tiled(args.compare, tile2)
         if trained_on2 != trained_on:
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
@@ -367,7 +368,9 @@ def main_deploy(args, device):
     per group (each group is already a quantile of many windows/points), so a mean-of-medians is
     reported rather than bootstrapped a second time.
     """
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
+    ld = load_detector(args.run, device=device, checkpoint=args.checkpoint)
+    model, wh, mcd, red, trained_on, tile_scale = (ld.model, ld.input_wh, ld.min_crop_dim,
+                                                   ld.reduce, ld.box_source, ld.tile_scale)
     if args.det_input_wh:
         wh = tuple(args.det_input_wh)
     score_thresh = args.score_thresh[0]

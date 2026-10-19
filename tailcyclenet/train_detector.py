@@ -25,7 +25,6 @@ from tailcyclenet.detector import (BoxDataset, CohortSampler, YOLOXNano,
                                    box_collate, detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
-from tailcyclenet.detector.pretrained import load_coco_backbone
 from tailcyclenet.format import load_datasets
 
 
@@ -126,10 +125,9 @@ BACKBONE_LR_SCALE = 0.1
 
 
 def _pretrained_params(model):
-    """The pretrained parameters that get BACKBONE_LR_SCALE: a backbone's own
-    `pretrained_parameters()` (ConvNeXt-T: its ImageNet trunk), else the whole backbone (COCO)."""
-    pick = getattr(model.backbone, 'pretrained_parameters', None)
-    return pick() if pick is not None else list(model.backbone.parameters())
+    """The pretrained parameters that get BACKBONE_LR_SCALE: the backbone's own
+    `pretrained_parameters()` (ConvNeXt-T: its ImageNet trunk)."""
+    return model.backbone.pretrained_parameters()
 
 
 def build_detector_optimizer(model, train_cfg, model_cfg):
@@ -140,10 +138,8 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     (schedule-free replaces it).
 
     Muon routing: 2D .weight -> Muon (wrapped in ScheduleFree), everything else -> AdamW-SF.
-    `torch.optim.Muon` ONLY ACCEPTS 2D TENSORS and raises on 4D conv weights. For a pure CNN
-    (tiny/nano/s/cspnext), every conv weight is 4D, so Muon gets NOTHING and the optimizer is
-    just AdamW-ScheduleFree (no cosine schedule). For a ViT backbone, ~96% of params are 2D and
-    Muon routes them all -- confirmed by `dev/scratch/prototype_muon_detector.py`. The routing
+    `torch.optim.Muon` ONLY ACCEPTS 2D TENSORS and raises on 4D conv weights, so conv weights
+    go to AdamW-ScheduleFree and the 2D (linear/transformer) weights to Muon. The routing
     rule is the same as the pose model's in tailcyclenet/optim.py: 2D .weight tensors that are
     NOT nn.Embedding -> Muon; everything else (4D conv, 1D bias, GroupNorm/LayerNorm affine) ->
     AdamW-SF. The detector has no nn.Embedding layers. Decay is applied by the
@@ -274,6 +270,16 @@ def _record_run(run: Path, config: dict) -> tuple[dict, dict]:
     return record, prov
 
 
+class _RemovedFlag(argparse.Action):
+    """A deleted flag: passing it exits naming the flag and why, never silently ignored."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        """Refuse the flag by name."""
+        raise SystemExit(f'{option_string} is deleted: it cached the COCO YOLOX backbone, and '
+                         'the canonical tiers and their COCO loader are deleted (v0.3.4 is the '
+                         'last release that has them).')
+
+
 def main(argv: list[str] | None = None):
     """Train the box predictor; exit via SystemExit on bad config.
 
@@ -283,9 +289,6 @@ def main(argv: list[str] | None = None):
 
     Notes:
     - A tiled checkpoint's `input_wh` is its TILE size, read back from `BoxDataset`.
-    - `n_keypoints` is derived from the registry, never configured; a masked
-      keypoint still emits a number (conv bias), so the labelled fraction is
-      logged (sampled, not exhaustive).
     - THE TRAIN LOADER IS UNCAPPED AND WEIGHTED, NEVER SUBSAMPLED.
       `[data].frames_per_group` is DELETED: every labelled frame is indexed and
       `BoxDataset.default_train_weights` draws view-uniformly WITHIN a cohort, so
@@ -294,7 +297,7 @@ def main(argv: list[str] | None = None):
       train fallback, `annot_frac` overrides the otherwise-natural cohort share,
       and `alpha`/W1.1/A6/A6c compose on top. The realised mix is PRINTED.
     - No `val/` is the only thing swallowed; config errors fail at construction. A
-      COCO-pretrained backbone gets BACKBONE_LR_SCALE x lr (COCO convs, fresh GroupNorm net).
+      pretrained (ImageNet) trunk gets BACKBONE_LR_SCALE x lr.
     - `detector.pth` is the BEST checkpoint, not the last one (recall peaks
       early on partially-labelled roots); every `detector_it*.pth` is still
       written. Evaluation scores both splits, stores the score beside the
@@ -314,12 +317,7 @@ def main(argv: list[str] | None = None):
     ap.add_argument('--out', type=Path, default=None, help='override [training].out')
     ap.add_argument('--iters', type=int, default=None, help='override [training].iters')
     ap.add_argument('--device', default=None, help='override [training].device')
-    ap.add_argument('--weights-dir', type=Path, default=None,
-                    help='cache directory for the COCO-pretrained YOLOX backbone ([model].'
-                         'pretrained = "coco"); defaults to $TAILCYCLENET_CACHE_DIR/weights or '
-                         '~/.cache/tailcyclenet/weights, auto-fetched from Megvii\'s tagged '
-                         '0.1.1rc0 GitHub release if not already cached there. Pass this to use a '
-                         'pre-staged directory instead (e.g. on a host with no internet access).')
+    ap.add_argument('--weights-dir', action=_RemovedFlag, nargs='?', help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
     config = load_detector_config(args.config or _DETECTOR_CONFIG, out=args.out,
@@ -336,10 +334,6 @@ def main(argv: list[str] | None = None):
     all_roots = load_datasets(data_cfg['path'])
     roots = [ds for ds in all_roots if 'train' in ds.sessions]
     multi = len(roots) > 1
-    if multi and data_cfg['keypoints']:
-        raise SystemExit(f'{data_cfg["path"]}: multi-root detector training is box-only; '
-                         '[data].keypoints = true is explicitly refused when more than one '
-                         'training root is given.')
     root_names = [ds.name for ds in roots]
     unknown_box_roots = set(data_cfg['boxes_by_dataset']) - {ds.name for ds in all_roots}
     if unknown_box_roots:
@@ -362,8 +356,7 @@ def main(argv: list[str] | None = None):
                        box_source=data_cfg['boxes'], boxes_by_dataset=data_cfg['boxes_by_dataset'],
                        min_crop_dim=data_cfg['min_crop_dim'], augment=data_cfg['augment'],
                        reduce=data_cfg['reduce'], max_frames_per_group=0,
-                       keypoints=data_cfg['keypoints'],
-                       hflip=0.0 if not data_cfg['hflip'] else None,
+                       hflip=0.5 if data_cfg['hflip'] else 0.0,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
                        seed=train_cfg['seed'], datasets=all_roots,
                        box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
@@ -387,22 +380,6 @@ def main(argv: list[str] | None = None):
                          for name in train.root_names}
     print(f'box sources={effective_sources}; box-only instance fallback: '
           f'{len(train.box_only_fallback_sessions)} session(s)')
-    n_kpts = len(all_roots[0].names) if data_cfg['keypoints'] else 0
-    if data_cfg['keypoints']:
-        print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')
-        cen = np.zeros(n_kpts)
-        step = max(1, len(train) // 200)
-        seen = 0
-        for j in range(0, len(train), step):
-            _, k = train.boxes_for(j, None, with_keypoints=True)
-            cen += np.isfinite(k[..., :2].numpy()).all(-1).sum(0)
-            seen += k.shape[0]
-        frac = cen / max(seen, 1)
-        names = all_roots[0].names
-        thin = [f'{names[i]} {frac[i]:.2f}' for i in np.argsort(frac)[:5]]
-        print(f'  labelled fraction per keypoint over {seen} sampled instances: '
-              f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
-        print(f'  thinnest: {", ".join(thin)}', flush=True)
     combined_w = train.train_weights(data_cfg['annot_frac'], data_cfg['alpha'],
                                      data_cfg['balance_datasets'])
     sampler = CohortSampler(combined_w, num_samples=max(len(combined_w), train_cfg['batch_size']),
@@ -440,7 +417,7 @@ def main(argv: list[str] | None = None):
                          box_source=data_cfg['boxes'], boxes_by_dataset=data_cfg['boxes_by_dataset'],
                          min_crop_dim=data_cfg['min_crop_dim'], reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
-                         keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
+                         seed=train_cfg['seed'],
                          include_roots=root_names, datasets=all_roots,
                          box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
                          input_norm=data_cfg['input_norm'],
@@ -452,22 +429,14 @@ def main(argv: list[str] | None = None):
     print(f'eval work/pass: up to {train_cfg["eval_batches"]} batches x {eval_roots} '
           f'root/split evaluations')
 
-    model = YOLOXNano(n_keypoints=n_kpts,
-                      version=model_cfg['yolox'],
-                      bottleneck_expansion=model_cfg['bottleneck_expansion'],
-                      p2=model_cfg['p2'],
-                      pretrained=model_cfg['pretrained'],
+    model = YOLOXNano(version=model_cfg['yolox'], p2=model_cfg['p2'],
                       shared_head=train_cfg['shared_head'],
                       fpn_upsample=train_cfg['fpn_upsample']).to(device)
     n = sum(p.numel() for p in model.parameters())
-    print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
-          f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
+    print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params')
     if model_cfg['pretrained'] == 'imagenet':
         n_loaded, n_total = model.backbone.load_weights()
         print(f'  loaded {model_cfg["pretrained"]} trunk: {n_loaded}/{n_total} tensors', flush=True)
-    if model_cfg['pretrained'] == 'coco':
-        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'], weights_dir=args.weights_dir)
-        print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors', flush=True)
 
     opt, sched = build_detector_optimizer(model, train_cfg, model_cfg)
     if model_cfg['pretrained'] and train_cfg['optimizer'] == 'adamw':
@@ -479,11 +448,10 @@ def main(argv: list[str] | None = None):
         'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
         'input_norm': data_cfg['input_norm'],
         'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
-        'input_wh': wh, 'n_keypoints': n_kpts,
+        'input_wh': wh,
         'norm': 'gn',
         'yolox_version': model_cfg['yolox'],
         'optimizer_kind': train_cfg['optimizer'],
-        'bottleneck_expansion': model_cfg['bottleneck_expansion'],
         'pretrained': model_cfg['pretrained'],
         'assignment': train_cfg['assignment'],
         'box_loss': train_cfg['box_loss'],
@@ -518,18 +486,14 @@ def main(argv: list[str] | None = None):
         for batch in loader:
             if it >= train_cfg['iters']:
                 break
-            x, gt, gt_kpts, gt_negative = split_batch(batch)
+            x, gt, gt_negative = split_batch(batch)
             x, gt = x.to(device), gt.to(device)
-            gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
             gt_negative = None if gt_negative is None else gt_negative.to(device)
             if gt_negative is not None and bool(gt_negative.all()):
                 gt_negative = None
-            out = model(x)
-            obj, boxes, kpt = out[0], out[1], out[2]
+            obj, boxes = model(x)
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
-            loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
-                                        kpt_weight=train_cfg['kpt_weight'],
-                                        kpt_score_weight=train_cfg['kpt_score_weight'],
+            loss, parts = detector_loss(obj, boxes, anchors, gt,
                                         negative_supervision=gt_negative,
                                         iou_aware=train_cfg['iou_aware_obj'],
                                         iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it,
@@ -557,11 +521,8 @@ def main(argv: list[str] | None = None):
             it += 1
 
             if it % 50 == 0:
-                kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
-                      if 'kpt' in parts else '')
-                kp += (f'  negf {parts["negative_frames"]:5.3f}'
-                       if 'negative_frames' in parts else '')
-                kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
+                kp = (f'  negf {parts["negative_frames"]:5.3f}'
+                      if 'negative_frames' in parts else '')
                 kp += f'  iouT {parts["iou_target"]:5.3f}' if 'iou_target' in parts else ''
                 seconds_per_it = (time.time() - t0) / 50
                 print(f'{it:7d}/{train_cfg["iters"]}  loss {np.mean(running):7.4f}  '
@@ -572,7 +533,7 @@ def main(argv: list[str] | None = None):
                                  'train/box': float(parts['box']),
                                  'train/positive_anchors': float(parts['n_pos']),
                                  'train/seconds_per_iteration': float(seconds_per_it)}
-                for key in ('kpt', 'kpt_score', 'negative_frames', 'ident', 'iou_target'):
+                for key in ('negative_frames', 'iou_target'):
                     if key in parts:
                         train_metrics[f'train/{key}'] = float(parts[key])
                 _log_detector_wandb(wb, train_metrics, it)

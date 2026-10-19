@@ -8,7 +8,7 @@ validated against an explicit allowed set so typos cannot silently train at defa
 
 Blocks:
     [data]      the loader and what the regression target bounds
-    [model]     the architecture: `yolox` (capacity tier), plus `pretrained` (COCO transfer)
+    [model]     the architecture: `yolox` (`convnext-t` or `hybrid`), `pretrained`, `p2`
     [training]  schedule, run folder, device; optional `[wandb]` config enables tracking
 
 `frames_per_group` is DELETED and now RAISES as an unknown key. The train loader indexes every
@@ -34,7 +34,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..crop import BOX_SOURCES
-from .yolox import PRETRAINED_TRUNKS, YOLOX_TIERS
+from .yolox import ARCHITECTURES, PRETRAINED_TRUNKS
 
 # THE ALLOWED KEYS, PER BLOCK. Anything else raises -- see module docstring. These are the
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
@@ -42,7 +42,7 @@ from .yolox import PRETRAINED_TRUNKS, YOLOX_TIERS
 DATA_KEYS = frozenset({
     'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
     'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong', 'rotate_deg',
-    'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
+    'reduce', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'alpha', 'balance_datasets', 'boxes_by_dataset',
     'box_target', 'antialias', 'grayscale_prob', 'vflip',
     'input_norm', 'scale_range', 'background_prob', 'invert_prob',
@@ -56,7 +56,21 @@ DELETED_DATA_KEYS = {
     'background_generic': 'the generic COCO image pack never beat synthetic canvases (report 73 '
                           '§9); compositing is synthetic-only, `background_prob` alone',
     'background_weights': 'compositing is synthetic-only (report 73 §9); `background_prob` alone',
+    'keypoints': 'the detector keypoint branch is deleted (dormant: every shipped detector had '
+                 'n_keypoints = 0; detector keypoints are a declared non-goal; v0.3.4 is the last release that has it)',
 }
+DELETED_MODEL_KEYS = {
+    'bottleneck_expansion': 'it shaped only the deleted canonical YOLOX tiers (v0.3.4 is the last release that has it)',
+}
+DELETED_TRAINING_KEYS = {
+    'kpt_weight': 'the detector keypoint branch is deleted (v0.3.4 is the last release that has it)',
+    'kpt_score_weight': 'the detector keypoint branch is deleted (v0.3.4 is the last release that has it)',
+}
+DELETED_KEYS = (('data', DELETED_DATA_KEYS), ('model', DELETED_MODEL_KEYS),
+                ('training', DELETED_TRAINING_KEYS))
+_LEGACY_ARCH = ('a legacy architecture, not shipped; v0.3.4 is the last release that builds and '
+                'loads it')
+DELETED_YOLOX_NAMES = {name: _LEGACY_ARCH for name in ('trimmed', 'nano', 'tiny', 's', 'm', 'l', 'x')}
 DELETED_YOLOX = {
     'dinov2-': 'worse than convnext-t on both transfer pairs and in-domain (report 73 §8)',
     'hybrid-': 'worse than convnext-t on both transfer pairs (report 73 §8)',
@@ -66,11 +80,15 @@ DELETED_YOLOX = {
 
 def deleted_yolox_reason(version: str):
     """Why a deleted `[model].yolox` value was removed, or None for a live one."""
+    if str(version) in DELETED_YOLOX_NAMES:
+        return DELETED_YOLOX_NAMES[str(version)]
     return next((why for pre, why in DELETED_YOLOX.items() if str(version).startswith(pre)), None)
-MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
+
+
+MODEL_KEYS = frozenset({'yolox', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
-    'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
+    'eval_batches', 'iou_aware_obj', 'iou_aware_warmup',
     'max_pos_per_gt', 'box_weight', 'weight_decay', 'nms_iou_thresh',
     'nms_center_dist_thresh', 'assignment', 'box_loss',
     'tal_topk', 'tal_alpha', 'tal_beta',
@@ -78,7 +96,7 @@ TRAINING_KEYS = frozenset({
     'shared_head', 'fpn_upsample', 'save_every',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
-YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid', *PRETRAINED_TRUNKS)
+YOLOX_CHOICES = ARCHITECTURES
 
 
 def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
@@ -146,13 +164,13 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         moves one key at a time; the code-level fallbacks only apply to keys the shipped file
         does not state. Shorthand references `dev/plans/detector_v2.md`.
         `nms_center_dist_thresh` defaults ON (A5, '' restores the old off); `pretrained`
-        accepts 'coco' (required to exist NOW) or 'imagenet' (convnext-t); ABSENT means the
+        accepts '' or 'imagenet' (convnext-t; 'coco' is deleted); ABSENT means the
         architecture's own source (convnext-t -> 'imagenet', every other -> scratch), so an
         overlay that changes `yolox` never inherits a source that cannot load into it, and an
         explicit '' trains from scratch. Deleted keys / `yolox` values (report 73) raise with
         their reason. The recommended shipped recipe is TAL + CIoU.
         The remaining keys (iou_aware_obj, box_weight, weight_decay, annot_frac, alpha,
-        bottleneck_expansion, p2, optimizer, shared_head, fpn_upsample) each only matter
+        p2, optimizer, shared_head, fpn_upsample) each only matter
         once a config states something else. The implicit base is `checkpoints._DETECTOR_CONFIG`
         (one source of truth with the pose side's `_BASE_CONFIG`, both resolved via
         `importlib.resources` rather than a repo-relative path recomputed here, so a pip install
@@ -165,10 +183,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     if missing:
         raise SystemExit(f'{path}: missing block(s) {missing}. A detector config needs '
                          f'[data], [model] and [training].')
-    gone = sorted(set(cfg['data']) & set(DELETED_DATA_KEYS))
-    if gone:
-        raise SystemExit('[data]: deleted key(s) ' + '; '.join(
-            f'{k!r}: {DELETED_DATA_KEYS[k]}' for k in gone) + '. Remove them.')
+    for block, deleted in DELETED_KEYS:
+        gone = sorted(set(cfg[block]) & set(deleted))
+        if gone:
+            raise SystemExit(f'[{block}]: deleted key(s) ' + '; '.join(
+                f'{k!r}: {deleted[k]}' for k in gone) + '. Remove them.')
     why = deleted_yolox_reason(cfg['model'].get('yolox', ''))
     if why:
         raise SystemExit(f"[model].yolox={cfg['model']['yolox']!r} is deleted: {why}. "
@@ -232,9 +251,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                                    'max_input_px': 4 * 416 * 416,
                                    'val_frames_per_group': 8,
                                    'tile_bg_per_frame': 1}[k]))
-    for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight', 'weight_decay'):
-        train[k] = float(train.get(k, {'lr': 1e-3, 'kpt_weight': 1.0, 'kpt_score_weight': 1.0,
-                                       'box_weight': 5.0, 'weight_decay': 5e-4}[k]))
+    for k in ('lr', 'box_weight', 'weight_decay'):
+        train[k] = float(train.get(k, {'lr': 1e-3, 'box_weight': 5.0, 'weight_decay': 5e-4}[k]))
     if train['weight_decay'] < 0:
         raise SystemExit(f"[training].weight_decay must be >= 0, got {train['weight_decay']}.")
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
@@ -245,7 +263,6 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['augment'] = bool(data.get('augment', True))
     data['augment_strong'] = bool(data.get('augment_strong', True))
     data['reduce'] = bool(data.get('reduce', False))
-    data['keypoints'] = bool(data.get('keypoints', False))
     data['hflip'] = bool(data.get('hflip', True))
     data['vflip'] = bool(data.get('vflip', True))
     data['antialias'] = bool(data.get('antialias', True))
@@ -270,10 +287,6 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
             or not 0 < float(sr[0]) <= float(sr[1])):
         raise SystemExit(f'[data].scale_range must be [lo, hi] with 0 < lo <= hi, got {sr!r}.')
     data['scale_range'] = [float(sr[0]), float(sr[1])]
-    if data['background_prob'] and data['keypoints']:
-        raise SystemExit(f"[data].background_prob={data['background_prob']:g} (the shipped default "
-                         'is 0.25) is box-only -- compositing drops keypoint targets. Set '
-                         '[data].background_prob = 0 alongside keypoints = true.')
     af = data.get('annot_frac', None)
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:
@@ -298,32 +311,16 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['boxes_by_dataset'] = {str(k): str(v) for k, v in by.items()}
     model['yolox'] = str(model.get('yolox', 'tiny'))
 
-    model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))
     pre = model.get('pretrained')
     model['pretrained'] = PRETRAINED_TRUNKS.get(model['yolox'], '') if pre is None else str(pre)
-    if model['pretrained'] not in ('', 'coco', 'imagenet'):
-        raise SystemExit(
-            f"[model].pretrained={model['pretrained']!r}: expected '' (from scratch), 'coco' (a "
-            "canonical yolox tier) or 'imagenet' (convnext-t).")
-    if model['yolox'] == 'trimmed' and model['bottleneck_expansion'] != 0.5:
-        raise SystemExit(
-            f"[model].bottleneck_expansion={model['bottleneck_expansion']} was set alongside "
-            "yolox='trimmed', but trimmed's backbone does not take it -- it stays at 0.5 "
-            "permanently. Use a canonical tier (one of the YOLOX_TIERS names) for a "
-            "COCO-compatible backbone.")
     if model['pretrained'] == 'coco':
-        if model['yolox'] == 'trimmed':
-            raise SystemExit("[model].pretrained='coco' requires a canonical yolox tier -- "
-                             "'trimmed' has no COCO counterpart to load.")
-        if model['yolox'] == 'hybrid':
-            raise SystemExit("[model].pretrained='coco' has no counterpart for yolox='hybrid' "
-                             "-- use '' (from scratch).")
-        if model['bottleneck_expansion'] != 1.0:
-            raise SystemExit(
-                "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
-                "every bottleneck conv is half Megvii's width and the load would silently take "
-                "only 19 of 35 backbone tensors.")
-    elif model['yolox'] in PRETRAINED_TRUNKS or model['pretrained'] == 'imagenet':
+        raise SystemExit("[model].pretrained='coco' is deleted: it loaded Megvii's COCO backbone "
+                         "into the canonical YOLOX tiers, which are deleted (v0.3.4 is the last release that has it).")
+    if model['pretrained'] not in ('', 'imagenet'):
+        raise SystemExit(
+            f"[model].pretrained={model['pretrained']!r}: expected '' (from scratch) or "
+            "'imagenet' (convnext-t).")
+    if model['yolox'] in PRETRAINED_TRUNKS or model['pretrained'] == 'imagenet':
         want = PRETRAINED_TRUNKS.get(model['yolox'])
         if model['pretrained'] not in ('', want):
             raise SystemExit(f"[model].yolox={model['yolox']!r} loads {want!r} weights; "

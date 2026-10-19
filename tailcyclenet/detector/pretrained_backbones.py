@@ -71,11 +71,9 @@ class _ImageNetNorm(nn.Module):
 class ConvNeXtBackbone(nn.Module):
     """torchvision ConvNeXt-T trunk; `features[1,3,5,7]` are strides 4/8/16/32."""
 
-    def __init__(self, p2=True, in_channels=3):
+    def __init__(self, p2=True):
         """Build the ConvNeXt-T architecture (no weights)."""
         super().__init__()
-        if in_channels != 3:
-            raise ValueError('convnext-t is a 3-channel ImageNet trunk')
         from torchvision.models import convnext_tiny
         self.norm = _ImageNetNorm()
         self.features = convnext_tiny(weights=None).features

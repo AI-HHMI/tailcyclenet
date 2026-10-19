@@ -149,8 +149,9 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, input_wh, _, min_crop_dim, reduce, box_source, tile_scale, _ = load_detector(
-        args.run, device=device)
+    ld = load_detector(args.run, device=device)
+    model, input_wh, min_crop_dim, reduce, box_source, tile_scale = (
+        ld.model, ld.input_wh, ld.min_crop_dim, ld.reduce, ld.box_source, ld.tile_scale)
     if box_source != args.boxes:
         print(f'WARNING: detector was trained on {box_source!r}, scoring GT {args.boxes!r}')
     if (args.data / 'session.toml').exists():

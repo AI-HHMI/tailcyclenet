@@ -22,13 +22,13 @@ def test_tt_transform_is_applied_only_when_requested(tiny_root):
 
 def test_save_every_defaults_to_eval_every(tmp_path):
     config = tmp_path / 'detector.toml'
-    config.write_text('[data]\npath = "dataset"\n[model]\nyolox = "tiny"\n[training]\nout = "out"\neval_every = 13\n')
+    config.write_text('[data]\npath = "dataset"\n[model]\nyolox = "hybrid"\n[training]\nout = "out"\neval_every = 13\n')
     cfg = load_detector_config(config)
     assert cfg['training']['save_every'] == 13
 
 
 def test_save_every_rejects_nonpositive(tmp_path):
     config = tmp_path / 'detector.toml'
-    config.write_text('[data]\npath = "dataset"\n[model]\nyolox = "tiny"\n[training]\nout = "out"\nsave_every = 0\n')
+    config.write_text('[data]\npath = "dataset"\n[model]\nyolox = "hybrid"\n[training]\nout = "out"\nsave_every = 0\n')
     with pytest.raises(SystemExit, match='save_every'):
         load_detector_config(config)

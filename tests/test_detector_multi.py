@@ -25,8 +25,8 @@ def _train_detector_module():
     return module
 
 
-def _config(tmp_path, root, out, *, keypoints=False):
-    path = tmp_path / f'config-{"kpt" if keypoints else "box"}.toml'
+def _config(tmp_path, root, out, *, extra_data=''):
+    path = tmp_path / 'config-box.toml'
     path.write_text(f'''
 [data]
 path = "{root}"
@@ -39,10 +39,10 @@ min_crop_dim = 16
 val_frames_per_group = 4
 augment = false
 augment_strong = false
-keypoints = {str(keypoints).lower()}
+{extra_data}
 background_prob = 0.0
 [model]
-yolox = "trimmed"
+yolox = "hybrid"
 pretrained = ""
 [training]
 out = "{out}"
@@ -77,7 +77,8 @@ def test_multi_root_training_records_root_scores_and_loads_checkpoint(tiny_root,
     assert 'val_root_ratlike' in ckpt['eval']
     assert not any(key.startswith('val_root_mouselike') for key in ckpt['eval'])
 
-    detector, _, trained_on, *_ = load_detector(out, device='cpu')
+    _ld = load_detector(out, device='cpu')
+    detector, trained_on = _ld.model, _ld.dataset
     assert trained_on == ''
     assert detector.trained_datasets == ['mouselike', 'ratlike']
     assert detector.box_sources == {'mouselike': 'keypoints', 'ratlike': 'instances'}
@@ -113,8 +114,8 @@ def test_multi_root_detector_inference_guard_and_box_source_resolution():
     assert _detector_box_source(detector, 'rat-city', 'keypoints') == 'keypoints'
 
 
-def test_multi_root_training_explicitly_refuses_keypoints(tiny_root, tmp_path, monkeypatch):
-    config = _config(tmp_path, tiny_root, tmp_path / 'run', keypoints=True)
+def test_the_deleted_keypoints_key_raises_by_name(tiny_root, tmp_path, monkeypatch):
+    config = _config(tmp_path, tiny_root, tmp_path / 'run', extra_data='keypoints = false')
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(config)])
-    with pytest.raises(SystemExit, match=r'multi-root detector training is box-only.*keypoints'):
+    with pytest.raises(SystemExit, match=r"deleted key.*'keypoints'.*keypoint branch"):
         _train_detector_module().main()

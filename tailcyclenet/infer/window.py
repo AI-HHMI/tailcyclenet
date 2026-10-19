@@ -778,12 +778,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                               cgroup, dev)
             elif cfg.box_prompt == 'detector':
                 _prompt_boxes = window_det[0] if window_det is not None else boxes_stc
-                if _prompt_boxes is None:
+                if _prompt_boxes is None and box_points is not None:
+                    box_t = (_deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
+                                                cgroup, dev) if a < n_lab else None)
+                elif _prompt_boxes is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
-                box_t = _deploy_box_prompt(mode, None, _prompt_boxes,
-                                          np.arange(len(frames)) if window_det is not None else frames - f0,
-                                          a, use, boxes, scales, cgroup, dev)
+                else:
+                    box_t = _deploy_box_prompt(mode, None, _prompt_boxes,
+                                              np.arange(len(frames)) if window_det is not None else frames - f0,
+                                              a, use, boxes, scales, cgroup, dev)
             if box_t is not None:
                 mkw['box_prompt'] = box_t
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())

@@ -937,6 +937,23 @@ def test_box_prompt_detector_with_no_boxes_raises(scene):
                   _cfg(anchor='none', box_prompt='detector'))
 
 
+def test_box_prompt_detector_from_a_boxes_file_uses_its_points(scene):
+    """`--boxes dets.npz` on a box model resolves the box prompt to 'detector', but that path
+    supplies crop POINTS (`box_points`), not detector boxes: the prompt must come from those
+    points (it used to raise "none were supplied"), exactly as the labels prompt would from
+    the same points."""
+    model, sess, registry, name = scene
+    lab = sess.labels('g000')
+    pts = lab.points3d if sess.mode == '3d' else lab.points2d[..., 0, :]
+    got = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='none', box_prompt='detector'), box_points=pts)
+    want = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='none', box_prompt='labels'))
+    assert (got['box_prompt_cams'] >= 1).any()
+    np.testing.assert_array_equal(got['box_prompt_cams'], want['box_prompt_cams'])
+    np.testing.assert_array_equal(got['pred'], want['pred'])
+
+
 def test_carried_prior_is_bounds_masked_and_dated():
     """The two defects in the deployed prompt, both of which were silent.
 

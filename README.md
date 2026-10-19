@@ -309,9 +309,9 @@ and the report ranks rather than thresholds.
 ## 7. Share a model
 
 ```bash
-pixi run python scripts/package_checkpoint.py --kind pose     --run runs/my-pose     --out my-pose.pth
-pixi run python scripts/package_checkpoint.py --kind detector --run runs/my-detector --out my-detector.pth
-pixi run python scripts/package_checkpoint.py --kind scorer   --run runs/my-scorer   --out my-scorer.pth
+tailcyclenet package --kind pose     --run runs/my-pose     --out my-pose.pth
+tailcyclenet package --kind detector --run runs/my-detector --out my-detector.pth
+tailcyclenet package --kind scorer   --run runs/my-scorer   --out my-scorer.pth
 ```
 
 A packaged `.pth` contains its config and keypoint registry, without the optimizer state, and
@@ -322,19 +322,20 @@ can be passed directly to `--pose` / `--detector` / `--scorer`.
 ## Repository layout
 
 ```
-tailcyclenet/         the library
-  format.py           read/validate/write the data format
-  dataset.py          training data loader (2D, 3D single-view, 3D multiview)
-  model.py            the pose model on top of the tracktail tracker
-  train.py            pose training (tailcyclenet train)
-  detector/           box detector and cross-view association
-  scorer/             track-quality scorer: model, training, QC scoring
-  infer/              the inference window loop and prediction writer
-  adopt.py            raw videos + anipose calibration -> an in-memory session
-  eval.py, metrics.py evaluation
-  render.py           visualisation
-configs/              base.toml (pose), detector.toml, scorer.toml, configs/datasets/ (skeletons)
-scripts/              command-line entry points, dataset converters, utilities
+tailcyclenet/         the library (one level of packages)
+  format/             read/validate/write the data format; format/prediction.py reads prediction sessions
+  data/               video decode, reader cache, pixels, camera geometry, THE crop rule
+  loader/             the pose training Dataset (2D, 3D single-view, 3D multiview)
+  pose/               the pose network on top of the tracktail tracker, its losses and its training
+  detector/           the box detector: model, data, training, checkpoint loading
+  scorer/             the track-quality scorer: model, data, training
+  infer/              THE deployment program: window loop, detection, association/tracking, the
+                      identity bridge, the session writer, scorer QC, --videos adoption
+  evaluation/         eval, metrics, detector deployment score, identity diagnostic
+  render/             visualisation
+  config.py runtime.py checkpoints.py distributed.py memory.py packaging.py tracktail_compat.py
+configs/              base.toml (pose), detector.toml, scorer.toml, configs/datasets/ (converter skeletons)
+scripts/              command-line shims, dataset converters, utilities
 docs/                 annotation_format.md -- the data format specification
 tests/
 ```
@@ -342,7 +343,8 @@ tests/
 ## Development
 
 ```bash
-pixi run test    # pytest
+pixi run test      # pytest, fast tier (~20 s)
+pixi run test-all  # including the slow tier
 pixi run lint    # ruff
 ```
 

@@ -220,9 +220,13 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
 @torch.no_grad()
 def score_fixed_views(model, ds, indices, device, score_thresh=0.05, batch_size=16,
                       max_animals=None, iou_thresh=0.5, center_dist_thresh=0.5):
-    """Return detailed decoded metrics for selected dataset item indices."""
+    """Return detailed decoded metrics for selected dataset item indices.
+
+    Scores unaugmented, as `score_dataset` does, and restores the model mode and `ds.augment`.
+    """
     was_training = model.training
     model.eval()
+    aug_was = ds.augment
     ds.augment = False
     indices = sorted(int(i) for i in indices)
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, sampler=indices,
@@ -250,6 +254,7 @@ def score_fixed_views(model, ds, indices, device, score_thresh=0.05, batch_size=
                          'miss': int(mota_row['misses']), 'fp': int(fp),
                          'fp_dup': int(mota_row['fp_dup']), 'fp_none': int(mota_row['fp_none']),
                          'scores': scores.detach().cpu().tolist()})
+    ds.augment = aug_was
     if was_training:
         model.train()
     return rows

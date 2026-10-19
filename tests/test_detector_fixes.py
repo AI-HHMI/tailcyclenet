@@ -112,3 +112,16 @@ def test_load_detector_refuses_a_convnext_override_not_divisible_by_32(tmp_path)
     assert load_detector(path)[1] == (128, 96)
     with pytest.raises(ValueError, match='divisible by 32'):
         load_detector(path, input_wh=(120, 96))
+
+
+def test_score_fixed_views_restores_augment(tmp_path):
+    """detector B13: `score_fixed_views` set `ds.augment = False` and never restored it, so a
+    train dataset scored mid-run silently stopped augmenting."""
+    from .conftest import _session_2d
+    from tailcyclenet.detector import BoxDataset, YOLOXNano
+    from tailcyclenet.detector.evaluate import score_fixed_views
+    _session_2d(tmp_path / 'r' / 'train' / 's0', T=4, S=2)
+    ds = BoxDataset(tmp_path / 'r', 'train', input_wh=(64, 64), augment=True)
+    rows = score_fixed_views(YOLOXNano(version='trimmed', pretrained=''), ds, [0, 1], 'cpu')
+    assert len(rows) == 2
+    assert ds.augment is True

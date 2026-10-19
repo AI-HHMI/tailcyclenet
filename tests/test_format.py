@@ -564,7 +564,8 @@ def test_table_writer_chunks_match_one_shot(tmp_path):
     dictionaries intact; an empty chunk writes no row group."""
     import pyarrow.parquet as pq
 
-    from tailcyclenet.format import DICT_COLS, TableWriter, _codes, write_table
+    from tailcyclenet.format import DICT_COLS, TableWriter, write_table
+    from tailcyclenet.format.tables import column_codes
 
     n = 500
     rng = np.random.default_rng(0)
@@ -583,7 +584,7 @@ def test_table_writer_chunks_match_one_shot(tmp_path):
     assert a.to_pydict() == b.to_pydict(), 'chunked rows must equal one-shot rows'
     assert pq.ParquetFile(tmp_path / 'many.pq').num_row_groups > 1, 'the chunks must be row groups'
     for col in ('group_id', 'animal_id', 'status'):
-        codes, vals = _codes(b, col)
+        codes, vals = column_codes(b, col)
         assert len(codes) == n and vals
 
     with TableWriter(tmp_path / 't.pq', DICT_COLS) as w:
@@ -617,7 +618,7 @@ def _video_session(tmp_path, T=6, cams=('cam0', 'cam1'), where='vids'):
 def test_a_video_group_decodes_with_no_session_directory(tmp_path):
     """The `--videos` invariant: `group.source` (pre-filled by `video_group`) is the only filesystem
     entry, so a session with no directory decodes the right (camera, frame) by VALUE."""
-    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.data.pixels import read_frames
 
     from .conftest import _video_colour
 

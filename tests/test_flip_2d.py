@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from tailcyclenet import format as fmt
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, _flip_2d
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
+from tailcyclenet.data.camera import flip_2d
 from tailcyclenet.scorer.triplet import _make_anchor
 
 
@@ -56,7 +58,7 @@ def _camera(size=(64, 48), offset=(0.0, 0.0), dist=None):
 def test_flip_affine_matches_pixels_and_projection(mode):
     import cv2
     from tracktail.model.cube import project_points_torch
-    from tailcyclenet.dataset import crop_affine
+    from tailcyclenet.data.pixels import crop_affine
 
     W, H = 64, 48
     cam = _camera(offset=(4.0, 3.0),
@@ -64,7 +66,7 @@ def test_flip_affine_matches_pixels_and_projection(mode):
     points = torch.tensor([[[0.4, 0.2, 4.0]]])
     source = project_points_torch([cam], points)[0]
     perm = torch.arange(1)
-    flipped_cam, flipped, rotation = _flip_2d(cam, source, mode, None, perm)
+    flipped_cam, flipped, rotation = flip_2d(cam, source, mode, None, perm)
     expected = source.clone()
     if mode == 'horizontal':
         expected[..., 0] = W - 1 - expected[..., 0]

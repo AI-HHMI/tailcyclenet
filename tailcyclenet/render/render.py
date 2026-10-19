@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..dataset import read_frames
+from ..data.pixels import read_frames
 from .h264 import H264Writer
 
 # BGR. Twelve, which is exactly rat-city's rat count -- no two animals share a colour there.
@@ -276,7 +276,7 @@ def session_for_prediction(pred, data=None, split=None):
 
     import pyarrow.parquet as pq
 
-    from .. import adopt
+    from ..infer import adopt
     from ..format import sessions_for
 
     pred = Path(pred)
@@ -409,7 +409,7 @@ def main(argv=None):
     """
     import tomllib
 
-    from ..infer.predictions import load_predictions
+    from ..format.prediction import load_predictions
 
     ap = build_parser()
     args = ap.parse_args(argv)

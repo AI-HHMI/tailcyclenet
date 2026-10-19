@@ -12,7 +12,7 @@ The bespoke `trimmed` net and the canonical YOLOX tiers (`nano`..`x`, with their
 deleted; v0.3.4 is the last release that builds or loads them (`config.DELETED_YOLOX`).
 
 GroupNorm throughout, not BatchNorm -- see `conv_norm_act`. The detector reproduces the SAME crop
-box the pose pipeline uses (`tailcyclenet.crop.crop_box_for_points`): either by regressing it
+box the pose pipeline uses (`tailcyclenet.data.crop.crop_box_for_points`): either by regressing it
 directly (`box_target = 'crop'`, legacy) or by regressing the tight extent the rule is a function
 of and applying the rule after detection (`'extent'`, shipped -- see `detector/dataset.py`).
 """

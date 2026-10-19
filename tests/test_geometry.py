@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from tailcyclenet import format as fmt
-from tailcyclenet.geometry import undistort_points
+from tailcyclenet.tracktail_compat import undistort_points
 
 
 def _rig(offset=(0.0, 0.0), distortion=None):
@@ -45,7 +45,7 @@ def test_skew_projection_inverse_and_rays_round_trip():
 
 def test_skew_projection_sensitivity_matches_autograd():
     from tracktail.model.cube import project_cam
-    from tailcyclenet.geometry import projection_sensitivity
+    from tailcyclenet.tracktail_compat import projection_sensitivity
 
     rig = _rig(offset=(7.0, -4.0), distortion=[0.01, -0.001, 0.0002, -0.0001, 0.0003])
     cam = rig.tracktail()[0]
@@ -66,7 +66,7 @@ def test_image_rotation_keeps_projection_in_warp_frame():
     """An image-plane rotation moves projections by exactly its 2x3, under skew and under an
     anisotropic focal with tangential distortion."""
     from tracktail.model.cube import project_cam
-    from tailcyclenet.dataset import rotate_camera_image_plane_3d
+    from tailcyclenet.tracktail_compat import rotate_camera_image_plane_3d
 
     rig = _rig(offset=(7.0, -4.0))
     cam = rig.tracktail()[0]
@@ -91,8 +91,10 @@ def test_image_rotation_keeps_projection_in_warp_frame():
 
 def test_skew_rotate_crop_resize_matches_pixel_affine():
     from tracktail.model.cube import project_cam
-    from tailcyclenet.crop import apply_crop
-    from tailcyclenet.dataset import crop_affine, resize_camera, rotate_camera_image_plane_3d
+    from tailcyclenet.data.crop import apply_crop
+    from tailcyclenet.data.pixels import crop_affine
+    from tailcyclenet.data.camera import resize_camera
+    from tailcyclenet.tracktail_compat import rotate_camera_image_plane_3d
 
     rig = _rig(offset=(7.0, -4.0))
     cam = rig.tracktail()[0]

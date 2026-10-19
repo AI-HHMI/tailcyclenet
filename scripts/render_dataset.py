@@ -18,7 +18,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt
-from tailcyclenet.dataset import read_frames
+from tailcyclenet.data.pixels import read_frames
 from tailcyclenet.render.h264 import H264Writer
 
 # BGR (cv2's order). Instance-status colours, fixed per-keypoint palette.

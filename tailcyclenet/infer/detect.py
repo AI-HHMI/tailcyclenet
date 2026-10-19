@@ -47,9 +47,9 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     import torch
     from concurrent.futures import ThreadPoolExecutor
     from .. import memory as _memory
-    from ..dataset import read_frames
+    from ..data.pixels import read_frames
     from ..detector.letterbox import letterbox, reduce_factor, unletterbox_boxes
-    from ..crop import crop_boxes_from_extents
+    from ..data.crop import crop_boxes_from_extents
 
     extent = getattr(det, 'box_target', 'crop') == 'extent'
     antialias = bool(getattr(det, 'antialias', False))

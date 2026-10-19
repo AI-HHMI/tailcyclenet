@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from tailcyclenet.format import load_datasets, sessions_for
-from tailcyclenet.video import open_reader
+from tailcyclenet.data.video import open_reader
 
 LABELS = ('visible', 'partially_visible', 'not_visible', 'unscorable')
 REASONS = ('localization', 'score', 'nms', 'top_k', 'kept')

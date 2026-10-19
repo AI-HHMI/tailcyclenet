@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import torch
 
-from .. import crop as cropmod
-from ..dataset import prior_out_of_bounds
+from ..data import crop as cropmod
+from ..data.camera import prior_out_of_bounds
 from .crops import prior_to_model_frame
 from .oracle import corrupt_prior
 

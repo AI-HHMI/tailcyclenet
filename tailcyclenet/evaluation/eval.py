@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from tailcyclenet.format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, sessions_for
-from tailcyclenet.infer.predictions import load_predictions
+from tailcyclenet.format.prediction import load_predictions
 from tailcyclenet.evaluation.metrics import (ERR_PCTS, per_frame_means, error_and_coverage, idf1,
                                   idf1_from_state, idf1_merge, idsw_stability_band, label_extent,
                                   match_instances, matched_error, mota, motion_ratio,

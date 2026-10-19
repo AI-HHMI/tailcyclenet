@@ -39,7 +39,7 @@ import numpy as np
 import polars as pl
 import toml
 
-from .predictions import load_predictions
+from ..format.prediction import load_predictions
 
 # The events that mark a hard interaction. Both are written by the duplicate backstop: the loser
 # is `retired_duplicate`, the winner is `shielded`. A `born`/`birth_refused` row is churn, not an

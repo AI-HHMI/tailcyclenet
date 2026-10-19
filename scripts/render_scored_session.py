@@ -33,7 +33,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt
-from tailcyclenet.dataset import read_frames
+from tailcyclenet.data.pixels import read_frames
 from tailcyclenet.infer.window import last_window_start
 from tailcyclenet.render.h264 import H264Writer
 

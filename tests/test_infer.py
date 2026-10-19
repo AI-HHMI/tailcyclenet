@@ -266,7 +266,7 @@ def test_the_window_union_covers_the_window_and_stays_in_the_image(mv):
 
 def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(rat):
     """One decode per (camera, frame): cropping the decoded frame equals cropping at decode, bit for bit."""
-    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.data.pixels import read_frames
     from tailcyclenet.infer.crops import crop_views
 
     _, sess, _, _ = rat
@@ -412,7 +412,7 @@ def test_carry_needs_overlap_but_self_does_not(rat):
 def test_inflate_box_widens_about_its_centre():
     """THE ONE INFLATION RULE, shared with the wide-crop training regime
     (`dataset.LoaderConfig.crop_inflate`) so the model trains and deploys on the same geometry."""
-    from tailcyclenet.crop import inflate_box as _inflate_box
+    from tailcyclenet.data.crop import inflate_box as _inflate_box
     box = torch.tensor([100, 100, 140, 160], dtype=torch.int32)     # 40x60, centre (120,130)
     size = torch.tensor([1000, 1000])
     out = _inflate_box(box, size, 1.5)
@@ -526,7 +526,7 @@ def test_box_prompt_column_order_matches_use():
                              [cgroup[1], cgroup[0]], 'cpu')
     assert got.shape == (1, T, 2, 4)
 
-    from tailcyclenet import crop as cropmod
+    from tailcyclenet.data import crop as cropmod
 
     def expected(src_ci, origin, scale, size):
         db = torch.as_tensor(boxes_stc[0, 0, src_ci], dtype=torch.float32)
@@ -899,7 +899,7 @@ def test_3d_carry_feeds_back_the_anchor_free_estimate(mv16):
 def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
     """`box_source='instances'` boxes go through the loader's crop rule (pad 0); detector boxes keep
     the raw union (re-squaring is measured worse)."""
-    from tailcyclenet import crop as cropmod
+    from tailcyclenet.data import crop as cropmod
 
     model, sess, registry, name = rat
     w, h = sess.rig.size(sess.cam_names[0])
@@ -1068,7 +1068,7 @@ def test_prediction_3d_missing_status_retains_best_guess_coordinates(mv, tmp_pat
 
     _, sess, registry, _ = mv
     from tailcyclenet.infer.session_writer import SessionWriter
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     gid = next(iter(sess.groups))
     K, C, T = sess.n_keypoints, len(sess.rig), 2
@@ -1231,7 +1231,7 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     import tomllib
 
     from tailcyclenet.format import Session, validate_session
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     sdir, run = _cli_setup(tmp_path)
     out = tmp_path / 'pred'
@@ -1272,7 +1272,7 @@ def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
     import shutil
 
     import conftest as cf
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     root = tmp_path / 'rat'
     cf._session_2d(root / 'test' / 's')
@@ -1519,7 +1519,7 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(rat16):
 def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
     """`frame` is always the SOURCE index and groups.pq keeps the full length; `load_predictions`
     densifies NaN outside the range (rebasing to 0 was the `chunk_frames` bug)."""
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     sdir, run = _cli_setup(tmp_path, T=16)
 
@@ -1787,7 +1787,7 @@ def test_2d_videos_without_calibration_defaults_to_px_and_nominal_cam(cli, monke
     got = Session.load(out)
     assert got.mode == '2d' and got.units == 'px'
     assert got.cam_names == ['cam0'] and got.rig.size('cam0') == wh
-    from tailcyclenet import adopt
+    from tailcyclenet.infer import adopt
     back = adopt.session_from_prediction(out)
     assert back.cam_names == ['cam0'] and back.rig.size('cam0') == wh
     with open(out / 'session.toml', 'rb') as f:
@@ -1824,7 +1824,7 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
 
     import conftest as cf
     from tailcyclenet.format import Session, validate_session
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     rig, vids, sdir = _videos_fixture(tmp_path)
     run, registry = _videos_run(tmp_path, cf.KPTS_3D)
@@ -1859,7 +1859,7 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
 
     assert not validate_session(Session.load(tmp_path / 'dumped'))
 
-    from tailcyclenet import adopt
+    from tailcyclenet.infer import adopt
     back = adopt.session_from_prediction(out)
     assert back.groups['t'].source('0')[1] == vids['0'].resolve()
 
@@ -1883,7 +1883,7 @@ def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, caps
 def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
     """A gated 2D row must stay gated in the saved points2d.pq (it used to be resurrected there,
     since `load_predictions` reads it back as the primary prediction)."""
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     sdir, run = _cli_setup(tmp_path)
     out = tmp_path / 'hi'

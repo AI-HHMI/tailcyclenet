@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from ..dataset import read_frames
+from ..data.pixels import read_frames
 
 
 class FrameStore:

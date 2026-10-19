@@ -12,7 +12,7 @@ import pytest
 import torch
 from pathlib import Path
 
-from tailcyclenet.crop import crop_box_for_points
+from tailcyclenet.data.crop import crop_box_for_points
 from tailcyclenet.detector.dataset import BoxDataset
 from tailcyclenet.detector.sampling import ChunkShuffle, CohortSampler, box_collate, split_batch
 from tailcyclenet.detector.yolox import YOLOXNano
@@ -732,13 +732,13 @@ def test_unletterbox_clamps_a_runaway_box_into_the_frame():
 
 
 def test_a_video_read_locks_per_container_not_globally():
-    """`dataset._read_video` locks PER PATH: one global lock would kill `detect_group`'s multi-
+    """`pixels._read_video` locks PER PATH: one global lock would kill `detect_group`'s multi-
     camera decode overlap (3.5x on 3dpop)."""
-    from tailcyclenet import dataset as ds
+    from tailcyclenet.data import reader_cache as ds
 
-    a, b = ds._read_lock_for('/x/cam0.mp4'), ds._read_lock_for('/x/cam1.mp4')
+    a, b = ds.read_lock_for('/x/cam0.mp4'), ds.read_lock_for('/x/cam1.mp4')
     assert a is not b
-    assert ds._read_lock_for('/x/cam0.mp4') is a
+    assert ds.read_lock_for('/x/cam0.mp4') is a
     with a:                       # holding one container's lock must not block another's
         assert b.acquire(blocking=False)
         b.release()

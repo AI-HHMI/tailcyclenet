@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..dataset import LoaderConfig
+from ..loader.config import LoaderConfig
 from .window import InferConfig
 
 

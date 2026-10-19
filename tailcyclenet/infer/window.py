@@ -17,9 +17,9 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from .. import crop as cropmod
+from ..data import crop as cropmod
 from .. import memory
-from ..dataset import resize_camera
+from ..data.camera import resize_camera
 from ..model import self_prompt
 from ..format import Labels, Session
 from ..model import share_scene

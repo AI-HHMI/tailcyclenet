@@ -8,8 +8,8 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-from .. import crop as cropmod
-from ..dataset import crop_affine
+from ..data import crop as cropmod
+from ..data.pixels import crop_affine
 
 
 def boxes_from_points(points, cgroup, min_crop_dim, mode):

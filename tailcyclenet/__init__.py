@@ -14,6 +14,6 @@ except PackageNotFoundError:
 
 # Install before any tracktail submodule imports its geometry helpers. The pinned release's
 # projection is full-K, but its inverse normalization is scalar-focal for nonzero skew.
-from .geometry import install_full_intrinsics as _install_full_intrinsics
+from .tracktail_compat import install_full_intrinsics as _install_full_intrinsics
 
 _install_full_intrinsics()

@@ -153,7 +153,7 @@ def test_detection_is_batch_aligned_and_slice_independent(det_scene):
     # window loop is already holding. It is handed SOURCE frame numbers, not slice-local ones --
     # the two differ for every slice but the first, and getting it wrong would detect the right
     # count of the wrong frames.
-    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.data.pixels import read_frames
 
     seen = []
 
@@ -208,22 +208,22 @@ def test_budget_is_resolved_once_per_process():
 
 
 def test_reader_cache_is_pure_given_ram_and_shrinks_under_a_cap():
-    """`_reader_cache_size` keeps its `ram_gb` parameter so the sizing is testable on any host
+    """`reader_cache_size` keeps its `ram_gb` parameter so the sizing is testable on any host
     (it must never open a container to measure anything).
     """
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
     # johnson's rig: 16 cameras of 3208x2200. The price is LINEAR in the count on PyAV; the
     # quadratic law this test used to assert came from the old decoder, measured without a trim on an
     # unconstrained host (i.e. it measured allocator arena).
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1024) == 16     # room -> the whole rig
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1) == 1         # never zero
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=1024) == 16     # room -> the whole rig
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=1) == 1         # never zero
     # A loader worker still wants 4, not the rig, and the worker count still divides.
-    assert _reader_cache_size(16, (3208, 2200), 4, ram_gb=1024) == 4
+    assert reader_cache_size(16, (3208, 2200), 4, ram_gb=1024) == 4
     # Monotone in the budget, and LINEAR: a 4x smaller budget gives ~4x fewer readers. Asserted
     # below the rig at both ends, or the `want` cap hides the shape.
-    big = _reader_cache_size(64, (3208, 2200), None, ram_gb=64)
-    small = _reader_cache_size(64, (3208, 2200), None, ram_gb=16)
+    big = reader_cache_size(64, (3208, 2200), None, ram_gb=64)
+    small = reader_cache_size(64, (3208, 2200), None, ram_gb=16)
     assert big > small >= 1
     assert small == pytest.approx(big / 4, rel=0.25)
 
@@ -233,12 +233,12 @@ def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees(
     pattern LRU cannot serve: at capacity < C it evicts exactly the entry needed next and takes
     ZERO hits. Asserted against the real pattern, not against the implementation.
     """
-    from tailcyclenet.dataset import _ReaderCache
+    from tailcyclenet.data.reader_cache import ReaderCache
 
-    cache = _ReaderCache(11)
+    cache = ReaderCache(11)
     cache_open = []
 
-    import tailcyclenet.video as vmod
+    import tailcyclenet.data.video as vmod
     real = vmod.open_reader
     vmod.open_reader = lambda p: cache_open.append(p) or object()
     try:
@@ -325,7 +325,8 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
     process-wide -- so with the budget resolved BELOW the input branch the override was not in
     effect during the probe, and any consumer that asked would have got the HOST figure.
     """
-    from tailcyclenet import adopt, memory
+    from tailcyclenet import memory
+    from tailcyclenet.infer import adopt
     from tailcyclenet.infer import driver, loading
 
     memory.reset()
@@ -375,7 +376,8 @@ def test_the_probe_is_inside_the_budget_partition():
     comes out of `FRACTION_READERS` rather than sitting outside a partition that sums to 1.00.
     It does NOT change the number on any rig anyone has run -- an open reader retains ~0.03 GB.
     """
-    from tailcyclenet import adopt, memory
+    from tailcyclenet import memory
+    from tailcyclenet.infer import adopt
 
     big = memory.host_budget(override_gb=1024)
     assert adopt.probe_workers(16, big) == adopt.PROBE_WORKERS_MAX

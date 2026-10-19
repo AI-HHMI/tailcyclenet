@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.scorer.triplet import (build_corruptors_for, displacement_masks, make_triplet,
                                          observed_frame_counts, transfer_points_2d,
                                          view_affine_2d, _draw_shift)

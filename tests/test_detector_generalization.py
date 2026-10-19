@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tailcyclenet.detector import train as train_detector
-from tailcyclenet.crop import crop_box_for_points, crop_boxes_from_extents
+from tailcyclenet.data.crop import crop_box_for_points, crop_boxes_from_extents
 from tailcyclenet.detector.dataset import BoxDataset
 from tailcyclenet.detector.letterbox import letterbox, unletterbox_boxes
 from tailcyclenet.detector.dataset import MIN_EXTENT_PX

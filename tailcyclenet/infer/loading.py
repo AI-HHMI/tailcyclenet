@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..checkpoints import load_run, peek_registry
-from ..dataset import LoaderConfig
+from ..loader.config import LoaderConfig
 from .predictions import refuse_multi_session
 
 
@@ -69,7 +69,7 @@ def load_source(args):
     assoc_res_max_px = (args.assoc_res_max_px if args.assoc_res_max_px is not None else 30.0)
 
     if args.videos:
-        from .. import adopt
+        from . import adopt
         adopt.check_flags(args)
         reg = peek_registry(args.run)
         vplan = adopt.plan(args.videos, args.calibration, args.cam_regex,

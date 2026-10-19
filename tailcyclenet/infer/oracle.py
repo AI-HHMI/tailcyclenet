@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from ..dataset import prior_out_of_bounds
+from ..data.camera import prior_out_of_bounds
 from .crops import prior_to_model_frame
 
 

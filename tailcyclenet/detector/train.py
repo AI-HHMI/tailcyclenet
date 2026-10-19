@@ -19,7 +19,7 @@ import toml
 
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.config import DETECTOR_CONFIG
-from tailcyclenet.dataset import worker_init
+from tailcyclenet.loader.sampling import worker_init
 from tailcyclenet.detector.checkpoint import tiled_input_wh
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.dataset import BoxDataset

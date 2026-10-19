@@ -11,7 +11,8 @@ import torch
 
 from tailcyclenet import checkpoints as ck
 from tailcyclenet import config as cfgmod
-from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.scorer.dataset import ScorerDataset
 
 REPO = Path(__file__).resolve().parent.parent

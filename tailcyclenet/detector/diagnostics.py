@@ -31,7 +31,7 @@ def gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
     `cap` bounds the frames sampled per group (evenly spaced), so a 20,000-frame clip costs the
     same as a 500-frame one -- this is a population read, not a census.
     """
-    from ..crop import crop_box_for_points
+    from ..data.crop import crop_box_for_points
     from tracktail.model.cube import project_points_torch
     frames = labelled_frames(sess, gid)
     if max_frames:

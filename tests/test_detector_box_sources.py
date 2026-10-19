@@ -1,11 +1,6 @@
-"""The detector's box-source and eligibility rules, on purpose-built sessions.
+"""The detector's box-source and eligibility rules, on purpose-built pixel-free sessions.
 
-These do NOT use `tests/conftest.py`'s shared fixture: that one is load-bearing for the POSE
-loader's per-view fallback (`tests/test_dataset.py::test_box_source_falls_back_per_view`), and a
-detector rule change must not be smuggled in by editing it.
-
-No pixels are written. Neither `BoxDataset.__init__` (which reads tables and builds an index) nor
-`boxes_for` decodes an image, so a root with no `groups/` is enough to pin both rules.
+Not conftest's shared fixture: that one pins the POSE loader's per-view fallback.
 """
 from __future__ import annotations
 
@@ -61,8 +56,10 @@ def _index(root, **kw):
 
 
 def test_absent_table_falls_back_to_keypoints(tmp_path):
-    """No `instances.pq` at all: the keypoint rule indexes the labelled frames, as it always did."""
+    """No `instances.pq`: the keypoint rule indexes the labelled frames, and a `missing`-only
+    frame (a visibility judgement with no coordinates) cannot anchor a box."""
     vis, points, inst, boxes = _tables(4, kp_frames=(0, 2), box_frames=None)
+    vis[0, 1, :, 0] = fmt.MISSING              # assessed, placed nowhere
     root = _root(tmp_path, vis=vis, points=points, instance=inst, boxes=boxes)
     ds, idx = _index(root, box_source='instances')
     assert {f for _, f in idx} == {0, 2}
@@ -70,23 +67,16 @@ def test_absent_table_falls_back_to_keypoints(tmp_path):
 
 
 def test_frame_with_no_stored_box_is_not_an_item(tmp_path):
-    """A table that exists and says nothing about a frame must not fall back to its keypoints."""
-    vis, points, inst, boxes = _tables(4, kp_frames=(0, 1, 2, 3), box_frames=(1,))
+    """A table that exists indexes exactly the frames it describes: it never falls back to their
+    keypoints, and a labeled box needs no keypoints."""
+    vis, points, inst, boxes = _tables(4, kp_frames=(0, 1, 2), box_frames=(1, 3))
     root = _root(tmp_path, vis=vis, points=points, instance=inst, boxes=boxes)
     ds, idx = _index(root, box_source='instances')
-    assert {f for _, f in idx} == {1}, 'only the frame the table describes is trainable'
-    # the same root under the keypoint source still indexes every labelled frame
+    assert {f for _, f in idx} == {1, 3}
+    assert all(torch.isfinite(ds.boxes_for(i)[0]).all() for i in range(len(ds)))
+    # the same root under the keypoint source indexes every labelled frame
     _, base = _index(root, box_source='keypoints')
-    assert {f for _, f in base} == {0, 1, 2, 3}
-
-
-def test_missing_only_keypoints_is_not_a_target(tmp_path):
-    """A `missing` row is a visibility judgement with no coordinates: it cannot anchor a box."""
-    vis, points, inst, boxes = _tables(2, kp_frames=(0,), box_frames=None)
-    vis[0, 1, :, 0] = fmt.MISSING              # assessed, placed nowhere
-    root = _root(tmp_path, vis=vis, points=points, instance=inst, boxes=boxes)
-    _, idx = _index(root, box_source='keypoints')
-    assert {f for _, f in idx} == {0}
+    assert {f for _, f in base} == {0, 1, 2}
 
 
 def test_an_animal_the_table_omits_gets_no_box(tmp_path):
@@ -106,6 +96,7 @@ def test_an_animal_the_table_omits_gets_no_box(tmp_path):
 
 
 def test_multi_root_box_source_override_is_resolved_per_session(tmp_path):
+    """`boxes_by_dataset` overrides the shared source for its root only."""
     vis, points, inst, boxes = _tables(1, kp_frames=(0,), box_frames=(0,))
     root_dir = tmp_path / 'multi'
     _root(root_dir, vis=vis, points=points, instance=inst, boxes=boxes, name='alpha')
@@ -120,11 +111,3 @@ def test_multi_root_box_source_override_is_resolved_per_session(tmp_path):
     torch.testing.assert_close(by_root['zeta'], torch.tensor([10.0, 18.0, 30.0, 38.0]))
     assert not torch.allclose(by_root['alpha'], by_root['zeta'])
 
-
-def test_instance_box_without_keypoints_is_indexed(tmp_path):
-    """A labeled instance box is an eligible frame even when no keypoints were recorded."""
-    vis, points, inst, boxes = _tables(1, kp_frames=(), box_frames=(0,))
-    root = _root(tmp_path, vis=vis, points=points, instance=inst, boxes=boxes)
-    ds, idx = _index(root, box_source='instances')
-    assert idx == {('g000', 0)}
-    assert torch.isfinite(ds.boxes_for(0)[0]).all()

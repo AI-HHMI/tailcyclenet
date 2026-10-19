@@ -230,7 +230,7 @@ def test_a_non_session_pred_is_refused_by_name(tmp_path, pred, match):
 
 def test_eval_still_scores_an_npz(tmp_path):
     """Render dropped npz; scoring (`load_predictions`) did not."""
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     npz = tmp_path / 'p.npz'
     np.savez(npz, __keys__=np.array(['s/g000'], dtype=object),
@@ -288,7 +288,7 @@ def _as_marked_prediction(path):
 
 
 def test_load_predictions_groups_filter_matches_the_unfiltered_read(tmp_path):
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     _two_group_session(tmp_path / 'sess')
     _as_marked_prediction(tmp_path / 'sess')
@@ -306,7 +306,7 @@ def test_deleted_prediction_readers_are_refused_by_name(tmp_path):
     """Pre-marker and --independent-windows sessions lost their readers; reading names why."""
     import toml
 
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     path = tmp_path / 'sess'
     _two_group_session(path)
@@ -322,7 +322,7 @@ def test_deleted_prediction_readers_are_refused_by_name(tmp_path):
 
 def test_load_predictions_refuses_ambiguous_marker_free_session(tmp_path):
     import toml
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     path = tmp_path / 'sess'
     _two_group_session(path)
@@ -361,7 +361,7 @@ def test_skeleton_override_validates_pairs_and_keypoint_names(tmp_path):
 def test_render_skeleton_override_replaces_resolved_session(monkeypatch, tmp_path):
     import types
     import tailcyclenet.render as render
-    import tailcyclenet.infer.predictions as predictions
+    import tailcyclenet.format.prediction as predictions
 
     pred = tmp_path / 'pred'
     pred.mkdir()

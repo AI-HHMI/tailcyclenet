@@ -1067,7 +1067,8 @@ def test_prediction_3d_missing_status_retains_best_guess_coordinates(mv, tmp_pat
     import pyarrow.parquet as pq
 
     _, sess, registry, _ = mv
-    from tailcyclenet.infer.predictions import SessionWriter, load_predictions
+    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.format.prediction import load_predictions
 
     gid = next(iter(sess.groups))
     K, C, T = sess.n_keypoints, len(sess.rig), 2
@@ -1230,7 +1231,7 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     import tomllib
 
     from tailcyclenet.format import Session, validate_session
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     sdir, run = _cli_setup(tmp_path)
     out = tmp_path / 'pred'
@@ -1271,7 +1272,7 @@ def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
     import shutil
 
     import conftest as cf
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     root = tmp_path / 'rat'
     cf._session_2d(root / 'test' / 's')
@@ -1518,7 +1519,7 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(rat16):
 def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
     """`frame` is always the SOURCE index and groups.pq keeps the full length; `load_predictions`
     densifies NaN outside the range (rebasing to 0 was the `chunk_frames` bug)."""
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     sdir, run = _cli_setup(tmp_path, T=16)
 
@@ -1823,7 +1824,7 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
 
     import conftest as cf
     from tailcyclenet.format import Session, validate_session
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     rig, vids, sdir = _videos_fixture(tmp_path)
     run, registry = _videos_run(tmp_path, cf.KPTS_3D)
@@ -1882,7 +1883,7 @@ def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, caps
 def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
     """A gated 2D row must stay gated in the saved points2d.pq (it used to be resurrected there,
     since `load_predictions` reads it back as the primary prediction)."""
-    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.format.prediction import load_predictions
 
     sdir, run = _cli_setup(tmp_path)
     out = tmp_path / 'hi'

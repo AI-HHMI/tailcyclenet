@@ -409,7 +409,7 @@ def main(argv=None):
     """
     import tomllib
 
-    from .infer.predictions import load_predictions
+    from .format.prediction import load_predictions
 
     ap = build_parser()
     args = ap.parse_args(argv)

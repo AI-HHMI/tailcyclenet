@@ -36,3 +36,4 @@ from .write import write_session, link  # noqa: E402,F401
 from .discovery import Dataset, load_dataset, sessions_for, load_datasets  # noqa: E402,F401
 from .registry import Registry  # noqa: E402,F401
 from .validate import validate_session, validate_dataset  # noqa: E402,F401
+from .prediction import load_predictions  # noqa: E402,F401

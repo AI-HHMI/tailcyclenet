@@ -75,6 +75,15 @@ def _bridge_group(rows, windows, events, gid, n_frames, window_length, cfg):
     return rows, list(reversed(decisions))
 
 
+def _swapped(pred=None, swap_at=120):
+    """`pred` (default: the crossing) with rows 0 and 1 exchanged from `swap_at` on, plus the
+    duplicate-episode events the tracker would log there."""
+    pred = _two_animals_crossing() if pred is None else pred
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    return pred, _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+
 def test_config_refuses_nonsense_by_name():
     for kw in ({'recovery_windows': 0}, {'horizon_steps': 0}, {'horizon_stride': 0},
                {'min_margin': -1}, {'missing_cost': 0}, {'pre_event_windows': -1},
@@ -89,139 +98,74 @@ def test_owned_segments_are_last_write_wins_and_contiguous():
     seg = bridge.owned_segments(_windows(4, 10), 'g', n_frames=100, window_length=25)
     assert [len(seg[w]) for w in (0, 1, 2)] == [10, 10, 10]
     assert seg[0][0] == 0 and seg[0][-1] == 9
-    # the final window keeps everything to the end of the clip
-    assert seg[3][0] == 30 and seg[3][-1] == 54
+    assert seg[3][0] == 30 and seg[3][-1] == 54, 'the final window keeps the rest of the clip'
     for frames in seg.values():
         assert np.all(np.diff(frames) == 1)
 
 
-def test_episodes_gap_join_and_drop_single_slot():
+def test_episodes_gap_join_drop_single_slot_and_ignore_other_events():
+    """Duplicate events join within `max_gap`; a one-slot episode, births/deaths and other groups'
+    events make no episode."""
     ev = _events([(10, 2, 'retired_duplicate'), (12, 3, 'shielded'),
                   (400, 5, 'retired_duplicate'), (401, 6, 'shielded'),
                   (800, 7, 'retired_duplicate')])
     eps = bridge.episodes(ev, 'g', max_gap=64)
-    assert [e['component'] for e in eps] == [(2, 3), (5, 6)]  # the lone slot-7 episode is dropped
+    assert [e['component'] for e in eps] == [(2, 3), (5, 6)]
     assert eps[0]['first_frame'] == 10 and eps[0]['last_frame'] == 12
+    assert bridge.episodes(_events([(10, 2, 'born'), (11, 3, 'birth_refused'), (12, 4, 'died')]),
+                           'g', 64) == []
+    assert bridge.episodes(_events([(10, 2, 'retired_duplicate'), (11, 3, 'shielded')],
+                                   gid='other'), 'g', 64) == []
 
 
-def test_episodes_ignore_births_and_other_groups():
-    ev = _events([(10, 2, 'born'), (11, 3, 'birth_refused'), (12, 4, 'died')])
-    assert bridge.episodes(ev, 'g', 64) == []
-    ev2 = _events([(10, 2, 'retired_duplicate'), (11, 3, 'shielded')], gid='other')
-    assert bridge.episodes(ev2, 'g', 64) == []
-
-
-def test_no_event_log_is_a_byte_exact_no_op():
-    """Output neutrality: a session with no episodes must come back untouched."""
+@pytest.mark.parametrize('case', ['no events', 'identity', 'unbridgeable'])
+def test_nothing_to_repair_is_a_byte_exact_no_op(case):
+    """No episode, an episode whose best map is the IDENTITY (skipped, not quarantined -- the
+    measured miss saving), or one with no clean anchor before it: the arrays come back untouched."""
     rows = {'pred': _two_animals_crossing(), 'group_id': 'g'}
     before = rows['pred'].copy()
-    out, decisions = _bridge_group(rows, _windows(24, 10), _events([]), 'g',
-                                         n_frames=240, window_length=10,
-                                         cfg=bridge.BridgeConfig())
-    assert decisions == []
-    assert np.array_equal(out['pred'], before, equal_nan=True)
-
-
-def test_identity_mapping_is_skipped_rather_than_quarantined():
-    """The measured miss saving: an episode whose best map is the identity repairs nothing.
-
-    Two rows on clean, separate tracks produce a duplicate event but no actual exchange, so the
-    bridge must leave every frame alone instead of spending coverage on a no-op permutation.
-    """
-    rows = {'pred': _two_animals_crossing(), 'group_id': 'g'}
-    before = rows['pred'].copy()
-    ev = _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')])
+    ev = {'no events': _events([]),
+          'identity': _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]),
+          'unbridgeable': _events([(1, 0, 'retired_duplicate'), (1, 1, 'shielded')])}[case]
     out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
-    assert len(decisions) == 1 and decisions[0].get('identity') is True
+                                   bridge.BridgeConfig())
     assert np.array_equal(out['pred'], before, equal_nan=True)
+    if case == 'no events':
+        assert decisions == []
+    elif case == 'identity':
+        assert len(decisions) == 1 and decisions[0].get('identity') is True
+    else:
+        assert decisions[0].get('skipped') is True
 
 
-def test_a_real_swap_is_repaired_and_only_inside_the_component():
-    """After an induced row exchange the bridge must undo it, and never touch row 2."""
-    pred = _two_animals_crossing()
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    rows = {'pred': pred, 'group_id': 'g'}
+def test_a_real_swap_is_repaired_quarantined_and_permuted_in_every_field():
+    """An induced exchange is undone ([1, 0]); the component is NaN before the release; boxes
+    follow the pose; row 2 (outside the component) is never touched."""
+    pred, ev = _swapped()
     row2_before = pred[2].copy()
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
+    boxes = np.zeros((3, 240, 2, 4), np.float32)
+    boxes[0], boxes[1], boxes[2] = 10.0, 20.0, 30.0
+    out, decisions = _bridge_group({'pred': pred, 'boxes': boxes, 'group_id': 'g'},
+                                   _windows(24, 10), ev, 'g', 240, 10, bridge.BridgeConfig())
     assert len(decisions) == 1
     plan = decisions[0]
     assert not plan.get('skipped') and not plan.get('refused')
     assert plan['mapping'] == [1, 0], 'the exchange must be undone, not re-applied'
-    # row 2 is outside the component and must be byte-identical
     assert np.array_equal(out['pred'][2], row2_before, equal_nan=True)
-    # far past the episode, row 0 is back on its own +x track
     assert out['pred'][0, 230, 0, 0] == pytest.approx(230.0)
+    assert out['boxes'][0, 230, 0, 0] == pytest.approx(20.0), 'boxes must follow the pose'
+    assert out['boxes'][2, 230, 0, 0] == pytest.approx(30.0)
 
-
-def test_quarantine_nans_the_component_before_release():
-    pred = _two_animals_crossing()
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    rows = {'pred': pred, 'group_id': 'g'}
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
-    plan = decisions[0]
     quarantined = [w for w in plan['windows'] if w < plan['release']]
     assert quarantined, 'a repaired episode must quarantine something'
     frame = 10 * quarantined[0]
     assert np.isnan(out['pred'][0, frame]).all() and np.isnan(out['pred'][1, frame]).all()
-    assert not np.isnan(out['pred'][2, frame]).any(), 'row 2 is not in the component'
-
-
-def test_every_row_field_takes_the_same_permutation():
-    """Pose from one animal with boxes from another would be worse than the swap it repairs."""
-    pred = _two_animals_crossing()
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    boxes = np.zeros((3, 240, 2, 4), np.float32)
-    boxes[0], boxes[1], boxes[2] = 10.0, 20.0, 30.0
-    rows = {'pred': pred, 'boxes': boxes, 'group_id': 'g'}
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
-    assert decisions[0]['mapping'] == [1, 0]
-    assert out['boxes'][0, 230, 0, 0] == pytest.approx(20.0), 'boxes must follow the pose'
-    assert out['boxes'][2, 230, 0, 0] == pytest.approx(30.0), 'row 2 untouched'
-
-
-def test_an_unbridgeable_episode_is_left_completely_alone():
-    """An episode with no clean anchor before it must not be half-repaired."""
-    rows = {'pred': _two_animals_crossing(), 'group_id': 'g'}
-    before = rows['pred'].copy()
-    ev = _events([(1, 0, 'retired_duplicate'), (1, 1, 'shielded')])
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
-    assert decisions[0].get('skipped') is True
-    assert np.array_equal(out['pred'], before, equal_nan=True)
-
-
-def test_an_impossible_margin_refuses_and_quarantines_instead_of_guessing():
-    pred = _two_animals_crossing()
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    rows = {'pred': pred, 'group_id': 'g'}
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-    cfg = bridge.BridgeConfig(min_margin=1e12)  # nothing can clear this
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10, cfg)
-    plan = decisions[0]
-    assert plan['refused'] is True and plan['mapping'] is None
-    assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
+    assert not np.isnan(out['pred'][2, frame]).any()
 
 
 def _nearly_parallel_tracks(n_frames=240, k=3):
-    """Two rows moving in almost the same direction -- an AMBIGUOUS case, unlike the cleanly
-    separated opposite-direction crossing every other test in this file uses. A swap here scores
-    a real but LOW margin, the shape that damaged a perfectly clean clip.
-    """
+    """Two rows moving in almost the same direction: a swap here scores a real but LOW margin,
+    the shape that damaged a perfectly clean clip."""
     pred = np.full((2, n_frames, k, 3), np.nan, np.float32)
     t = np.arange(n_frames, dtype=np.float32)
     for j in range(k):
@@ -233,171 +177,90 @@ def _nearly_parallel_tracks(n_frames=240, k=3):
     return pred
 
 
-def test_a_low_margin_release_is_refused_at_the_shipped_default_but_not_at_the_old_one():
-    """A low threshold released a real permutation on a perfectly clean clip at margin 43.08,
-    turning idsw 0 into 2. The shipped threshold must refuse this shape of low-margin release;
-    the old threshold must still apply it, so this test catches regressions in either direction.
-    """
-    pred = _nearly_parallel_tracks()
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    rows = {'pred': pred, 'group_id': 'g'}
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
+def test_a_low_margin_release_is_refused_and_quarantined_instead_of_guessed():
+    """A margin-43 release turned idsw 0 into 2 on a clean clip: the shipped `min_margin` refuses
+    (and quarantines) it while the old 1.0 applied it; an impossible margin refuses a clean swap."""
+    pred, ev = _swapped(_nearly_parallel_tracks())
+    out, decisions = _bridge_group({'pred': pred.copy(), 'group_id': 'g'}, _windows(24, 10), ev,
+                                   'g', 240, 10, bridge.BridgeConfig())
     plan = decisions[0]
-    assert plan['refused'] is True, 'the shipped default must refuse a low-margin release'
-    assert plan['mapping'] is None
+    assert plan['refused'] is True and plan['mapping'] is None
     assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all(), 'refused means quarantined'
+    _, old = _bridge_group({'pred': pred.copy(), 'group_id': 'g'}, _windows(24, 10), ev, 'g',
+                           240, 10, bridge.BridgeConfig(min_margin=1.0))
+    assert not old[0].get('refused') and old[0]['mapping'] is not None
 
-    pred_old = _nearly_parallel_tracks()
-    pred_old[0, swap_at:], pred_old[1, swap_at:] = tail[1], tail[0]
-    rows_old = {'pred': pred_old, 'group_id': 'g'}
-    _, decisions_old = _bridge_group(rows_old, _windows(24, 10), ev, 'g', 240, 10,
-                                           bridge.BridgeConfig(min_margin=1.0))
-    plan_old = decisions_old[0]
-    assert not plan_old.get('refused'), 'the OLD default applied this release -- reproduces the bug'
-    assert plan_old['mapping'] is not None
+    pred, ev = _swapped()
+    _, decisions = _bridge_group({'pred': pred, 'group_id': 'g'}, _windows(24, 10), ev, 'g',
+                                 240, 10, bridge.BridgeConfig(min_margin=1e12))
+    assert decisions[0]['refused'] is True and decisions[0]['mapping'] is None
 
 
-def test_backward_agrees_is_a_diagnostic_that_never_changes_the_arrays():
-    """plan §7.1 / report 64: an independent backward confirmation, stored on the decision dict
-    only -- it must never affect which frames are quarantined or how they are permuted.
-    """
-    pred = _two_animals_crossing(n_frames=400)
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    rows = {'pred': pred.copy(), 'group_id': 'g'}
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-
-    out, decisions = _bridge_group(rows, _windows(40, 10), ev, 'g', 400, 10,
-                                         bridge.BridgeConfig())
+def test_backward_agrees_and_all_candidates_are_diagnostics_on_every_decision():
+    """`backward_agrees` and `all_candidates` (sorted by margin, winner first) ride on the
+    decision dict only, unconditionally (identity outcomes too), and never pick the winner."""
+    pred, ev = _swapped(_two_animals_crossing(n_frames=400))
+    _, decisions = _bridge_group({'pred': pred, 'group_id': 'g'}, _windows(40, 10), ev, 'g', 400,
+                                 10, bridge.BridgeConfig())
     plan = decisions[0]
-    assert 'backward_agrees' in plan
-    assert plan['backward_agrees'] in (True, False, None)
-    # an involution (2-row swap) is its own inverse, so a real repair with room for a backward
-    # anchor must agree with itself here
-    assert plan['backward_agrees'] is True
-
-    # identity and refused outcomes carry the key too (unconditional membership), always None
-    out_id, dec_id = _bridge_group(
-        {'pred': _two_animals_crossing(), 'group_id': 'g'}, _windows(24, 10),
-        _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]), 'g', 240, 10,
-        bridge.BridgeConfig())
-    assert dec_id[0]['identity'] is True and dec_id[0]['backward_agrees'] is None
-
-
-def test_all_candidates_are_recorded_sorted_by_margin_and_change_nothing():
-    """plan §7 item 2 / report 73: every horizon-invariant candidate is logged, not just the
-    winner -- a pure diagnostic, sorted descending by margin, that must never change WHICH
-    candidate wins or any array output.
-    """
-    pred = _two_animals_crossing()
-    swap_at = 120
-    tail = pred[:, swap_at:].copy()
-    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
-    rows = {'pred': pred.copy(), 'group_id': 'g'}
-    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
-
-    out, decisions = _bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
-                                         bridge.BridgeConfig())
-    plan = decisions[0]
-    assert 'all_candidates' in plan
-    assert len(plan['all_candidates']) >= 1
+    assert plan['backward_agrees'] is True, 'a 2-row swap is an involution: it must self-agree'
     margins = [c['mean_margin'] for c in plan['all_candidates']]
-    assert margins == sorted(margins, reverse=True), 'must be sorted descending by margin'
-    winner = plan['all_candidates'][0]
-    assert winner['release'] == plan['release']
-    assert winner['mapping'] == plan['mapping']
+    assert margins and margins == sorted(margins, reverse=True)
+    assert plan['all_candidates'][0]['release'] == plan['release']
+    assert plan['all_candidates'][0]['mapping'] == plan['mapping']
 
-    # identity and refused outcomes carry the field too (unconditional membership)
     _, dec_id = _bridge_group(
         {'pred': _two_animals_crossing(), 'group_id': 'g'}, _windows(24, 10),
         _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]), 'g', 240, 10,
         bridge.BridgeConfig())
-    assert dec_id[0]['identity'] is True and 'all_candidates' in dec_id[0]
+    assert dec_id[0]['identity'] is True and dec_id[0]['backward_agrees'] is None
+    assert 'all_candidates' in dec_id[0]
 
 
-def test_rewrite_tables_deletes_quarantine_and_relabels_the_release(tmp_path):
-    """A permutation IS an `animal_id` relabel and a quarantine IS a row deletion.
-
-    Rebuilding the tables from arrays would drop `conf2d`, which does not survive a
-    `load_predictions` round trip, so the bridge edits rows instead. This pins that contract.
-    """
+def test_rewrite_tables_deletes_quarantine_relabels_release_and_spares_other_groups(tmp_path):
+    """A quarantine IS a row deletion and a permutation IS an `animal_id` relabel (rebuilding from
+    arrays would drop `conf2d`); another group's rows stay byte-exact."""
     from tailcyclenet.format import DICT_COLS, write_table
-    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
-    animals = np.array(['a0', 'a1', 'a0', 'a1', 'a0', 'a1'], dtype=object)
     write_table(tmp_path / 'points3d.pq', {
-        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
-        'animal_id': animals, 'bodypart': np.array(['n'] * 6, dtype=object),
-        'status': np.array(['visible'] * 6, dtype=object),
-        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
-        'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
-    segments = {0: np.arange(0, 10), 1: np.arange(10, 30)}
+        'group_id': np.array(['g'] * 6 + ['other'] * 2, dtype=object),
+        'frame': np.array([0, 0, 5, 5, 20, 20, 0, 0], np.int32),
+        'animal_id': np.array(['a0', 'a1'] * 4, dtype=object),
+        'bodypart': np.array(['n'] * 8, dtype=object),
+        'status': np.array(['visible'] * 8, dtype=object),
+        'x': np.arange(8, dtype=np.float32), 'y': np.zeros(8, np.float32),
+        'z': np.zeros(8, np.float32)}, dict_cols=DICT_COLS)
     plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
             'refused': False}
-    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], segments, [plan], n_frames=30)
+    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10), 1: np.arange(10, 30)},
+                          [plan], n_frames=30)
     out = pl.read_parquet(tmp_path / 'points3d.pq')
-    # window 0 (frames 0..9) is quarantined, so its rows are gone entirely
-    assert set(out['frame'].to_list()) == {20}
-    # window 1 onward is released under [1, 0], so the two ids are exchanged
-    got = dict(zip(out['animal_id'].cast(pl.String).to_list(), out['x'].to_list()))
+    g = out.filter(pl.col('group_id').cast(pl.String) == 'g')
+    assert set(g['frame'].to_list()) == {20}
+    got = dict(zip(g['animal_id'].cast(pl.String).to_list(), g['x'].to_list()))
     assert got['a0'] == pytest.approx(5.0) and got['a1'] == pytest.approx(4.0)
+    other = out.filter(pl.col('group_id').cast(pl.String) == 'other')
+    assert other['x'].to_list() == [6.0, 7.0]
+    assert other['animal_id'].cast(pl.String).to_list() == ['a0', 'a1']
 
 
-def test_rewrite_tables_leaves_other_groups_byte_exact(tmp_path):
-    from tailcyclenet.format import DICT_COLS, write_table
-    write_table(tmp_path / 'points3d.pq', {
-        'group_id': np.array(['g', 'g', 'other', 'other'], dtype=object),
-        'frame': np.array([0, 0, 0, 0], np.int32),
-        'animal_id': np.array(['a0', 'a1', 'a0', 'a1'], dtype=object),
-        'bodypart': np.array(['n'] * 4, dtype=object),
-        'status': np.array(['visible'] * 4, dtype=object),
-        'x': np.arange(4, dtype=np.float32), 'y': np.zeros(4, np.float32),
-        'z': np.zeros(4, np.float32)}, dict_cols=DICT_COLS)
-    plan = {'component': [0, 1], 'windows': [0], 'release': None, 'mapping': None,
-            'refused': True}
-    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10)}, [plan], 10)
-    out = pl.read_parquet(tmp_path / 'points3d.pq')
-    assert out['group_id'].cast(pl.String).to_list() == ['other', 'other']
-    assert out['x'].to_list() == [2.0, 3.0]
-
-
-def test_provenance_lists_every_lever_unconditionally():
-    """A partial record lies: an absent key reads as 'not used' when it means 'unknown'."""
-    keys = {k for k, _ in bridge.config_provenance(bridge.BridgeConfig())}
-    assert keys == {f'bridge_{f}' for f in bridge.BridgeConfig.__dataclass_fields__}
-
-
-def test_write_bridge_provenance_merges_into_an_existing_session_toml(tmp_path):
-    """`--identity-bridge` runs after `SessionWriter.close()`, so `session.toml` is already
-    frozen with the run's other provenance -- this must ADD the bridge's keys, not replace them,
-    and every key must be recorded unconditionally (same rule as `config_provenance` itself).
-    """
+def test_bridge_provenance_lists_every_lever_and_merges_into_session_toml(tmp_path):
+    """Every lever is recorded unconditionally (an absent key reads as 'not used'), and is ADDED
+    to the already-frozen session.toml without disturbing the run's own keys."""
     import toml
     import tomllib
 
+    want = {f'bridge_{f}' for f in bridge.BridgeConfig.__dataclass_fields__}
+    assert {k for k, _ in bridge.config_provenance(bridge.BridgeConfig())} == want
     cfg_path = tmp_path / 'session.toml'
     cfg_path.write_text(toml.dumps({
         'mode': '3d', 'units': 'mm', 'labels': 'tracked', 'names': ['a', 'b'],
-        'assoc_res_max_px': 30.0,
-        'provenance': {'run': 'r', 'checkpoint': 'c', 'anchor': 'carry'},
-    }))
+        'provenance': {'run': 'r', 'checkpoint': 'c', 'anchor': 'carry'}}))
     bridge._write_bridge_provenance(tmp_path, bridge.BridgeConfig())
-
     with open(cfg_path, 'rb') as f:
         doc = tomllib.load(f)
     prov = doc['provenance']
-    # the pre-existing keys survive untouched
     assert prov['run'] == 'r' and prov['checkpoint'] == 'c' and prov['anchor'] == 'carry'
-    # every bridge lever is added, unconditionally, matching config_provenance's own key set
-    want = {f'bridge_{f}' for f in bridge.BridgeConfig.__dataclass_fields__}
-    assert want <= set(prov)
-    assert prov['bridge_min_margin'] == bridge.BridgeConfig().min_margin
-    # the rest of the document (not just provenance) survives untouched
+    assert want <= set(prov) and prov['bridge_min_margin'] == bridge.BridgeConfig().min_margin
     assert doc['mode'] == '3d' and doc['names'] == ['a', 'b']
 
 

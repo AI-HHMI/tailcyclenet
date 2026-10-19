@@ -144,3 +144,12 @@ def test_pose_loss_rejects_an_unknown_training_losses_key():
     raise rather than silently training at a default."""
     with pytest.raises(TypeError):
         PoseLoss(not_a_real_key=1.0)
+
+
+def test_pose_loss_carries_no_inert_weight_and_so_prints_no_inert_warning(capsys):
+    """`TotalLoss`'s defaults (gamma 0.8, feature_loss_weight 0.5) gate on outputs the tracker
+    never emits, so every run printed two '[warn] ... silently inert' lines."""
+    PoseLoss()._warn_unconsumed_weights(object(), {})
+    assert '[warn]' not in capsys.readouterr().out
+    PoseLoss(gamma=0.8)._warn_unconsumed_weights(object(), {})
+    assert 'gamma' in capsys.readouterr().out

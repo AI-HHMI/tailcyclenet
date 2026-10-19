@@ -21,7 +21,7 @@ from tracktail.model.cube import project_points_torch
 
 from .. import crop as cropmod
 from .. import memory
-from ..dataset import _crop_affine, _resize_camera, prior_out_of_bounds
+from ..dataset import crop_affine, resize_camera, prior_out_of_bounds
 from ..model import self_prompt
 from ..format import Labels, Session
 from ..model import share_scene
@@ -78,10 +78,6 @@ class InferConfig:
     # Pass 1's input resolution under `--refine`; None -> `image_size`. Refine's gain is
     # magnification, not coordinate frame, so pass 1 only has to localise. No shipped default.
     refine_px: int | None = None
-    # Where the window's crop comes from: 'boxes' unions the detector's per-frame boxes;
-    # 'keypoints' runs the crop rule on the detector's own keypoints (needs a keypoint-trained
-    # detector; ignored without one).
-    crop_source: str = 'boxes'
     # How many finite (frame, camera) boxes a row needs before it gets a window crop; raising it
     # deliberately lowers reported coverage (one box used to fabricate a whole window's).
     min_box_frames: int = 1
@@ -249,13 +245,13 @@ def _crop_views(imgs, box, target_size):
     b = np.asarray(box)
     src_wh = (imgs[0].shape[1], imgs[0].shape[0])
     if b.ndim == 1:
-        aff = _crop_affine(src_wh, box, target_size, None)
+        aff = crop_affine(src_wh, box, target_size, None)
         out = [im if aff is None else cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR)
                for im in imgs]
     else:
         out = []
         for t, im in enumerate(imgs):
-            aff = _crop_affine(src_wh, b[min(t, len(b) - 1)], target_size, None)
+            aff = crop_affine(src_wh, b[min(t, len(b) - 1)], target_size, None)
             out.append(im if aff is None else
                        cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
     return torch.from_numpy(np.asarray(out))[None]
@@ -484,7 +480,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
     Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, not
     comparable: `box_points` (S,T,K,R) points the crop rule follows (the labels themselves are
-    the GT-crop upper bound), or `boxes_for(store, lo, hi) -> (boxes, scores, kpts)` from a
+    the GT-crop upper bound), or `boxes_for(store, lo, hi) -> (boxes, scores)` from a
     detector or detections file (the deployment number); whichever was used is recorded.
 
     A block owns a bounded frame span, so nothing is proportional to the clip's length. A block's
@@ -559,7 +555,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     f0, w0 = 0, 0
     pred = conf = box_agree = outcome = crop = crop_refined = box_cams = None
     pred2d = conf2d = None
-    boxes_stc = det_kpts_stc = None
+    boxes_stc = None
     _boxes_from = ('detector' if boxes_for is not None else
                    ('given points' if box_points is not None else
                     ('instances.pq' if inst_boxes is not None else 'labels')))
@@ -583,9 +579,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         window's crop); with boxes, one box per camera is the UNION over the window's frames
         (only the cameras that saw the row), NOT re-squared through `crop_box_for_points`
         (a near-square union only grows); results are int32 and clamped. Stored (instances.pq)
-        boxes ARE squared through the rule (`pad=0`); under `crop_source = 'keypoints'` the
-        detector keypoints are unioned then squared once. The camera must describe the box the
-        pixels were cut with: `apply_crop` sets `size`, `_resize_camera` makes it `scales`,
+        boxes ARE squared through the rule (`pad=0`). The camera must describe the box the
+        pixels were cut with: `apply_crop` sets `size`, `resize_camera` makes it `scales`,
         and `forward` divides by that -- a mismatch scales every keypoint.
 
         Wide-crop deployment (`crop_inflate != 1.0`) inflates each crop about its centre before
@@ -631,15 +626,6 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
                         y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
                         box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
-                    if cfg.crop_source == 'keypoints' and det_kpts_stc is not None:
-                        kk = det_kpts_stc[a, fl, ci][..., :2].reshape(-1, 2)
-                        kk = kk[np.isfinite(kk).all(-1)]
-                        if len(kk):
-                            kb = cropmod.crop_box_for_points(
-                                torch.as_tensor(kk, dtype=torch.float32),
-                                torch.tensor([w, h], dtype=torch.float32), cfg.min_crop_dim)
-                            if kb is not None and _overlaps(kb, box):
-                                box = kb.to(torch.int32)
                     boxes.append(box)
                     use.append(ci)
                 if not use:
@@ -664,7 +650,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             scales = []
             uncropped = list(cgroup)
             for i, cam in enumerate(cgroup):
-                cgroup[i], s = _resize_camera(cam, pass1_res)
+                cgroup[i], s = resize_camera(cam, pass1_res)
                 scales.append(s)
             for i, ci in enumerate(use):
                 crop[a, wl, ci] = np.asarray(boxes[i], np.float32)
@@ -870,7 +856,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     return plan
                 cg, sc = [], []
                 for cam in uncropped:
-                    c, s = _resize_camera(cam, cfg.image_size)
+                    c, s = resize_camera(cam, cfg.image_size)
                     cg.append(c)
                     sc.append(s)
                 return WindowPlan(a, use, boxes, cg, sc, uncropped)
@@ -893,7 +879,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     continue
                 uncropped2, sc2 = list(cg2), []
                 for i, cam in enumerate(cg2):
-                    cg2[i], s = _resize_camera(cam, cfg.image_size)
+                    cg2[i], s = resize_camera(cam, cfg.image_size)
                     sc2.append(s)
                 for i, ci in enumerate(use):
                     crop_refined[a, wi - w0, ci] = np.asarray(b2[i], np.float32)
@@ -1085,12 +1071,12 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             f_own = int(starts[w1]) if w1 < len(starts) else T_total
             n_blk, n_win = f_read - f0, w1 - w0
 
-            boxes_stc = det_kpts_stc = None
+            boxes_stc = None
             if _det_pool is not None:
-                boxes_stc, _scores, det_kpts_stc = _pending_det.result()
+                boxes_stc, _scores = _pending_det.result()
                 _pending_det = _det_pool.submit(_detect, bi + 1)
             elif boxes_for is not None:
-                boxes_stc, _scores, det_kpts_stc = _detect(bi)
+                boxes_stc, _scores = _detect(bi)
 
             det_box = np.full((S, n_blk, len(session.rig), 4), np.nan, np.float32)
             det_score = np.full((S, n_blk, len(session.rig)), np.nan, np.float32)

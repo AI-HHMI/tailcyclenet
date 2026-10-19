@@ -116,7 +116,7 @@ def _identity_provenance(args):
 
     The sibling of `_box_provenance`, and it exists for the same reason one frame later in the
     pipeline: detection provenance answers "which boxes", this answers "whose". Without it two
-    runs differing only in `--pose-nms` or `--link-boxes` are distinguishable **only by their
+    runs differing only in `--link-boxes` are distinguishable **only by their
     directory name**, which is how the two stored 2D suppression arms in `scratch/dupfollow/pred`
     ended up unmatched -- their `[provenance]` records the detector, the crop and the checkpoint,
     and says nothing about the identity mechanism whose effect they were built to measure. Eval
@@ -135,8 +135,6 @@ def _identity_provenance(args):
         'max_move': float(args.max_move),
         'max_age': int(args.max_age),
         'identity_bridge': bool(args.identity_bridge),
-        'pose_nms': (float(args.pose_nms) if getattr(args, 'pose_nms', None) is not None
-                     else 0.0),
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
     }
@@ -343,16 +341,16 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                     if args.det_trace else None),
                              read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
                                  ci, cam, fr, pool=pool, reduce=reduce))
-            b, s, k = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
-                                      min_views=args.min_views, track=args.track,
-                                      max_move=args.max_move,
-                                      max_age=args.max_age, stats=stats,
-                                      pose_nms=args.pose_nms, state=assoc_state,
-                                      duplicate_radius=args.duplicate_radius,
-                                      duplicate_persist=args.duplicate_persist,
-                                      frame_base=cursor)
+            b, s = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
+                                   min_views=args.min_views, track=args.track,
+                                   max_move=args.max_move,
+                                   max_age=args.max_age, stats=stats,
+                                   state=assoc_state,
+                                   duplicate_radius=args.duplicate_radius,
+                                   duplicate_persist=args.duplicate_persist,
+                                   frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
-                buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
+                buf[t] = (b[:, j], s[:, j])
             if stats is not None:
                 stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
                 stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
@@ -360,8 +358,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                     stats['identity_events'] = assoc_state['tracker'].events
             cursor = end
         want = range(lo, min(hi, T))
-        out = tuple(np.stack([buf[t][i] for t in want], 1) if buf[lo][i] is not None else None
-                    for i in range(3))
+        out = tuple(np.stack([buf[t][i] for t in want], 1) for i in range(2))
         for t in [t for t in buf if t < lo]:
             del buf[t]
         return out
@@ -640,7 +637,6 @@ def run_dataset(args):
         vis_thresh=args.vis_thresh, refine=refine, refine_px=refine_px,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
-        crop_source=args.crop_source,
         box_prompt=box_prompt, box_prompt_first_only=box_prompt_first_only,
         crop_inflate=crop_inflate,
         prefetch_windows=args.prefetch_windows,
@@ -656,8 +652,11 @@ def run_dataset(args):
         from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
         det_path = resolve_detector_checkpoint(args.detector, args.detector_checkpoint)
         args._detector_checkpoint = str(det_path.resolve())
-        det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile, det_objq = load_detector(
-            det_path, device)
+        loaded = load_detector(det_path, device)
+        det, det_wh, det_ds, det_mcd = (loaded.model, loaded.input_wh, loaded.dataset,
+                                        loaded.min_crop_dim)
+        det_red, det_boxsrc, det_tile, det_objq = (loaded.reduce, loaded.box_source,
+                                                   loaded.tile_scale, loaded.obj_quantiles)
         if det_objq and args.det_score >= det_objq.get('q50', 0.0):
             print(f'WARNING: --det-score {args.det_score} is at or above this detector\'s MEDIAN '
                   f'objectness ({det_objq["q50"]:.4f}), so it discards at least half of the '
@@ -692,12 +691,6 @@ def run_dataset(args):
                 f'{args.detector}: trained at min_crop_dim={det_mcd}, but this run\'s '
                 f'[data].min_crop_dim is {cfg.min_crop_dim}. The detector reproduces the crop '
                 'rule; two floors are two rules.')
-        if args.crop_source == 'keypoints' and not int(getattr(det, 'n_keypoints', 0)):
-            raise SystemExit(
-                f'{args.detector}: has no keypoint branch, so --crop-source keypoints would '
-                'silently fall back to cropping from the boxes and measure the arm it is being '
-                'compared against. Train the detector with --keypoints, or use --crop-source '
-                'boxes.')
         if (det_boxsrc or 'keypoints') != cfg.box_source:
             print(f'WARNING: detector boxes are {det_boxsrc!r} but this run was trained on '
                   f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '
@@ -735,7 +728,6 @@ def run_dataset(args):
                             'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
                             'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
                             'precision': precision, 'camera_batch': bool(camera_batch),
-                            'crop_source': cfg.crop_source,
                             'boxes': (str(args.detector) if args.detector else
                                       (str(args.boxes) if args.boxes else 'labels')),
                             'box_source': ((det_boxsrc or 'keypoints') if args.detector
@@ -823,11 +815,6 @@ def run_dataset(args):
                   f'({_dec / max(_wall, 1e-9):.2f}x wall), store {_h}/{_h + _m} hits '
                   f'({_h / max(_h + _m, 1):.2f})')
             if det is not None:
-                if args.pose_nms is not None:
-                    print(f'{key}: pose-nms dropped {det_stats.get("nms_dropped", 0)} row(s) of '
-                          f'{det_stats.get("nms_pairs", 0)} overlapping pair(s)'
-                          + (' (no keypoint branch -- pose-nms is a no-op)'
-                             if 'nms_pairs' not in det_stats else ''), flush=True)
                 _sl = det_stats.get('slots', 0)
                 if _sl:
                     filled = det_stats.get('filled', 0) / _sl

@@ -81,7 +81,7 @@ def test_skew_image_rotation_keeps_projection_in_warp_frame():
 def test_skew_rotate_crop_resize_matches_pixel_affine():
     from tracktail.model.cube import project_cam
     from tailcyclenet.crop import apply_crop
-    from tailcyclenet.dataset import _crop_affine, _resize_camera, rotate_camera_image_plane_3d
+    from tailcyclenet.dataset import crop_affine, resize_camera, rotate_camera_image_plane_3d
 
     rig = _rig(offset=(7.0, -4.0))
     cam = rig.tracktail()[0]
@@ -90,8 +90,8 @@ def test_skew_rotate_crop_resize_matches_pixel_affine():
     w, h = (int(x) for x in rotated['size'])
     box = torch.tensor([10, 8, w - 10, h - 8], dtype=torch.int32)
     cropped = apply_crop(rotated, box)
-    resized, _ = _resize_camera(cropped, 128)
-    affine, _ = _crop_affine(cam['size'].tolist(), box, resized['size'].tolist(), rotation)
+    resized, _ = resize_camera(cropped, 128)
+    affine, _ = crop_affine(cam['size'].tolist(), box, resized['size'].tolist(), rotation)
     affine = torch.as_tensor(affine, dtype=world.dtype)
     expected = project_cam(cam, world) @ affine[:, :2].T + affine[:, 2]
     got = project_cam(resized, world)

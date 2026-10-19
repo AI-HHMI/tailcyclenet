@@ -53,7 +53,7 @@ def _one(root, session_root, mode_2d, seed=0, **over):
     cfg = LoaderConfig(**{k: v for k, v in cfg.items() if not k.startswith('_')})
     ds = PoseDataset(root / session_root, 'train', cfg, train=True)
     rng = np.random.default_rng(seed)
-    sel = ds._select(0, rng, ds._shape(np.random.default_rng(1)))
+    sel = ds.select(0, rng, ds.shape(np.random.default_rng(1)))
     assert sel is not None
     trip = make_triplet(ds, sel, rng, CORRUPTION, build_corruptors_for(CORRUPTION))
     return ds, trip
@@ -156,7 +156,7 @@ def test_the_crop_does_not_depend_on_the_corruption(roots):
     is the structural statement of "the crop does not depend on the corruption", and it fails if
     the two are ever reordered.
 
-    The rng handling is the whole test: `_select` consumes the stream before `_realise` sees it, so
+    The rng handling is the whole test: `select` consumes the stream before `realise` sees it, so
     a fresh generator for the standalone view would draw DIFFERENT rotation and jitter and the
     comparison would fail on unchanged code. Both paths are therefore driven from a generator that
     has run the identical prefix.
@@ -167,15 +167,15 @@ def test_the_crop_does_not_depend_on_the_corruption(roots):
     RNG rather than of the crop.
     """
     ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
-    shape = ds._shape(np.random.default_rng(1))
+    shape = ds.shape(np.random.default_rng(1))
 
     rng_a = np.random.default_rng(0)
-    sel_a = ds._select(0, rng_a, shape)
-    standalone = ds._realise(sel_a, rng_a, world_gauge=False)
+    sel_a = ds.select(0, rng_a, shape)
+    standalone = ds.realise(sel_a, rng_a, world_gauge=False)
 
     torch.manual_seed(0)
     rng_b = np.random.default_rng(0)
-    sel_b = ds._select(0, rng_b, shape)
+    sel_b = ds.select(0, rng_b, shape)
     trip = make_triplet(ds, sel_b, rng_b, CORRUPTION, build_corruptors_for(CORRUPTION))
     assert standalone is not None, 'the standalone realisation failed'
     assert trip is not None, ('the triplet did not build for this seed. The corruption draws come '
@@ -196,9 +196,9 @@ def test_the_2d_affine_round_trips_a_point(roots):
     """`H_to @ inv(H_from) @ (H_from @ x) == H_to @ x` -- the composition is exact."""
     ds, _trip = _one(roots, 'ratlike', True, 0)
     rng = np.random.default_rng(0)
-    sel = ds._select(0, rng, ds._shape(np.random.default_rng(1)))
-    a = ds._realise(sel, np.random.default_rng(11), world_gauge=False)
-    b = ds._realise(sel, np.random.default_rng(12), world_gauge=False)
+    sel = ds.select(0, rng, ds.shape(np.random.default_rng(1)))
+    a = ds.realise(sel, np.random.default_rng(11), world_gauge=False)
+    b = ds.realise(sel, np.random.default_rng(12), world_gauge=False)
     Ha, Hb = view_affine_2d(a), view_affine_2d(b)
 
     src = torch.rand(10, 2, dtype=torch.float32) * 40 + 5
@@ -270,7 +270,7 @@ def test_sparse_windows_still_build_and_still_carry_signal(roots):
     high = dict(CORRUPTION, min_valid_frames=6)
     ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
     rng = np.random.default_rng(0)
-    trip = make_triplet(ds, ds._select(0, rng, ds._shape(np.random.default_rng(1))),
+    trip = make_triplet(ds, ds.select(0, rng, ds.shape(np.random.default_rng(1))),
                         rng, high, build_corruptors_for(high))
     assert trip is not None, 'a fully sparse window was refused'
     assert trip['n_sparse'] == trip['good'][1].shape[2], 'not every point came out sparse'
@@ -316,10 +316,10 @@ def test_the_forced_sparse_menu_moves_every_sparse_keypoint(roots):
     checked = 0
     for seed in range(12):
         rng = np.random.default_rng(seed)
-        sel = ds._select(0, rng, ds._shape(np.random.default_rng(1)))
+        sel = ds.select(0, rng, ds.shape(np.random.default_rng(1)))
         if sel is None:
             continue
-        view = ds._realise(sel, rng, world_gauge=False)
+        view = ds.realise(sel, rng, world_gauge=False)
         if view is None:
             continue
         coords = view.coords[None]
@@ -430,7 +430,7 @@ def test_frame_triplet_masks_are_post_gate_and_source_weighted(roots):
     for root_name, mode in (('mouselike', '3d'), ('ratlike', '2d')):
         ds = PoseDataset(roots / root_name, 'train', CFG, train=True)
         rng = np.random.default_rng(0)
-        sel = ds._select(0, rng, ds._shape(np.random.default_rng(1)))
+        sel = ds.select(0, rng, ds.shape(np.random.default_rng(1)))
         trip = make_triplet(ds, sel, rng, cfg, build_corruptors_for(cfg))
         assert trip is not None and trip['mode'] == mode
         shape = (1, trip['good'][1].shape[1], trip['good'][1].shape[2])
@@ -486,18 +486,3 @@ def test_distance_states_exclude_near_and_ambiguous_rows():
     out = displacement_masks(good, bad, anchor, camera, '2d',
                              {'min_corrupt_px': 1.0, 'max_clean_px': 0.5})
     assert bool(out['far_mask'][0, 0, 0]) and bool(out['active_mask'][0, 0, 0])
-
-
-def test_independent_reference_gate_rejects_an_improved_bad_point():
-    camera = [{'size': (100, 100)}]
-    good = torch.tensor([[[[10.0, 10.0]]]])
-    bad = torch.tensor([[[[11.0, 10.0]]]])
-    anchor = good.clone()
-    reference = torch.tensor([[[[11.0, 10.0]]]])
-    out = displacement_masks(
-        good, bad, anchor, camera, '2d',
-        {'min_corrupt_px': 0.5, 'max_clean_px': 0.1, 'reference_gate': 'independent_far',
-         'reference_margin_px': 0.0}, reference=reference)
-    assert bool(out['base_far_mask'].all())
-    assert not bool(out['far_mask'].any())
-    assert bool(out['reference_rejected_mask'].all())

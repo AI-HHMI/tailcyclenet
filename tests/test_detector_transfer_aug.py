@@ -95,7 +95,7 @@ def test_composite_empty_canvas_has_no_boxes(flat_canvas):
     assert new.shape == (0, 4) and (out == 90).all()
 
 
-def _cfg(tmp_path, extra='', model='yolox = "tiny"'):
+def _cfg(tmp_path, extra='', model='yolox = "hybrid"'):
     p = tmp_path / 'c.toml'
     p.write_text(f'[data]\npath = "/tmp/ds"\n{extra}\n[model]\n{model}\n'
                  '[training]\nout = "/tmp/run"\n')
@@ -113,8 +113,7 @@ def test_shipped_defaults_are_the_report_73_recipe(tmp_path):
 
 @pytest.mark.parametrize('model, want', [
     ('yolox = "convnext-t"', 'imagenet'), ('yolox = "convnext-t"\npretrained = ""', ''),
-    ('yolox = "tiny"', ''), ('yolox = "hybrid"', ''),
-    ('yolox = "tiny"\npretrained = "coco"\nbottleneck_expansion = 1.0', 'coco')])
+    ('yolox = "hybrid"', '')])
 def test_absent_pretrained_follows_the_architecture(tmp_path, model, want):
     """An overlay that changes `yolox` never inherits a source that cannot load into it."""
     assert load_detector_config(_cfg(tmp_path, '', model=model))['model']['pretrained'] == want
@@ -126,10 +125,28 @@ def test_absent_pretrained_follows_the_architecture(tmp_path, model, want):
     ('background_generic = "x"', '', 'background_generic'),
     ('background_weights = [0, 0, 1]', '', 'background_weights'),
     ('', 'yolox = "dinov2-s"', 'deleted'), ('', 'yolox = "hybrid-tiny"', 'deleted'),
-    ('', 'yolox = "cspvit-m"', 'deleted'), ('', 'yolox = "tiny"\npretrained = "imagenet"', 'imagenet')])
+    ('', 'yolox = "cspvit-m"', 'deleted'), ('', 'yolox = "hybrid"\npretrained = "imagenet"', 'imagenet'),
+    ('', 'yolox = "tiny"', 'deleted.*v0.3.4'), ('', 'yolox = "trimmed"', 'deleted.*v0.3.4'),
+    ('', 'yolox = "s"', 'deleted.*v0.3.4'),
+    ('', 'yolox = "hybrid"\npretrained = "coco"', "pretrained='coco' is deleted"),
+    ('', 'yolox = "hybrid"\nbottleneck_expansion = 1.0', "deleted key.*bottleneck_expansion"),
+    ('keypoints = false', '', "deleted key.*'keypoints'")])
 def test_deleted_and_mismatched_keys_raise_by_name(tmp_path, extra, model, match):
     with pytest.raises(SystemExit, match=match):
         load_detector_config(_cfg(tmp_path, extra, model=model))
+
+
+@pytest.mark.parametrize('meta, match', [
+    ({'yolox_version': 'tiny'}, 'deleted architecture.*v0.3.4'),
+    ({}, "yolox='trimmed' is a deleted architecture"),
+    ({'yolox_version': 'hybrid', 'n_keypoints': 17}, 'keypoint branch is deleted'),
+    ({'yolox_version': 'hybrid', 'in_channels': 6}, 'in_channels=6')])
+def test_load_detector_refuses_retired_checkpoints_by_name(tmp_path, meta, match):
+    from tailcyclenet.detector import load_detector
+    p = tmp_path / 'detector_it000010.pth'
+    torch.save({'input_wh': [64, 64], 'norm': 'gn', 'model_state': {}, **meta}, p)
+    with pytest.raises(ValueError, match=match):
+        load_detector(p)
 
 
 def test_load_detector_refuses_a_deleted_architecture(tmp_path):
@@ -145,8 +162,6 @@ def test_load_detector_refuses_a_deleted_architecture(tmp_path):
     ('input_norm = "clahe"', 'input_norm'),
     ('invert_prob = 1.5', 'invert_prob'),
     ('scale_range = [1.2, 0.5]', 'scale_range'),
-    ('background_prob = 0.5\nkeypoints = true', 'box-only'),
-    ('keypoints = true', 'background_prob = 0 alongside keypoints'),
 ])
 def test_transfer_keys_refuse_nonsense(tmp_path, extra, match):
     with pytest.raises(SystemExit, match=match):

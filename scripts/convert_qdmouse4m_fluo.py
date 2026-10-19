@@ -24,7 +24,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt
 
-SOURCE = Path("/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/qdmouse4m-fluo")
 OUTPUT = Path("/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/qdmouse4m-fluo-separate-cameras")
 
 
@@ -146,7 +145,7 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
     return mapping
 
 
-def convert(*, source=SOURCE, output=OUTPUT, overwrite=False, validate=False) -> None:
+def convert(*, source, output=OUTPUT, overwrite=False, validate=False) -> None:
     """Convert all train/val/test sessions without touching ``source``.
 
     Existing manifests are copied alongside the derived root; the selection
@@ -191,7 +190,9 @@ def main() -> None:
     Side effects: creates or replaces the output directory and its contents.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, default=SOURCE)
+    parser.add_argument("--source", type=Path, required=True,
+                        help="the qdmouse4m-fluo root this was converted from (no longer on disk "
+                             "under its old name, so it must be named)")
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--validate", action="store_true")

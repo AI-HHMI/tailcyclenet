@@ -180,12 +180,8 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
              f'(expanded non-recursively over {fmt.VIDEO_EXTS}).')
 
     if calibration is None:
-        from aniposelib.cameras import CameraGroup
-
         cal = None
-        rig = fmt.Rig(cgroup=CameraGroup([fmt.nominal_camera('cam0', (1, 1))]),
-                      offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
-                      calibrated={'cam0': False})
+        rig = fmt.nominal_rig('cam0', (1, 1))
         need_size = ['cam0']
     else:
         cal = Path(calibration).resolve()
@@ -543,11 +539,11 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
     names = list(cfg['names'])
     K, C = len(names), len(p.rig)
     groups, empty = {}, {}
+    fps = gt.get('fps') or [None] * len(want_groups)
     for i, gid in enumerate(want_groups):
         n = int(gt['n_frames'][i])
         groups[gid] = fmt.video_group(gid, n, p.videos[gid],
-                                      fps=float(gt.get('fps', [float('nan')] * len(gt))[i]
-                                                or float('nan')))
+                                      fps=float(fps[i] or float('nan')))
         empty[gid] = fmt.empty_labels(0, n, K, C, mode3d=(cfg['mode'] == '3d'))
     sess = fmt.VideoSession(
         path=_common_parent([Path(f) for f in files]) / p.session_id,

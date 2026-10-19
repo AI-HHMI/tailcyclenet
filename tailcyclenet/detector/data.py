@@ -20,9 +20,9 @@ from torch.utils.data import Dataset
 from tracktail.model.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
-from ..dataset import _apply_affine, read_frames
-from ..format import (INST_ABSENT, INST_LABELED, INST_NONE, INST_PRESENT, PROJECTED, UNLABELED,
-                      VISIBLE, load_datasets)
+from ..dataset import apply_affine, read_frames
+from ..format import (INST_ABSENT, INST_LABELED, INST_NONE, INST_PRESENT, UNLABELED,
+                      load_datasets)
 
 
 def reduce_factor(size, out_wh):
@@ -146,35 +146,14 @@ def unletterbox_boxes(boxes, scale, pad, src_wh=None):
     return out
 
 
-def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
-    """Detector-input keypoints (N,K,3) -> source-image keypoints. Sibling of `unletterbox_boxes`.
-
-    Lives HERE, beside the box version, because it is the one inverse every consumer goes through,
-    and a keypoint un-letterboxed by a different rule than its own box is invisible in every
-    downstream number. Out-of-frame keypoints go NaN rather than clamping: a box is clamped because
-    a partly-visible animal still has a real extent, but a keypoint outside the frame was not
-    observed there and clamping it to the border would invent a position.
-    """
-    out = kpts.clone().float()
-    out[..., 0] = (out[..., 0] - pad[0]) / scale
-    out[..., 1] = (out[..., 1] - pad[1]) / scale
-    if src_wh is not None:
-        w, h = float(src_wh[0]), float(src_wh[1])
-        bad = ((out[..., 0] < 0) | (out[..., 0] > w) | (out[..., 1] < 0) | (out[..., 1] > h))
-        out[..., :2] = torch.where(bad[..., None], torch.nan, out[..., :2])
-    return out
-
-
-def _photometric(img, rng, gain=None):
+def _photometric(img, rng):
     """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
 
     DLC's extended form (additive brightness + per-channel gaussian noise) was built, measured
     and REFUTED here: it costs accuracy in-domain, and neither shipped split tests the
-    out-of-domain gain it buys. `gain=None` draws its own; `gain=<value>` applies a PRE-DRAWN one
-    so a stacked (t-1, t) pair sees the same appearance shift, not an independent one.
+    out-of-domain gain it buys.
     """
-    g = rng.uniform(0.7, 1.3) if gain is None else gain
-    out = img * g
+    out = img * rng.uniform(0.7, 1.3)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -242,7 +221,7 @@ def _cutout_rects(wh, rng, n=(1, 3), frac=0.15):
     """1-3 rects of `frac` x `frac` of `wh` (INPUT pixels), random RGB fill.
 
     tracktail's `cutout_rects`: an erasure, not a geometric transform, so it never touches a box
-    target -- only the pixels under it, and (in `__getitem__`) the keypoints it covers.
+    target -- only the pixels under it.
     """
     w, h = int(wh[0]), int(wh[1])
     rw, rh = max(1, int(w * frac)), max(1, int(h * frac))
@@ -261,20 +240,6 @@ def _apply_cutout(img, rects):
     for x0, y0, x1, y1, fill in rects:
         out[y0:y1, x0:x1] = fill
     return out
-
-
-def _keypoints_in_rects(kpts_xy, rects):
-    """(..., 2) input-pixel keypoints, `rects` from `_cutout_rects` -> (...) bool, covered or not.
-
-    Half-open like the rects themselves, so a keypoint exactly on the far edge is not erased.
-    """
-    if not rects:
-        return torch.zeros(kpts_xy.shape[:-1], dtype=torch.bool)
-    x, y = kpts_xy[..., 0], kpts_xy[..., 1]
-    mask = torch.zeros_like(x, dtype=torch.bool)
-    for x0, y0, x1, y1, _ in rects:
-        mask = mask | ((x >= x0) & (x < x1) & (y >= y0) & (y < y1))
-    return mask
 
 
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
@@ -298,9 +263,7 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     every angle.
 
     No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
-    relabelling left to right permutes the set and the extent is unchanged -- but only while
-    keypoints are not a target, which is why `BoxDataset` passes `hflip=0` (and `vflip=0`)
-    whenever it emits them.
+    relabelling left to right permutes the set and the extent is unchanged.
 
     `vflip` (probability of a vertical mirror) is box-only-safe for the same reason. It draws
     from `rng` ONLY when nonzero, so at 0 the draw sequence -- and every augmentation stream on
@@ -326,7 +289,7 @@ def _drop_outside(x, bounds):
 
     A point warped off the region it belongs to is not that point any more: dropping it shrinks a
     box to its visible part, and `crop_box_for_points` returns None when every point of an animal
-    is gone. `boxes_for` uses one shared copy of this rule for keypoints and box geometry.
+    is gone. `boxes_for` uses this one rule for every box's geometry.
     """
     lo_x, lo_y, hi_x, hi_y = bounds
     out = ((x[..., 0] < lo_x) | (x[..., 0] > hi_x) |
@@ -358,13 +321,6 @@ def _floor_extent(boxes, min_side):
     return out
 
 
-def tt_photometric_transform(img, gain=1.0, gamma=1.0):
-    """Apply clipped gain/gamma to an RGB uint8 image without mutating it."""
-    if gain == 1.0 and gamma == 1.0:
-        return img
-    return np.clip(255.0 * ((img.astype(np.float32) / 255.0) ** gamma) * gain, 0, 255).astype(np.uint8)
-
-
 class BoxDataset(Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
@@ -374,10 +330,10 @@ class BoxDataset(Dataset):
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
-                 augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
+                 augment=False, reduce=False, hflip=0.5, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
                  boxes_by_dataset=None, include_roots=None, datasets=None,
-                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, tt_transform=None,
+                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0,
                  input_norm='none', scale_range=(0.8, 1.25), background_prob=0.0,
                  invert_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
@@ -394,13 +350,11 @@ class BoxDataset(Dataset):
             input_wh -- model input size; replaced by the tile size under tiling.
             tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
                 size; `tile_scale` is the source -> input scale and the only scale there is.
-            keypoints -- also emit per-keypoint targets and kill the horizontal flip (hflip=None
-                decides from `keypoints`).
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
             box_target -- 'crop' (legacy): `crop_box_for_points` itself. 'extent': the tight
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
             antialias / grayscale_prob / vflip -- area-filtered shrinking and the
-                train-augmentation probabilities; `vflip` is 0 under `keypoints`.
+                train-augmentation probabilities.
             input_norm / invert_prob / scale_range / background_prob -- `transfer_aug` (report 73).
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
@@ -426,13 +380,11 @@ class BoxDataset(Dataset):
         self.tile_bg_per_frame = int(tile_bg_per_frame)
         if self.tile_wh is not None and self.tile_scale <= 0:
             raise ValueError(f'tile_scale must be > 0, got {tile_scale}')
-        self.keypoints = bool(keypoints)
-        self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
+        self.hflip = float(hflip)
         if box_target not in BOX_TARGETS:
             raise ValueError(f'box_target must be one of {BOX_TARGETS}, got {box_target!r}')
         self.box_target = box_target
         self.antialias = bool(antialias)
-        self.tt_transform = tt_transform
         from .transfer_aug import INPUT_NORMS
         if input_norm not in INPUT_NORMS:
             raise ValueError(f'input_norm must be one of {INPUT_NORMS}, got {input_norm!r}')
@@ -440,10 +392,8 @@ class BoxDataset(Dataset):
         self.invert_prob = float(invert_prob)
         self.scale_range = tuple(float(v) for v in scale_range)
         self.background_prob = float(background_prob)
-        if self.background_prob and keypoints:
-            raise ValueError('background compositing is box-only; it drops keypoint targets')
         self.grayscale_prob = float(grayscale_prob)
-        self.vflip = 0.0 if self.keypoints else float(vflip)
+        self.vflip = float(vflip)
         self.rotate_deg = float(rotate_deg)
         self.augment = augment
         self.strong = bool(strong)
@@ -465,9 +415,6 @@ class BoxDataset(Dataset):
             self.datasets = [ds for ds in split_datasets if ds.name in include_roots]
             if not self.datasets:
                 raise ValueError(f'{path}: split {split!r} has no included roots with data')
-        if len(self.datasets) > 1 and self.keypoints:
-            raise ValueError('multi-root detector training is box-only: [data].keypoints = true '
-                             'is explicitly unsupported when more than one dataset root is given.')
         self.ds = self.datasets[0] if len(self.datasets) == 1 else None
         self.root_names = [ds.name for ds in self.datasets]
         all_root_names = {ds.name for ds in all_datasets}
@@ -900,12 +847,8 @@ class BoxDataset(Dataset):
             boxes = b
         return ig, boxes
 
-    def boxes_for(self, i, warp=None, with_keypoints=False):
-        """Return letterboxed target boxes without decoding the image.
-
-        With `with_keypoints=True`, also return `(S,K,3)` `(x, y, vis)` targets in the same
-        pixels. The `vis` channel is the format status, not coordinate finiteness; it is NaN when
-        the session made no assessment.
+    def boxes_for(self, i, warp=None):
+        """Return letterboxed (S,4) target boxes without decoding the image.
 
         The method is separate from `__getitem__` so assignment diagnostics can inspect targets
         without decoding pixels. `warp` is a source-pixel 2x3 augmentation: points move through it
@@ -924,10 +867,6 @@ class BoxDataset(Dataset):
         lab = sess.labels(gid)
         cam = self._camera(sess, gid, f, ci)
         p2d = self._points_2d(sess, gid, f, ci)
-        if sess.mode == '3d':
-            vis = None if lab.vis3d is None else lab.vis3d[:, f]
-        else:
-            vis = None if lab.vis2d is None else lab.vis2d[:, f, :, ci]
 
         tile_box = None
         if self.origins[i] is not None:
@@ -936,22 +875,6 @@ class BoxDataset(Dataset):
             tile_box = (ox, oy, ox + tw, oy + th)
 
         drop_outside = _drop_outside
-
-        kpts = None
-        if with_keypoints:
-            k = p2d.clone()
-            if warp is not None:
-                k = _apply_affine(k, (warp, None))
-                k = drop_outside(k, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
-            if tile_box is not None:
-                k = drop_outside(k, tile_box)
-            if vis is None:
-                v = torch.full(k.shape[:-1], float('nan'))
-            else:
-                vt = torch.as_tensor(np.asarray(vis))
-                v = torch.where(vt == PROJECTED, torch.nan,
-                                (vt == VISIBLE).to(torch.float32))
-            kpts = torch.cat([k, v[..., None].to(k.dtype)], -1)
 
         boxes = []
         use_instances = self._uses_instance_boxes(sess, lab)
@@ -969,7 +892,7 @@ class BoxDataset(Dataset):
             else:
                 src, pad = p2d[s], 20
             if warp is not None:
-                src = _apply_affine(src, (warp, None))
+                src = apply_affine(src, (warp, None))
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
             if tile_box is not None:
                 src = drop_outside(src, tile_box)
@@ -984,16 +907,12 @@ class BoxDataset(Dataset):
         boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
         if self.box_target == 'extent':
             boxes = _floor_extent(boxes, MIN_EXTENT_PX)
-        if kpts is None:
-            return boxes
-        kpts[..., 0] = kpts[..., 0] * scale + pad[0]
-        kpts[..., 1] = kpts[..., 1] * scale + pad[1]
-        return boxes, kpts
+        return boxes
 
-    def _load_letterbox(self, i, with_keypoints=False):
+    def _load_letterbox(self, i):
         """Decode item `i` and letterbox (or tile) it with NO augmentation whatsoever.
 
-        `(img_uint8, boxes, kpts_or_None)`, all in INPUT pixels. Used only by mosaic-lite as a
+        `(img_uint8, boxes)`, both in INPUT pixels. Used only by mosaic-lite as a
         source of another frame's pixels and its own crop-rule box -- it must not recurse into
         `__getitem__`'s augmentation path, or a mosaic source could itself be mosaicked.
         """
@@ -1015,11 +934,9 @@ class BoxDataset(Dataset):
             D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
             M = (L @ D)[:2]
             img = warp_image(img, M, self.input_wh, self.antialias)
-        got = self.boxes_for(i, None, with_keypoints=with_keypoints)
-        boxes, kpts = got if with_keypoints else (got, None)
-        return img, boxes, kpts
+        return img, self.boxes_for(i, None)
 
-    def _mosaic_paste(self, i, boxes, kpts, img, rng):
+    def _mosaic_paste(self, i, boxes, img, rng):
         """Copy-paste one WHOLE, untruncated crop-rule box from a DIFFERENT frame into empty
         space of this item's rendered image, at a location fully interior to `input_wh`.
 
@@ -1030,17 +947,16 @@ class BoxDataset(Dataset):
         fit entirely inside `input_wh` is redrawn, up to a few tries, and the item is returned
         unchanged if none fits.
 
-        A keypoint of the source instance that falls outside the pasted box is dropped, the same
-        rule a point warped off-frame follows. An `extent` target stops at the outermost POINT,
+        An `extent` target stops at the outermost POINT,
         not the animal's edge, so its paste carries a quarter-side margin of context.
         """
         if len(self) < 2:
-            return boxes, kpts, img
+            return boxes, img
         for _ in range(4):
             j = int(rng.integers(len(self)))
             if j == i:
                 continue
-            src_img, src_boxes, src_kpts = self._load_letterbox(j, with_keypoints=self.keypoints)
+            src_img, src_boxes = self._load_letterbox(j)
             finite = torch.isfinite(src_boxes).all(-1)
             if not bool(finite.any()):
                 continue
@@ -1063,20 +979,12 @@ class BoxDataset(Dataset):
             img[dy:dy + bh, dx:dx + bw] = src_img[y0:y1, x0:x1]
             offset = torch.tensor([dx - x0, dy - y0, dx - x0, dy - y0], dtype=boxes.dtype)
             boxes = torch.cat([boxes, (b + offset).to(boxes.dtype)[None]], 0)
-            if self.keypoints and kpts is not None:
-                k = src_kpts[s].clone()
-                k[..., 0] += (dx - x0)
-                k[..., 1] += (dy - y0)
-                outside = ((k[..., 0] < dx) | (k[..., 0] >= dx + bw) |
-                          (k[..., 1] < dy) | (k[..., 1] >= dy + bh))
-                k[..., :2] = torch.where(outside[..., None], torch.nan, k[..., :2])
-                kpts = torch.cat([kpts, k[None]], 0)
             break
-        return boxes, kpts, img
+        return boxes, img
 
     def __getitem__(self, i):
-        """Decode item `i`: letterboxed/tiled pixels, boxes, optional kpts, and whether the
-        view's background negatives are supervised.
+        """Decode item `i`: letterboxed/tiled pixels, boxes, and whether the view's background
+        negatives are supervised.
 
         Fresh entropy is drawn per train visit; evaluation is deterministic. Under tiling the
         input is the frame at `tile_scale`, not the tile size. One warpAffine composes decode
@@ -1090,8 +998,7 @@ class BoxDataset(Dataset):
                               rotate_deg=self.rotate_deg, centre=self._warp_centre(i),
                               vflip=self.vflip)
                 if rng is not None else None)
-        got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
-        boxes, kpts = got if self.keypoints else (got, None)
+        boxes = self.boxes_for(i, warp)
         negative_supervision = self.negative_supervision_for(sess, gid, f, ci)
 
         out_wh = (self.input_wh if self.tile_wh is None
@@ -1100,8 +1007,6 @@ class BoxDataset(Dataset):
         img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
         if img is None:
             raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
-        if self.tt_transform is not None:
-            img = self.tt_transform(img)
         dec = (img.shape[1], img.shape[0])
         want = tuple(-(-size[a] // r) for a in (0, 1))
         assert dec == want or dec == size, \
@@ -1131,13 +1036,8 @@ class BoxDataset(Dataset):
             if rng.random() < 0.5:
                 rects = _cutout_rects(self.input_wh, rng)
                 img = _apply_cutout(img, rects)
-                if kpts is not None:
-                    mask = _keypoints_in_rects(kpts[..., :2], rects)
-                    kpts[..., 0] = torch.where(mask, torch.nan, kpts[..., 0])
-                    kpts[..., 1] = torch.where(mask, torch.nan, kpts[..., 1])
-                    kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
             if rng.random() < 0.2:
-                boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
+                boxes, img = self._mosaic_paste(i, boxes, img, rng)
         if rng is not None and self.invert_prob and rng.random() < self.invert_prob:
             from .transfer_aug import invert
             img = invert(img)
@@ -1152,10 +1052,7 @@ class BoxDataset(Dataset):
             from .transfer_aug import normalize_input
             img = normalize_input(img, self.input_norm)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        item = {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
-        if kpts is not None:
-            item['kpts'] = kpts
-        return item
+        return {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
 
 
 class ChunkShuffle(torch.utils.data.Sampler):
@@ -1241,12 +1138,10 @@ def box_collate(batch):
 
     Pad the box axis with NaN so a batch can hold different animal counts. NaN, not zero, and
     that carries all the way to the loss: a padded row is "no animal", which is the same signal
-    a real animal with no finite point in this view sends. Keypoints pad the same way, so a
-    padded (S,K,3) slice is non-finite in every channel and every mask drops it.
+    a real animal with no finite point in this view sends.
 
-    Items are explicit named dicts (`x`, `boxes`, optional `kpts`, `negative_supervision`) --
-    dispatched BY NAME, not by rank or tuple length. The old rank-based dispatch once fed
-    rectangles to the keypoint loss; a named contract cannot.
+    Items are explicit named dicts (`x`, `boxes`, `negative_supervision`), dispatched BY NAME,
+    not by rank or tuple length.
     """
     xs = torch.stack([b['x'] for b in batch])
     n = max(b['boxes'].shape[0] for b in batch)
@@ -1255,14 +1150,6 @@ def box_collate(batch):
         boxes[i, :b['boxes'].shape[0]] = b['boxes']
     out = {'x': xs, 'boxes': boxes}
 
-    if any('kpts' in b for b in batch):
-        K = next(b['kpts'] for b in batch if 'kpts' in b).shape[1]
-        kpts = torch.full((len(batch), n, K, 3), float('nan'))
-        for i, b in enumerate(batch):
-            k = b['kpts']
-            kpts[i, :k.shape[0]] = k
-        out['kpts'] = kpts
-
     if any('negative_supervision' in b for b in batch):
         out['negative_supervision'] = torch.tensor(
             [bool(b.get('negative_supervision', True)) for b in batch], dtype=torch.bool)
@@ -1270,8 +1157,5 @@ def box_collate(batch):
 
 
 def split_batch(batch):
-    """A collated batch dict -> `(x, boxes, kpts_or_None, negative_supervision_or_None)`.
-
-    Keys, not ranks: an old rank-based version fed rectangles to the keypoint loss.
-    """
-    return batch['x'], batch['boxes'], batch.get('kpts'), batch.get('negative_supervision')
+    """A collated batch dict -> `(x, boxes, negative_supervision_or_None)`."""
+    return batch['x'], batch['boxes'], batch.get('negative_supervision')

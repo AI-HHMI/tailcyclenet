@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import crop_box_for_points
 from tailcyclenet.detector import detect_raw, load_detector
-from tailcyclenet.detector.assign import box_iou
+from tailcyclenet.detector.boxes import NMS_CENTER_DIST_DEPLOY, box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
 from tailcyclenet.infer.driver import detector_box_source
 from tracktail.model.cube import project_points_torch
@@ -132,7 +132,7 @@ def main():
     ap.add_argument('--min-crop-dim', type=int, default=None)
     ap.add_argument('--score-thresh', type=float, default=0.01)
     ap.add_argument('--nms-iou', type=float, default=0.5)
-    ap.add_argument('--nms-center-dist', type=float, default=0.3)
+    ap.add_argument('--nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY)
     ap.add_argument('--top-k', type=int, default=24)
     ap.add_argument('--max-frames', type=int, default=0,
                     help='prefix length when --start-frame is zero')
@@ -149,8 +149,9 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, input_wh, _, min_crop_dim, reduce, box_source, tile_scale, _ = load_detector(
-        args.run, device=device)
+    ld = load_detector(args.run, device=device)
+    model, input_wh, min_crop_dim, reduce, box_source, tile_scale = (
+        ld.model, ld.input_wh, ld.min_crop_dim, ld.reduce, ld.box_source, ld.tile_scale)
     if box_source != args.boxes:
         print(f'WARNING: detector was trained on {box_source!r}, scoring GT {args.boxes!r}')
     if (args.data / 'session.toml').exists():

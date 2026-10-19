@@ -7,12 +7,11 @@
 #
 # Blocks: [data] (loader + regression target), [model] (architecture), [training] (schedule).
 # An UNKNOWN KEY IN ANY BLOCK RAISES -- a typo must not silently train at defaults.
-# The cosine schedule itself is not configurable; it never was a flag. `weight_decay` IS a config
-# key (added post-report-42); its code-level fallback for an absent key is 5e-4 (the old hardcoded
-# value, byte-identical), but THIS FILE's own shipped value is 0.01 -- see the key's own comment.
+# The cosine schedule itself is not configurable; it never was a flag. Every key stated here is
+# this file's value only -- `detector/config.py` carries no second default for it.
 
 [data]
-# A dataset root (train/, optionally val/ and test/) OR a folder whose children are dataset roots (one box-only detector across all of them; `keypoints = true` is refused there).
+# A dataset root (train/, optionally val/ and test/) OR a folder whose children are dataset roots (one detector across all of them).
 path = ""
 
 # Multi-root only: true draws each root with equal probability (the existing view/cohort/alpha weighting applies WITHIN each root); false pools every root into one big dataset. Inert on a single root.
@@ -62,13 +61,10 @@ rotate_deg = 180.0
 # decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target; stored in the checkpoint; no effect on a video root.
 reduce = false
 
-# train a bottom-up KEYPOINT BRANCH beside the box head; off means NOT CONSTRUCTED (byte-identical to every recorded detector), and on also disables the horizontal flip.
-keypoints = false
-
-# the horizontal flip in the augmentation; exists for the box-only control arm (`keypoints = true` disables it implicitly).
+# the horizontal flip in the augmentation (p 0.5).
 hflip = true
 
-# the vertical flip (p 0.5), box-only like hflip (`keypoints = true` disables it). Shipped 2026-10-02 for cross-rig generalization, not measured.
+# the vertical flip (p 0.5). Shipped 2026-10-02 for cross-rig generalization, not measured.
 vflip = true
 
 # probability a train view is converted to grayscale (IR / monochrome rigs); 0 is off, byte-identical. Matches the pose loader's grayscale_prob. Not measured.
@@ -96,7 +92,7 @@ tile_scale = 1.0
 tile_bg_per_frame = 1
 
 [model]
-# the ARCHITECTURE, recorded in the checkpoint (absent = `trimmed`). OWNER DEFAULT 2026-10-03: `convnext-t`, ImageNet ConvNeXt-T (report 73 §8: best on both transfer pairs, no in-domain cost on allen; NOT measured in-domain on the other roots, where `hybrid` won report 47 -- still available by name, and every pre-2026-10-03 checkpoint is one). `[model].pretrained` absent = the architecture's own source (imagenet here; '' = scratch).
+# the ARCHITECTURE, recorded in the checkpoint: `convnext-t` or `hybrid` (the canonical tiers and `trimmed` are deleted). OWNER DEFAULT 2026-10-03: `convnext-t`, ImageNet ConvNeXt-T (report 73 §8: best on both transfer pairs, no in-domain cost on allen; NOT measured in-domain on the other roots, where `hybrid` won report 47 -- still available by name, and every pre-2026-10-03 checkpoint is one). `[model].pretrained` absent = the architecture's own source (imagenet here; '' = scratch).
 yolox = "convnext-t"
 
 # stride-4 (P2) FPN level on top of either tier; DEFAULTS TO true (confirmed on 3dpop at both seeds); false restores the 3-level FPN, byte-identical to every checkpoint on record.
@@ -122,9 +118,6 @@ eval_every = 2000
 # batches per split at each checkpoint; TRAIN is scored too -- the train/val gap says augmentation (a gap) or resolution (no gap, low absolute recall).
 eval_batches = 25
 
-kpt_weight = 1.0
-kpt_score_weight = 1.0
-
 # Task-aligned assignment (TAL) -- the recommended Wave-0 TAL+CIoU recipe; `center` restores the legacy centre-prior assignment.
 assignment = "tal"
 
@@ -141,7 +134,7 @@ iou_aware_warmup = 2000
 # weight on the GIoU box term (formerly a hardcoded constant -- 5.0); DEFAULTS TO 15.0, the only lever to survive a full-length confirmation AND a same-recipe replicate.
 box_weight = 15.0
 
-# AdamW's DECOUPLED weight decay (p <- p*(1 - lr*wd)); SHIPPED 0.01 PER USER INSTRUCTION, NOT A CONFIRMED WIN (report 42: real but MIXED trade-off, one seed, never replicated); absent-key fallback stays 5e-4, byte-identical.
+# AdamW's DECOUPLED weight decay (p <- p*(1 - lr*wd)); SHIPPED 0.01 PER USER INSTRUCTION, NOT A CONFIRMED WIN (report 42: real but MIXED trade-off, one seed, never replicated); the pre-key hardcoded value was 5e-4.
 weight_decay = 0.01
 
 # the detector-architecture-sweep winning recipe (report 47), confirmed against a matched-iteration tiny+COCO control on all 6 training roots: separate obj/reg head towers (not shared), bilinear FPN upsampling, and a wider TAL positive-anchor pool. Ship together -- measured as one recipe, not swept independently past Wave 1.

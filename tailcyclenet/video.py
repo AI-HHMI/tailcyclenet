@@ -384,15 +384,6 @@ class PyAVReader:
             return declared
         return actual
 
-    def frame_times(self) -> np.ndarray:
-        """Presentation time in seconds of every frame index, float64 (stream clock, not zeroed).
-
-        This is what to sync long recordings on: a dropped frame is a gap here, invisible in the
-        index."""
-        if self._tab is None:
-            return np.arange(len(self), dtype=np.float64) / float(self._rate)
-        return self._tab.astype(np.float64) * float(self._tb)
-
     def frame_shape(self):
         """(height, width, 3) of decoded frames."""
         return (int(self._st.codec_context.height), int(self._st.codec_context.width), 3)
@@ -578,10 +569,6 @@ class H264Writer:
         self._stream = None
         self._size = None if size is None else (int(size[0]), int(size[1]))
         self.count = 0
-
-    def isOpened(self) -> bool:
-        """cv2.VideoWriter compatibility: True until released."""
-        return self._container is not None
 
     def _open_stream(self, w: int, h: int) -> None:
         """Add the H.264 stream at the even-padded size."""

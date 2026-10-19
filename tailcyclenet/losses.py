@@ -35,7 +35,14 @@ class PoseLoss(TotalLoss):
         """Set the 2D visibility BCE weight; everything else reaches `TotalLoss` unchanged.
 
         Inputs: vis_loss_2d_weight -- weight of the 2D visibility term; defaults to 0.1.
+
+        `gamma` and `feature_loss_weight` default to 0 here, not to the library's 0.8 / 0.5: both
+        gate on outputs the TrackerEncoder never emits (`coords_pred_iters`,
+        `feature_planes_levels`), so the library defaults are inert and only made `TotalLoss`
+        warn on every run. An old config that still states either one is passed through.
         """
+        kwargs.setdefault('gamma', 0.0)
+        kwargs.setdefault('feature_loss_weight', 0.0)
         super().__init__(**kwargs)
         self.vis_loss_2d_weight = vis_loss_2d_weight
 

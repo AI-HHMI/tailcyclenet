@@ -90,6 +90,43 @@ def fit(im: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(im, (width, h), interpolation=cv2.INTER_AREA)
 
 
+VIDEO_CHUNK = 64
+
+
+def write_group_video(group, cam: str, ci: int, lab: fmt.Labels, sess: fmt.Session,
+                      frames, path: Path, args) -> bool:
+    """Write the whole group as one annotated video, decoding `VIDEO_CHUNK` frames at a time so
+    a long group (calms21: 23,810 frames, ~41 GB per camera decoded) never sits in RAM at once.
+    -> False, with the partial file removed, if any frame is unreadable.
+    """
+    import cv2
+
+    vw = None
+    try:
+        for c0 in range(0, group.n_frames, VIDEO_CHUNK):
+            ims = read_frames(group, cam, list(range(c0, min(c0 + VIDEO_CHUNK, group.n_frames))))
+            if any(i is None for i in ims):
+                if vw is not None:
+                    vw.release()
+                    vw = None
+                path.unlink(missing_ok=True)
+                return False
+            for i, raw in enumerate(ims, start=c0):
+                fr = fit(draw(raw, lab, i, ci, sess.names, sess.skeleton), args.width)
+                if vw is None:
+                    vw = H264Writer(path, args.fps, (fr.shape[1], fr.shape[0]))
+                mark = '  <-- LABELLED' if i in frames else ''
+                cv2.putText(fr, f'{group.group_id} frame {i}/{group.n_frames - 1}'
+                                f' (source {group.source_frame_start + i}){mark}',
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 0, 255) if mark else (255, 255, 255), 2)
+                vw.write(fr)
+    finally:
+        if vw is not None:
+            vw.release()
+    return True
+
+
 def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dict:
     """Render one group: sheets, per-animal crops, and optionally a video.
 
@@ -139,22 +176,10 @@ def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dic
                 stat['crops'] += 1
 
         if args.video:
-            ims = read_frames(group, cam, list(range(group.n_frames)))
-            if any(i is None for i in ims):
+            if write_group_video(group, cam, ci, lab, sess, frames, out / f'{tag}.mp4', args):
+                stat['videos'] += 1
+            else:
                 print(f'  [warn] {stem}/{cam}: unreadable frames, no video')
-                continue
-            first = fit(draw(ims[0], lab, 0, ci, sess.names, sess.skeleton), args.width)
-            vw = H264Writer(out / f'{tag}.mp4', args.fps, (first.shape[1], first.shape[0]))
-            for i, raw in enumerate(ims):
-                fr = fit(draw(raw, lab, i, ci, sess.names, sess.skeleton), args.width)
-                mark = '  <-- LABELLED' if i in frames else ''
-                cv2.putText(fr, f'{gid} frame {i}/{group.n_frames - 1}'
-                                f' (source {group.source_frame_start + i}){mark}',
-                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 0, 255) if mark else (255, 255, 255), 2)
-                vw.write(fr)
-            vw.release()
-            stat['videos'] += 1
     return stat
 
 

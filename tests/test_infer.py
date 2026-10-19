@@ -86,7 +86,7 @@ def cli():
     return mod
 
 
-def _boxes_for(boxes, kpts=None):
+def _boxes_for(boxes):
     """Adapt a whole-clip (S,T,C,4) array to `run_blocks`' `boxes_for` callback.
 
     The tests build the box array up front because that is the clearest way to state a scenario;
@@ -95,7 +95,7 @@ def _boxes_for(boxes, kpts=None):
     exercising the adapter instead of the loop.
     """
     def f(store, lo, hi):
-        return (boxes[:, lo:hi], None, None if kpts is None else kpts[:, lo:hi])
+        return (boxes[:, lo:hi], None)
     return f
 
 
@@ -1208,10 +1208,9 @@ def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
     import conftest as cf
     from tailcyclenet.detector.yolox import YOLOXNano
 
-    m = YOLOXNano(version='tiny')
+    m = YOLOXNano(version='hybrid')
     ckpt = cf._detector_checkpoint(
-        m, input_wh=(64, 48), n_keypoints=0, yolox_version='tiny', bottleneck_expansion=0.5,
-        p2=False, dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
+        m, input_wh=(64, 48), dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
     p = tmp_path / 'det.pth'
     torch.save(ckpt, p)
     return p
@@ -1295,9 +1294,9 @@ def test_cli_allow_detector_transfer_bypasses_the_family_refusal(cli, monkeypatc
     (['--oracle-corrupt', 'off'], 'needs an amount'),
     (['--oracle-corrupt', 'swap'], 'needs an amount'),
     (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
-    (['--independent-windows'], '--independent-windows was removed'),
-    (['--fill-from', 'prior'], '--fill-from was removed'),
-    (['--det-input-wh', '416', '416'], '--det-input-wh was removed'),
+    (['--independent-windows'], '--independent-windows is deleted'),
+    (['--fill-from', 'prior'], '--fill-from is deleted'),
+    (['--det-input-wh', '416', '416'], '--det-input-wh is deleted'),
 ])
 def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
                                                                         argv, expect):
@@ -1534,7 +1533,7 @@ def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
 
     That is the whole reason `forward` un-crops the per-camera pose with the SAME expression the
     2D path uses for `pred` (`p / scale + box[:2]`) rather than the more exact per-axis inverse in
-    `dataset._crop_affine`. The two differ by a sub-pixel amount that comes from `_resize_camera`
+    `dataset.crop_affine`. The two differ by a sub-pixel amount that comes from `resize_camera`
     rounding `cam['size']`; adopting the exact form would move every published 2D number, so the
     inexactness is kept deliberately and pinned here.
 
@@ -2021,11 +2020,11 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
         seen.append((int(fr[0]), int(fr[-1])))
         C, D = len(session.rig), max(1, top_k)
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32), None)
+                np.full((D, len(fr), C), np.nan, np.float32))
 
     def fake_associate(raw, session, gid, n, **kw):
-        b, s, _ = raw
-        return b[:n], s[:n], None
+        b, s = raw
+        return b[:n], s[:n]
 
     import tailcyclenet.detector as detmod
     old = (detmod.detect_raw, detmod.associate_group)
@@ -2078,12 +2077,12 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
         seen.append((int(fr[0]), int(fr[-1])))
         C, D = len(session.rig), max(1, top_k)
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32), None)
+                np.full((D, len(fr), C), np.nan, np.float32))
 
     import tailcyclenet.detector as detmod
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw = fake_detect_raw
-    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n], None)
+    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
     try:
         args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
                                           '--max-move', '1.0'])

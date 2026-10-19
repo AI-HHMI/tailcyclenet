@@ -20,7 +20,7 @@ if not hasattr(cube, '_tailcyclenet_scalar_projection_sensitivity'):
     cube._tailcyclenet_scalar_projection_sensitivity = cube.projection_sensitivity
 
 
-def _has_skew(cam) -> bool:
+def has_skew(cam) -> bool:
     """Whether the camera's 2x2 image transform has an off-diagonal term."""
     matrix = cam['mat']
     return bool(torch.any(matrix[:2, :2].abs().masked_fill(
@@ -35,7 +35,7 @@ def undistort_points(cam, points):
     cameras delegate to the installed implementation for exact compatibility.
     """
     matrix = cam['mat']
-    if not _has_skew(cam):
+    if not has_skew(cam):
         return cube._tailcyclenet_scalar_undistort_points(cam, points)
     if cam.get('type', 'pinhole') != 'pinhole':
         raise ValueError('full-skew inverse geometry supports pinhole cameras only')
@@ -81,7 +81,7 @@ def projection_sensitivity(cam, points):
     Side effects: delegates zero-skew cameras to tracktail's original implementation. The
     normalized-coordinate mask indexes input columns (x and y), not output rows.
     """
-    if not _has_skew(cam):
+    if not has_skew(cam):
         return cube._tailcyclenet_scalar_projection_sensitivity(cam, points)
     if cam.get('type', 'pinhole') != 'pinhole':
         raise ValueError('full-skew projection sensitivity supports pinhole cameras only')

@@ -110,11 +110,7 @@ def _load_annotations(cfg: dict, split: str) -> tuple[dict, dict, list[str], lis
 
 def _nominal_rig(size: tuple[int, int]) -> fmt.Rig:
     """Build the required one-camera nominal calibration for this 2-D source."""
-    from aniposelib.cameras import CameraGroup
-
-    camera = fmt.nominal_camera('cam0', size)
-    return fmt.Rig(CameraGroup([camera]), offset={'cam0': (0.0, 0.0)},
-                   moving={'cam0': False}, calibrated={'cam0': False})
+    return fmt.nominal_rig('cam0', size)
 
 
 def _frame_files(data_dir: Path) -> list[Path]:

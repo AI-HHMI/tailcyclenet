@@ -33,7 +33,7 @@ def test_scorer_shape_draws_are_shared_by_ddp_ordinal():
                                   cfg=LoaderConfig(cams_to_sample=[1, 8]))
     _, shape0, _ = wrapped._streams(17, ordinal=41)
     _, shape1, _ = wrapped._streams(93, ordinal=41)
-    assert PoseDataset._shape(wrapped.base, shape0) == PoseDataset._shape(wrapped.base, shape1)
+    assert PoseDataset.shape(wrapped.base, shape0) == PoseDataset.shape(wrapped.base, shape1)
 
 
 def test_scorer_loader_uses_separate_train_and_validation_workers():

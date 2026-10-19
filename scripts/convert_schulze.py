@@ -29,7 +29,6 @@ import torch
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
-from aniposelib.cameras import CameraGroup
 
 from tailcyclenet import format as fmt
 from tailcyclenet.crop import crop_box_for_points
@@ -156,9 +155,7 @@ def load_skeleton(src: Path, names: list[str]) -> tuple[list[list[str]], list[li
 
 def make_rig(width: int, height: int):
     """Make the nominal one-camera rig required for an uncalibrated 2D session."""
-    cam = fmt.nominal_camera('cam0', (width, height))
-    return fmt.Rig(cgroup=CameraGroup([cam]), offset={'cam0': (0.0, 0.0)},
-                   moving={'cam0': False}, calibrated={'cam0': False})
+    return fmt.nominal_rig('cam0', (width, height))
 
 
 def detect_runs(src: Path, n_video: int, extent_px: float | None) -> list[tuple[int, int]]:

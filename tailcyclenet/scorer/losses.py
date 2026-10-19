@@ -14,14 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-_MASK_KEYS = (
-    'active_mask', 'observed_mask', 'anchor_observed_mask', 'in_view_mask', 'far_mask',
-    'near_mask', 'ambiguous_mask', 'reference_far_mask', 'reference_rejected_mask',
-    'source_frame_weight', 'corruption_type_mask', 'fired_frame', 'fired', 'frames',
-    'good_reference_distance_px', 'bad_reference_distance_px',
-)
-
-
 def _as_tensor(value, device, dtype=None):
     """Convert worker metadata without assuming it was already moved to the model device."""
     if value is None:
@@ -101,9 +93,7 @@ def _triplet_values(scores, precisions, labels):
 
 def signed_pointwise_targets(labels, observed_mask, in_view_mask, anchor_observed_mask,
                              far_mask, near_mask, *, anchor_label=None,
-                             ambiguous_mask=None, reference_rejected_mask=None,
-                             reference_gate='source_far', good_reference_distance_px=None,
-                             max_clean_px=0.0):
+                             ambiguous_mask=None, reference_rejected_mask=None):
     """Construct member-specific signed targets and masks for the direct framewise term.
 
     Returns ``(targets, mask)`` with shape ``[B,T,K,3]``.  Columns are good, bad, anchor; targets
@@ -126,24 +116,12 @@ def signed_pointwise_targets(labels, observed_mask, in_view_mask, anchor_observe
                 else reference_rejected_mask.bool())
     member = observed_mask & in_view_mask & ~rejected & ~ambiguous_mask
 
-    independent = str(reference_gate) == 'independent_far'
-    if independent:
-        if good_reference_distance_px is None:
-            raise ValueError(
-                'independent_far pointwise labels require good_reference_distance_px metadata')
-        good_reference_distance_px = good_reference_distance_px.to(observed_mask.device)
-        good_clean = member & torch.isfinite(good_reference_distance_px)
-        good_clean &= good_reference_distance_px <= float(max_clean_px)
-    else:
-        good_clean = member
-
     targets = torch.zeros((*shape, 3), dtype=torch.float32, device=labels.device)
     mask = torch.zeros_like(targets, dtype=torch.bool)
     targets[..., 0] = 1.0
-    mask[..., 0] = good_clean
+    mask[..., 0] = member
 
-    clean_gate = good_clean if independent else torch.ones_like(member)
-    bad_valid = member & ~ambiguous_mask & clean_gate & (far_mask | near_mask)
+    bad_valid = member & ~ambiguous_mask & (far_mask | near_mask)
     targets[..., 1] = torch.where(far_mask, -torch.ones_like(far_mask, dtype=torch.float32),
                                   torch.ones_like(far_mask, dtype=torch.float32))
     mask[..., 1] = bad_valid
@@ -154,7 +132,7 @@ def signed_pointwise_targets(labels, observed_mask, in_view_mask, anchor_observe
     else:
         a = torch.as_tensor(anchor_label, device=labels.device, dtype=labels.dtype)
         anchor_is_bad = (a < 0).expand(shape)
-    anchor_bad_valid = anc_valid & ~ambiguous_mask & clean_gate & (far_mask | near_mask)
+    anchor_bad_valid = anc_valid & ~ambiguous_mask & (far_mask | near_mask)
     targets[..., 2] = torch.where(
         anchor_is_bad,
         torch.where(far_mask, -torch.ones_like(far_mask, dtype=torch.float32),
@@ -183,7 +161,7 @@ class FrameTripletScorerLoss(nn.Module):
     def __init__(self, margin=0.5, precision_reg_weight=0.01, score_reg_weight=0.0,
                  reduction='mean', pointwise_weight=0.0, pointwise_balance=True,
                  pointwise_label_smoothing=0.0, inactive_consistency_weight=0.0,
-                 anchor_consistency_weight=0.0, triplet_margin=None, max_clean_px=0.0):
+                 anchor_consistency_weight=0.0, triplet_margin=None):
         """Initialize loss weights and the fresh positive pointwise calibration scale."""
         super().__init__()
         if triplet_margin is not None:
@@ -206,7 +184,6 @@ class FrameTripletScorerLoss(nn.Module):
         self.pointwise_label_smoothing = float(pointwise_label_smoothing)
         self.inactive_consistency_weight = float(inactive_consistency_weight)
         self.anchor_consistency_weight = float(anchor_consistency_weight)
-        self.max_clean_px = float(max_clean_px)
         self.pointwise_log_scale = nn.Parameter(torch.zeros(()))
         self.loss_history = defaultdict(list)
         self._totals = defaultdict(float)
@@ -253,14 +230,12 @@ class FrameTripletScorerLoss(nn.Module):
         return source_frame_weights(frames, eligible=eligible, device=device)
 
     def _pointwise_loss(self, scores, labels, *, observed, in_view, anchor_observed,
-                        far, near, ambiguous, rejected, reference_gate,
-                        good_reference, source_weight, anchor_label):
+                        far, near, ambiguous, rejected, source_weight, anchor_label):
         """Compute balanced signed logistic supervision and its diagnostic counts."""
         targets, target_mask = signed_pointwise_targets(
             labels, observed, in_view, anchor_observed, far, near,
             anchor_label=anchor_label, ambiguous_mask=ambiguous,
-            reference_rejected_mask=rejected, reference_gate=reference_gate,
-            good_reference_distance_px=good_reference, max_clean_px=self.max_clean_px)
+            reference_rejected_mask=rejected)
         signed_targets = targets * (1.0 - self.pointwise_label_smoothing)
         losses = F.softplus(-signed_targets * self.pointwise_scale * scores)
         weights = source_weight[..., None].expand_as(losses)
@@ -350,15 +325,6 @@ class FrameTripletScorerLoss(nn.Module):
             trip_meta, source_frame_weight, shape, device, eligible)
         if anchor_label is None:
             anchor_label = self._metadata(trip_meta, 'anchor_label', None)
-        reference_gate = str((trip_meta or {}).get('reference_gate', 'source_far'))
-        good_reference = self._metadata(trip_meta, 'good_reference_distance_px', None)
-        if good_reference is not None:
-            good_reference = _as_tensor(good_reference, device, torch.float32)
-            if good_reference.ndim == 2:
-                good_reference = good_reference.unsqueeze(0)
-            if tuple(good_reference.shape) != shape:
-                raise ValueError(
-                    f'good_reference_distance_px must be {shape}, got {tuple(good_reference.shape)}')
 
         flat_scores = scores.reshape(-1, 3)
         flat_prec = precisions.reshape(-1, 3)
@@ -427,9 +393,7 @@ class FrameTripletScorerLoss(nn.Module):
             pointwise_loss, point_mask, point_counts = self._pointwise_loss(
                 scores, labels, observed=observed, in_view=in_view,
                 anchor_observed=anchor_observed, far=far, near=near,
-                ambiguous=ambiguous, rejected=rejected,
-                reference_gate=reference_gate, good_reference=good_reference,
-                source_weight=weights, anchor_label=anchor_label)
+                ambiguous=ambiguous, rejected=rejected, source_weight=weights, anchor_label=anchor_label)
             pointwise_loss = pointwise_loss * self.pointwise_weight
 
         total = rank_loss + precision_reg + score_reg + inactive_loss + anchor_loss + pointwise_loss

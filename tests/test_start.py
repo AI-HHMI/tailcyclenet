@@ -60,17 +60,20 @@ def no_warm_weights(monkeypatch):
 
 
 def test_no_checkpoint_is_a_fresh_start_with_the_pretrained_backbone(tmp_path):
+    """Also `no_warm_start` (never resolves `checkpoint_path`) and `no_resume` (a
+    `checkpoint_path` warm-starts, nothing else is fresh)."""
     plan = start.plan_start(tmp_path / 'run')
     assert plan.mode == 'fresh' and plan.start_it == 0 and plan.registry is None
     make = _Factory()
     got = start.build_start(plan, make, _cfg())
     assert make.calls == [True], 'only a fresh run needs the VJEPA2 download'
     assert isinstance(got.optimizer, PoseDualOptimizer)
+    assert start.plan_start(tmp_path / 'x', 'org/never-fetched', no_warm_start=True).mode == 'fresh'
 
-
-def test_no_warm_start_ignores_checkpoint_path(tmp_path):
-    plan = start.plan_start(tmp_path / 'run', 'org/never-fetched', no_warm_start=True)
-    assert plan.mode == 'fresh'
+    run = tmp_path / 'run'
+    path = _trained(run)
+    assert start.plan_start(run, str(path), no_resume=True).mode == 'warm'
+    assert start.plan_start(run, no_resume=True).mode == 'fresh'
 
 
 def test_own_folder_resumes_without_resolving_checkpoint_path(tmp_path, monkeypatch):
@@ -210,13 +213,6 @@ def test_optimizer_kind_mismatch(tmp_path):
     assert plan.mode == 'warm' and 'muon' in plan.reason
 
 
-def test_no_resume_makes_checkpoint_path_a_warm_start(tmp_path):
-    run = tmp_path / 'run'
-    path = _trained(run)
-    assert start.plan_start(run, str(path), no_resume=True).mode == 'warm'
-    assert start.plan_start(run, no_resume=True).mode == 'fresh'
-
-
 def test_the_registry_comes_from_the_checkpoint_not_the_run_folder(tmp_path):
     """B10: a lone `.pth`'s own registry keys its identity rows; without one it is refused."""
     path = _trained(tmp_path / 'src')
@@ -233,23 +229,20 @@ def test_the_registry_comes_from_the_checkpoint_not_the_run_folder(tmp_path):
     assert plan.mode == 'warm' and plan.registry is None, 'a base with no keypoint table is fine'
 
 
-def test_training_keys_are_checked_and_freeze_encoder_raises_by_name():
+def test_training_keys_are_checked_and_freeze_encoder_raises_by_name(tmp_path):
     check_training_keys({k: None for k in KNOWN_TRAINING_KEYS})
     with pytest.raises(SystemExit, match='n_iteration'):
         check_training_keys({'n_iteration': 5})
     with pytest.raises(SystemExit, match='freeze_encoder was removed'):
         check_training_keys({'freeze_encoder': True})
-
-
-def test_only_a_missing_val_split_skips_validation(tmp_path):
+    # and only a MISSING val split skips validation (a folder of roots counts any root's)
     root = tmp_path / 'root'
     (root / 'train').mkdir(parents=True)
     assert not has_val_split(root)
     (root / 'val').mkdir()
     assert has_val_split(root)
-    multi = tmp_path / 'multi'
-    (multi / 'a' / 'val').mkdir(parents=True)
-    assert has_val_split(multi)
+    (tmp_path / 'multi' / 'a' / 'val').mkdir(parents=True)
+    assert has_val_split(tmp_path / 'multi')
 
 
 def test_a_resumed_sampler_continues_its_ordinal_on_a_new_stream():

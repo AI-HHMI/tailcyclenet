@@ -151,7 +151,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
         Path(run), checkpoint=checkpoint, device=device)
     if checkpoint_info is not None:
         checkpoint_info['checkpoint_file'] = str(ckpt)
-        checkpoint_data = torch.load(ckpt, map_location='cpu', weights_only=False)
+        checkpoint_data = torch.load(ckpt, map_location='cpu', weights_only=False, mmap=True)
         checkpoint_info['checkpoint_iteration'] = checkpoint_data.get('iteration')
     lc = _loader_config(config)
     if window_offset is not None:

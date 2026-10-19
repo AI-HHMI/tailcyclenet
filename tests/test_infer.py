@@ -56,7 +56,7 @@ def scene(request):
 def multiwindow_scene(request):
     """The same two shapes as `scene`, but T=16 -- SEVERAL windows at n_frames=4/overlap=2
 
-    (`_window_starts(16, 4, 2)` is 7 starts), which `scene`'s T=4 cannot exercise at all (one
+    (`window_starts(16, 4, 2)` is 7 starts), which `scene`'s T=4 cannot exercise at all (one
     window only). This is what a prefetch-ahead pipeline needs to be tested against: with one
     window there is nothing to prefetch and `prefetch_windows` is a no-op by construction.
     """
@@ -774,7 +774,7 @@ def test_carried_prior_is_bounds_masked_and_dated():
     """The two defects in the deployed prompt, both of which were silent.
 
     `prompt_time = 0` is right for interior windows and wrong on the last window of a group, which
-    `_window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
+    `window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
     was handed in as a confident prior instead of as "I was not told".
     """
     from tailcyclenet.infer import _build_prior
@@ -1890,7 +1890,7 @@ def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path
 # so every one of these runs on the existing session fixtures and needs no video at all.
 
 def _range_scene(tmp_path, T=16):
-    """A 2D session long enough for several windows -- `_window_starts(16, 4, 2)` is 7 starts."""
+    """A 2D session long enough for several windows -- `window_starts(16, 4, 2)` is 7 starts."""
     import conftest as cf
 
     cf._session_2d(tmp_path / 'rat' / 'test' / 's', T=T)
@@ -1907,7 +1907,7 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
     range equals the whole-clip slice wherever the two runs put the SAME window over the SAME
     frames.
 
-    **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `_window_starts`
+    **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `window_starts`
     pulls the LAST window back to end exactly on the last frame, so a range ending at `b` has a
     final window `[b - T, b)` -- not a whole-clip window unless `b` is the clip end. A frame
     belongs to the last window containing it, so the few frames after the range's final start were

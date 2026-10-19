@@ -17,6 +17,7 @@ from einops import einsum, rearrange, repeat
 from tracktail.model.cube import from_homogeneous, to_homogeneous, undistort_points
 from tracktail.model.tracker_encoder import TrackerEncoder
 
+from .dataset import prior_out_of_bounds
 from .query_encoder import BOX_ENCODERS, BOX_MODES, WideQueryEncoder
 
 QUERY_MODES = ('prior', 'none')
@@ -639,3 +640,21 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
     return cls(n_keypoints=n_keypoints, query=query, query_encoder=enc,
                gridresid_offset=offset, query_terms=query_terms,
                box_prompt=box_prompt, **cfg, **extra)
+
+
+def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_prompt=None):
+    """Re-query at the model's own frame-0 prediction -- the label-free prompted regime.
+
+    `first` is a completed prior-free pass; its frame-0 pose becomes the prior for a second pass,
+    already in the model's own frame (the pose is `(1,K,R)`). It gets the same bounds mask
+    `carry` gets: a keypoint outside its own crop is NaN, which is what the no-query tokens key
+    off. The box prompt carries into the second pass unchanged: the window has not moved. Shared
+    with the trainer so training and inference report the same number.
+    """
+    p = first['coords_pred'][0].detach()
+    prior = p[0][None].clone()
+    prior[0, prior_out_of_bounds(prior[0], mode, cgroup)] = float('nan')
+    qt = torch.zeros(prior.shape[:2], dtype=torch.int32, device=prior.device)
+    mkw = {} if box_prompt is None else {'box_prompt': box_prompt}
+    return model(views, kpt_ids, cgroup, mode=mode, kpt_prior=prior, prompt_time=qt,
+                 kpt_chunk=kpt_chunk, **mkw)

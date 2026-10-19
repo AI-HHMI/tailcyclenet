@@ -28,7 +28,7 @@ from tailcyclenet.crop import crop_box_for_points
 from tailcyclenet.detector import detect_raw, load_detector
 from tailcyclenet.detector.assign import box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
-from tailcyclenet.infer.driver import _detector_box_source
+from tailcyclenet.infer.driver import detector_box_source
 from tracktail.model.cube import project_points_torch
 
 
@@ -173,7 +173,7 @@ def main():
                            frames=frames, iou_thresh=args.nms_iou,
                            center_dist_thresh=args.nms_center_dist,
                            trace=trace, trace_detail=True,
-                           box_source=_detector_box_source(model, ds_name, box_source))
+                           box_source=detector_box_source(model, ds_name, box_source))
                 counts = {reason: 0 for reason in REASONS}
                 by_camera = {}
                 n_gt = 0

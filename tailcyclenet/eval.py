@@ -16,7 +16,7 @@ import numpy as np
 
 from tailcyclenet.format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.infer.predictions import load_predictions
-from tailcyclenet.metrics import (ERR_PCTS, _per_frame_means, error_and_coverage, idf1,
+from tailcyclenet.metrics import (ERR_PCTS, per_frame_means, error_and_coverage, idf1,
                                   idf1_from_state, idf1_merge, idsw_stability_band,
                                   match_instances, matched_error, mota, motion_ratio,
                                   paired_bootstrap, pck)
@@ -650,7 +650,7 @@ def _shared_error(a, b):
     db = np.linalg.norm(pb[ok] - true[ok], axis=-1)
     fa = np.where(ok, np.linalg.norm(pa - true, axis=-1), np.nan)
     fb = np.where(ok, np.linalg.norm(pb - true, axis=-1), np.nan)
-    ma, mb = _per_frame_means(fa), _per_frame_means(fb)
+    ma, mb = per_frame_means(fa), per_frame_means(fb)
     keep = np.isfinite(ma) & np.isfinite(mb)
     return (float(da.mean()), float(db.mean()), int(ok.sum()), n_lab,
             float(ma[keep].mean()) if keep.any() else float('nan'),

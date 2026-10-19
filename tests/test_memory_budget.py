@@ -598,17 +598,17 @@ def test_plan_windows_refuses_when_one_window_does_not_fit():
 
 def test_plan_windows_returns_starts_blocks_cam_decode_when_it_fits():
     """The non-refusal path: a budget generous enough for the whole clip in one block, and the
-    window starts match `_window_starts` exactly (this is its own pure prefix, not a re-derivation
+    window starts match `window_starts` exactly (this is its own pure prefix, not a re-derivation
     that could drift from it).
     """
-    from tailcyclenet.infer.window import _plan_windows, _window_starts
+    from tailcyclenet.infer.window import _plan_windows, window_starts
     from tailcyclenet.memory import Budget
 
     roomy = Budget(limit_gb=64.0, available_gb=64.0, budget_gb=64.0, source='test', stated=True)
     starts, blocks, cam_decode, pipeline_det = _plan_windows(
         'sess', 'g000', [(64, 64)], n_frames=12, overlap=4, T_total=100, frame_start=0,
         budget=roomy)
-    assert starts == _window_starts(100, 12, 4, start=0)
+    assert starts == window_starts(100, 12, 4, start=0)
     assert blocks and blocks[0][0] == 0 and blocks[-1][1] == len(starts)
     assert cam_decode >= 1
     assert isinstance(pipeline_det, bool)

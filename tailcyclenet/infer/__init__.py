@@ -24,20 +24,19 @@ _LAZY_EXPORTS = {
     'merge_blocks': ('.window', 'merge_blocks'),
     'run_blocks': ('.window', 'run_blocks'),
     'run_group': ('.window', 'run_group'),
-    'self_prompt': ('.window', 'self_prompt'),
     '_build_prior': ('.window', '_build_prior'),
     '_corrupt_prior': ('.window', '_corrupt_prior'),
     '_crop_views': ('.window', '_crop_views'),
     '_deploy_box_prompt': ('.window', '_deploy_box_prompt'),
-    '_window_starts': ('.window', '_window_starts'),
+    'window_starts': ('.window', 'window_starts'),
 }
 
 # Keep the historical order: callers may use __all__ as part of the public surface.
 __all__ = [
     'ANCHORS', 'CARRY_SOURCES', 'ORACLE_CORRUPTIONS', 'OUTCOMES', 'FrameStore',
-    'InferConfig', 'boxes_from_points', 'merge_blocks', 'run_blocks', 'run_group', 'self_prompt',
+    'InferConfig', 'boxes_from_points', 'merge_blocks', 'run_blocks', 'run_group',
     'run_dataset', 'build_parser', 'main', '_build_prior', '_corrupt_prior', '_crop_views',
-    '_deploy_box_prompt', '_window_starts',
+    '_deploy_box_prompt', 'window_starts',
 ]
 
 # These package submodules were exposed as attributes as a side effect of the old eager imports.

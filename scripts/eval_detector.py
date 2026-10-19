@@ -24,7 +24,7 @@ from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.detector import BoxDataset, load_detector
 from tailcyclenet.detector.evaluate import deployment_score, score_dataset, score_fixed_views
 from tailcyclenet.format import load_datasets
-from tailcyclenet.infer.driver import _detector_box_source
+from tailcyclenet.infer.driver import detector_box_source
 from tailcyclenet.metrics import paired_bootstrap
 
 
@@ -374,7 +374,7 @@ def main_deploy(args, device):
     sessions = ds.sessions.get(args.split, [])
     if not sessions:
         raise SystemExit(f'{args.data}: no {args.split!r} split')
-    trained_on = _detector_box_source(model, ds.name, trained_on)
+    trained_on = detector_box_source(model, ds.name, trained_on)
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={trained_on}  '
           f'track={args.deploy_track} link={args.link_boxes}  det_score={args.score_thresh}\n')

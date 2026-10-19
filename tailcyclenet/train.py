@@ -332,7 +332,7 @@ def evaluate(model, batches, optimizer, device, fabric=None):
     """
     from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
 
-    from tailcyclenet.infer import self_prompt
+    from tailcyclenet.model import self_prompt
     from tailcyclenet.model import share_scene
 
     model.eval()

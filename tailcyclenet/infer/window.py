@@ -22,6 +22,7 @@ from tracktail.model.cube import project_points_torch
 from .. import crop as cropmod
 from .. import memory
 from ..dataset import _crop_affine, _resize_camera, prior_out_of_bounds
+from ..model import self_prompt
 from ..format import Labels, Session
 from ..model import share_scene
 from .store import FrameStore
@@ -118,19 +119,20 @@ class InferConfig:
     capture_window_predictions: bool = False
 
 
-def _window_starts(n_frames: int, T: int, overlap: int, start: int = 0):
-    """Contiguous windows covering [start, start + n_frames), stepping by T - overlap.
+def window_starts(span: int, window: int, overlap: int, start: int = 0):
+    """Starts of `window`-frame windows covering [start, start + span), stepping by
+    `window - overlap`.
 
     The last window is pulled back to end at the last frame rather than padded, so no frame is
     predicted from duplicated pixels. `start` and the returned starts are SOURCE indices; at the
     default 0 the values are what they always were, so an unset range is byte-identical.
     """
-    step = max(1, T - overlap)
-    if n_frames <= T:
+    step = max(1, window - overlap)
+    if span <= window:
         return [start]
-    starts = list(range(start, start + n_frames - T + 1, step))
-    if starts[-1] + T < start + n_frames:
-        starts.append(start + n_frames - T)
+    starts = list(range(start, start + span - window + 1, step))
+    if starts[-1] + window < start + span:
+        starts.append(start + span - window)
     return starts
 
 
@@ -245,24 +247,6 @@ def _crop_views(imgs, box, target_size):
     return torch.from_numpy(np.asarray(out))[None]
 
 
-def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_prompt=None):
-    """Re-query at the model's own frame-0 prediction -- the label-free prompted regime.
-
-    `first` is a completed prior-free pass; its frame-0 pose becomes the prior for a second pass,
-    already in the model's own frame (the pose is `(1,K,R)`). It gets the same bounds mask
-    `carry` gets: a keypoint outside its own crop is NaN, which is what the no-query tokens key
-    off. The box prompt carries into the second pass unchanged: the window has not moved. Shared
-    with the trainer so training and inference report the same number.
-    """
-    p = first['coords_pred'][0].detach()
-    prior = p[0][None].clone()
-    prior[0, prior_out_of_bounds(prior[0], mode, cgroup)] = float('nan')
-    qt = torch.zeros(prior.shape[:2], dtype=torch.int32, device=prior.device)
-    mkw = {} if box_prompt is None else {'box_prompt': box_prompt}
-    return model(views, kpt_ids, cgroup, mode=mode, kpt_prior=prior, prompt_time=qt,
-                 kpt_chunk=kpt_chunk, **mkw)
-
-
 def _plan_blocks(starts, n_frames, T_total, frame_cost, store_bytes):
     """Group the windows into blocks whose frames fit the store at once -> [(w0, w1), ...].
 
@@ -296,7 +280,7 @@ def _plan_windows(session_id, gid, cam_sizes, n_frames, overlap, T_total, frame_
     Side effects: none. Never allocates, decodes, or opens a container -- this only does
     arithmetic on sizes already known from parsed config and the rig.
     """
-    starts = _window_starts(T_total - frame_start, n_frames, overlap, start=frame_start)
+    starts = window_starts(T_total - frame_start, n_frames, overlap, start=frame_start)
     _frame_bytes = max(int(w) * int(h) for w, h in cam_sizes) * 3
     _frame_cost = len(cam_sizes) * _frame_bytes
     _budget = memory.current() if budget is None else budget

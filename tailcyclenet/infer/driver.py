@@ -69,7 +69,7 @@ def _detector_matches_source(trained_datasets, trained_on, ds_name):
                 and _dataset_family(trained_on) == _dataset_family(ds_name))
 
 
-def _detector_box_source(det, ds_name, default):
+def detector_box_source(det, ds_name, default):
     """Effective detector target for this source root, with a unique-family fallback."""
     by_root = getattr(det, 'box_sources', {}) or {}
     if ds_name in by_root:
@@ -669,7 +669,7 @@ def run_dataset(args):
                   'sweep --det-score per checkpoint (the 0.01 default favours recall; raising '
                   'it was measured to cost coverage).', flush=True)
         trained_datasets = list(getattr(det, 'trained_datasets', []) or ([det_ds] if det_ds else []))
-        det_boxsrc = _detector_box_source(det, ds_name, det_boxsrc)
+        det_boxsrc = detector_box_source(det, ds_name, det_boxsrc)
         trained_label = (trained_datasets[0] if len(trained_datasets) == 1 else
                          (', '.join(trained_datasets) if trained_datasets else det_ds))
         print(f'detector: {det_path} ({det_wh[0]}x{det_wh[1]}'

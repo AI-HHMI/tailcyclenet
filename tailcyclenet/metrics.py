@@ -58,7 +58,7 @@ def _frame_stats(frame_means) -> dict:
             'frame_sum': float(fm[ok].sum()), 'frame_n': int(ok.sum())}
 
 
-def _per_frame_means(d):
+def per_frame_means(d):
     """Mean matched distance per frame. `d` is `(..., T, K)`; the frame axis is -2.
 
     A frame that matched nothing is an all-NaN slice, which `nanmean` answers with NaN and a
@@ -88,7 +88,7 @@ def error_and_coverage(pred, true) -> dict:
         'err': float(np.nanmean(d)) if matched.any() else float('nan'),
         'median': float(np.nanmedian(d)) if matched.any() else float('nan'),
         **_err_pcts(d),
-        **_frame_stats(_per_frame_means(d)),
+        **_frame_stats(per_frame_means(d)),
         'n_true': n_true,
         'n_matched': int(matched.sum()),
         'coverage': float(matched.sum() / n_true) if n_true else float('nan'),

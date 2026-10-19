@@ -351,7 +351,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",
     which does not predict the box path's real cost: current-generation checkpoints read val r@.5
     0.91-0.93 and IoU 0.79 while costing 43% of pose coverage and +25 px MPJPE. This runs the SAME
-    functions deployment does -- `detect_raw` then `associate_group`, and `infer._window_starts`
+    functions deployment does -- `detect_raw` then `associate_group`, and `infer.window.window_starts`
     for the window rule `run_group` uses -- over a whole test group, and reports what a pose
     window actually gets:
 
@@ -363,7 +363,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                        animal" from "association dropped a detection it had".
         window_miss    fraction of (row, window) with fewer than `min_box_frames` finite boxes
                        anywhere in the window -- the EXACT quantity `infer.run_group` marks
-                       `no box`, using its own `_window_starts` rule.
+                       `no box`, using its own `window_starts` rule.
         union_side_px  quantiles of each window's per-camera UNION box side (SOURCE px), the
                        crop-inflation number `--refine` exists to survive.
         gt_side_px     quantiles of the crop-RULE box side over this group's own labels, as an
@@ -377,7 +377,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     """
     from . import detect_raw
     from . import associate_group as _associate_group
-    from ..infer import _window_starts
+    from ..infer.window import window_starts
 
     n_animals = max_animals or max(1, len(sess.labels(gid).animal_ids))
     raw = detect_raw(model, input_wh, sess, gid, top_k=max(top_k, n_animals), device=device,
@@ -393,7 +393,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     S, T, C = sc.shape
     slot_fill = float(np.isfinite(sc).mean())
 
-    starts = _window_starts(T, n_frames, overlap)
+    starts = window_starts(T, n_frames, overlap)
     miss, union_sides = [], []
     for a in range(S):
         for st in starts:

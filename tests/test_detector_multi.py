@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tailcyclenet.detector import load_detector
-from tailcyclenet.infer.driver import (_detector_box_source, _detector_matches_source)
+from tailcyclenet.infer.driver import (detector_box_source, _detector_matches_source)
 from tailcyclenet.format import load_datasets
 from tailcyclenet.train_detector import input_wh_for_roots
 
@@ -108,9 +108,9 @@ def test_multi_root_detector_inference_guard_and_box_source_resolution():
                        'johnson-mouse-combined-aug': 'keypoints'}
 
     detector = Detector()
-    assert _detector_box_source(detector, 'allen-mouse-combined', 'keypoints') == 'instances'
-    assert _detector_box_source(detector, 'johnson-mouse-annotated', 'instances') == 'keypoints'
-    assert _detector_box_source(detector, 'rat-city', 'keypoints') == 'keypoints'
+    assert detector_box_source(detector, 'allen-mouse-combined', 'keypoints') == 'instances'
+    assert detector_box_source(detector, 'johnson-mouse-annotated', 'instances') == 'keypoints'
+    assert detector_box_source(detector, 'rat-city', 'keypoints') == 'keypoints'
 
 
 def test_multi_root_training_explicitly_refuses_keypoints(tiny_root, tmp_path, monkeypatch):

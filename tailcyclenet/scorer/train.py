@@ -41,6 +41,7 @@ from ..train import _gpu_peak_gb, build_optimizer, init_wandb, log
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer, flatten_sequence_triplet
+from .qc import refuse_deleted_data_keys
 from .triplet import SEGMENT_TYPES, seed_worker
 
 SCORER_HEAD_KEYS = ('pool_num_heads', 'score_hidden', 'use_precision', 'output_granularity')
@@ -283,6 +284,7 @@ def loader_config(data_cfg: dict, model_cfg: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming the unknown keys.
     """
+    refuse_deleted_data_keys(data_cfg)
     known = set(LoaderConfig.__dataclass_fields__) | {
         'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
     unknown = set(data_cfg) - known

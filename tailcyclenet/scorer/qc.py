@@ -28,6 +28,24 @@ if TYPE_CHECKING:
     from ..dataset import LoaderConfig
 
 
+DELETED_DATA_KEYS = {
+    'val_offset': 'the scorer window-offset lever is deleted: report 60 measured that offsetting '
+                  'the window lattice does not make the scorer catch more errors',
+}
+
+
+def refuse_deleted_data_keys(data_cfg: dict) -> None:
+    """Refuse a deleted `[data]` key by name, with the reason it was deleted.
+
+    Inputs: data_cfg -- a `[data]` block.
+    Outputs: None.
+    Side effects: raises SystemExit naming the first deleted key present.
+    """
+    for key, why in DELETED_DATA_KEYS.items():
+        if key in data_cfg:
+            raise SystemExit(f'[data].{key} is deleted: {why}')
+
+
 def _loader_config(config: dict) -> LoaderConfig:
     """The run's `[data]` block as a `LoaderConfig`, with the box forced off.
 
@@ -38,6 +56,7 @@ def _loader_config(config: dict) -> LoaderConfig:
     from ..dataset import LoaderConfig
 
     data_cfg = dict(config.get('data', {}))
+    refuse_deleted_data_keys(data_cfg)
     known = set(LoaderConfig.__dataclass_fields__) | {
         'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
     unknown = set(data_cfg) - known
@@ -121,8 +140,7 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
 
 
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
-               window_offset: int | None = None, val_stride: int | None = None,
-               spans: dict | None = None, coverage: list[dict] | None = None, *,
+               val_stride: int | None = None, spans: dict | None = None, coverage: list[dict] | None = None, *,
                checkpoint_info: dict | None = None, checkpoint: str | None = None,
                session: str | None = None, start: int | None = None,
                stop: int | None = None) -> tuple:
@@ -131,8 +149,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
             device -- where to run the model; limit -- stop after this many windows (a long clip
             is thousands of them, and a first look must not need the whole split);
-            window_offset -- shift the window lattice by this many frames, so the scorer judges a
-            track under a framing other than the one that produced it; val_stride -- window
+            val_stride -- window
             spacing, defaulting to the run's `n_frames` (non-overlapping); session -- score only
             the exact session id; start/stop -- zero-based half-open positions in the resulting
             window index (after session and span filtering); spans -- restrict
@@ -154,8 +171,6 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
         checkpoint_data = torch.load(ckpt, map_location='cpu', weights_only=False, mmap=True)
         checkpoint_info['checkpoint_iteration'] = checkpoint_data.get('iteration')
     lc = _loader_config(config)
-    if window_offset is not None:
-        lc = replace(lc, val_offset=int(window_offset))
     if val_stride is not None:
         lc = replace(lc, val_stride=int(val_stride))
     dataset_cls = PoseDataset
@@ -178,7 +193,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             raise SystemExit(
                 'no window starts inside the given spans, so there is nothing to score: check '
                 'the session/group/animal keys, and that span_start is a WINDOW start (a multiple '
-                'of the run n_frames, plus --window-offset)')
+                'of the run n_frames)')
         where = [i for i in where if i in span_where]
         print(f'{len(where)} windows remain inside the requested spans')
     if start is not None or stop is not None:
@@ -456,8 +471,7 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
                   checkpoint_iteration: int | None = None,
                   output_granularity: str | None = None,
                   session: str | None = None, start: int | None = None,
-                  stop: int | None = None, window_offset: int | None = None,
-                  val_stride: int | None = None) -> None:
+                  stop: int | None = None, val_stride: int | None = None) -> None:
     """Write mode-aware QC tables, report, provenance, and optional coverage.
 
     Framewise ``table`` is the raw contextual window table returned by :func:`score_root`.  It is
@@ -515,8 +529,6 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         output_provenance['window_start_index'] = int(start)
     if stop is not None:
         output_provenance['window_stop_index'] = int(stop)
-    if window_offset is not None:
-        output_provenance['window_offset'] = int(window_offset)
     if val_stride is not None:
         output_provenance['val_stride'] = int(val_stride)
     (out / 'provenance.toml').write_text(toml.dumps(output_provenance))

@@ -382,3 +382,21 @@ def test_score_session_help_requires_explicit_best_checkpoint(capsys):
     assert '--session' in help_text
     assert '--start' in help_text
     assert '--stop' in help_text
+
+
+def test_the_deleted_window_offset_flag_is_refused_by_name():
+    """`--window-offset` was refuted (report 60): the CLI names it and says why, before loading."""
+    from tailcyclenet.scorer.score import main
+
+    with pytest.raises(SystemExit, match='--window-offset is deleted'):
+        main(['--run', 'r', '--data', 'd', '--out', 'o', '--window-offset', '4'])
+
+
+def test_the_deleted_val_offset_data_key_is_refused_by_name():
+    """A run config carrying `[data].val_offset` is refused naming the key, not run unshifted."""
+    from tailcyclenet.scorer.train import loader_config
+
+    with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
+        qc._loader_config({'data': {'val_offset': 3}})
+    with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
+        loader_config({'val_offset': 3}, {})

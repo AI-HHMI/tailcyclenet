@@ -413,3 +413,38 @@ def _scorer(n_keypoints, **over):
     cfg = {**SMALL, 'box_prompt': 'film', 'video_encoder_pretrained': False, **over}
     cfg.pop('query_encoder', None)
     return build_scorer(cfg, n_keypoints, **SCORER_KW)
+
+
+SKEW_RIG3 = [(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)]
+
+
+def _skew_rig(specs):
+    """A rig whose cameras sit at their own tilt and height, so rays through different points
+    are skew. specs entries are (rvec_x, rvec_y, tvec_y) -> a tracktail camera group."""
+    from aniposelib.cameras import Camera, CameraGroup
+
+    cams = []
+    for i, (rx, ry, ty) in enumerate(specs):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([rx, ry, 0.0]),
+                     tvec=np.array([0.0, ty, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    return fmt.Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+                   moving=dict.fromkeys(names, False),
+                   calibrated=dict.fromkeys(names, True)).tracktail()
+
+
+def _jittered_boxes(cg, worlds, side=100.0, jitter=None):
+    """Square boxes around each world point's projection, per camera (+ optional pixel jitter)."""
+    from tailcyclenet.infer.track import _project
+
+    out = []
+    for c, cam in enumerate(cg):
+        uv = _project(cam, np.asarray(worlds, np.float32))
+        if jitter is not None:
+            uv = uv + torch.as_tensor(jitter[c], dtype=torch.float32)
+        out.append(torch.stack([uv[:, 0] - side / 2, uv[:, 1] - side / 2,
+                                uv[:, 0] + side / 2, uv[:, 1] + side / 2], -1))
+    return out

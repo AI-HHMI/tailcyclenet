@@ -3,7 +3,8 @@ import numpy as np
 import torch
 
 from tailcyclenet.detector.boxes import box_iou
-from tests.helpers import _flat_rig, _lever_boxes, _session_2d, _session_3d
+from tests.helpers import (SKEW_RIG3, _flat_rig, _jittered_boxes, _lever_boxes, _session_2d,
+                           _session_3d, _skew_rig)
 
 
 def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
@@ -273,3 +274,109 @@ def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path
     associate_group(raw, ranged, 'g000', 1, track=True, frame_base=6)
     assert ranged.frames == [6, 7, 8, 9], \
         "a moving rig's extrinsics must be fetched at SOURCE frames, not batch-local ones"
+
+
+# --- Phase 8 levers (each a switch whose default is the shipped behaviour) ---
+
+def _p8_scene(side):
+    """Three animals, jittered centres (so residuals are non-zero), equal box sides."""
+    cg = _skew_rig(SKEW_RIG3)
+    worlds = [[0.0, 0.0, 0.0], [150.0, 0.0, 0.0], [0.0, 150.0, 30.0]]
+    rng = np.random.default_rng(0)
+    jitter = [rng.normal(0, 6.0, (3, 2)) for _ in cg]
+    return cg, _jittered_boxes(cg, worlds, side, jitter)
+
+
+def _p8_key(groups):
+    return [(sorted(g['members'].items()), round(g['residual'], 6)) for g in groups]
+
+
+def test_sides_gate_equals_pixel_gate_when_every_box_has_one_side():
+    """With every box the same side s, a gate of g sides IS a gate of g*s pixels: the same
+    groups, in the same order, with residuals scaled by 1/s."""
+    from tailcyclenet.infer.associate import associate
+
+    side = 80.0
+    cg, boxes = _p8_scene(side)
+    for px in (5.0, 12.0, 30.0):
+        a = associate(cg, boxes, max_res_px=px)
+        b = associate(cg, boxes, max_res_px=999.0, max_res_sides=px / side)
+        assert [sorted(g['members'].items()) for g in a] == \
+            [sorted(g['members'].items()) for g in b]
+        np.testing.assert_allclose([g['residual'] / side for g in a],
+                                   [g['residual'] for g in b], rtol=1e-5)
+
+
+def test_sides_gate_is_scale_free():
+    """A pixel gate that accepts a small-box rig rejects the same geometry at twice the image
+    scale; the box-side gate reads both the same."""
+    from tailcyclenet.infer.associate import associate
+
+    cg, small = _p8_scene(60.0)
+    n_px = len(associate(cg, small, max_res_px=10.0))
+    n_sides = len(associate(cg, small, max_res_sides=10.0 / 60.0))
+    assert n_px == n_sides
+    # half the box side at the same residual: the side gate tightens, the pixel gate cannot see it
+    _, tiny = _p8_scene(30.0)
+    assert len(associate(cg, tiny, max_res_px=10.0)) == n_px
+    assert len(associate(cg, tiny, max_res_sides=10.0 / 60.0)) <= n_px
+
+
+def test_default_associate_is_unchanged_by_the_new_keywords():
+    from tailcyclenet.infer.associate import associate
+
+    cg, boxes = _p8_scene(80.0)
+    scores = [torch.rand(len(b), generator=torch.Generator().manual_seed(1)) for b in boxes]
+    assert _p8_key(associate(cg, boxes)) == _p8_key(associate(cg, boxes, scores_per_cam=scores))
+
+
+def test_score_order_prefers_the_stronger_pair_over_the_lower_residual():
+    """Two cameras, one animal, camera 1 double-fires: an exact weak box and a 6 px-off strong
+    box. Support ties (no third camera), so the default takes the lower residual and the
+    objectness order takes the stronger box."""
+    from tailcyclenet.infer.associate import associate
+
+    cg = _skew_rig(SKEW_RIG3[:2])
+    b0, b1 = _jittered_boxes(cg, [[0.0, 0.0, 0.0]])
+    off = b1 + torch.tensor([6.0, 0.0, 6.0, 0.0])
+    boxes = [b0, torch.cat([b1, off])]
+    scores = [torch.tensor([0.9]), torch.tensor([0.1, 0.9])]
+    plain = associate(cg, boxes, scores_per_cam=scores)
+    ordered = associate(cg, boxes, scores_per_cam=scores, score_order=True)
+    assert plain[0]['members'] == {0: 0, 1: 0}
+    assert ordered[0]['members'] == {0: 0, 1: 1}
+
+
+def test_score_order_needs_scores():
+    import pytest
+
+    from tailcyclenet.infer.associate import associate
+
+    cg, boxes = _p8_scene(80.0)
+    with pytest.raises(ValueError, match='scores_per_cam'):
+        associate(cg, boxes, score_order=True)
+
+
+def test_fast_associate_is_identical_to_the_reference():
+    """TR7: `fast=True` returns the same groups, bit for bit (points, residuals, members), under
+    every gate and order switch, on crowded jittered scenes with double-fires and NaN boxes."""
+    from tailcyclenet.infer.associate import associate
+
+    cg = _skew_rig(SKEW_RIG3 + [(0.1, 0.3, 40.0)])
+    rng = np.random.default_rng(3)
+    for trial in range(6):
+        W = rng.uniform(-200, 200, (8, 3))
+        boxes = _jittered_boxes(cg, W, 100.0, [rng.normal(0, 8, (8, 2)) for _ in cg])
+        boxes = [torch.cat([b, b[:2] + 7.0]) for b in boxes]
+        boxes[trial % 4][1] = float('nan')
+        scores = [torch.as_tensor(rng.uniform(0, 1, len(b)), dtype=torch.float32)
+                  for b in boxes]
+        for kw in ({}, {'max_res_sides': 0.2}, {'score_order': True}, {'min_views': 1},
+                   {'max_instances': 3}):
+            ref = associate(cg, boxes, scores_per_cam=scores, **kw)
+            got = associate(cg, boxes, scores_per_cam=scores, fast=True, **kw)
+            assert len(ref) == len(got)
+            for g, h in zip(ref, got):
+                assert g['members'] == h['members'] and g['residual'] == h['residual']
+                assert torch.equal(torch.nan_to_num(g['point'], nan=1e30),
+                                   torch.nan_to_num(h['point'], nan=1e30))

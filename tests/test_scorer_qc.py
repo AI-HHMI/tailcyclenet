@@ -393,9 +393,11 @@ def test_the_deleted_window_offset_flag_is_refused_by_name():
 
 
 def test_the_deleted_val_offset_data_key_is_refused_by_name():
-    """A run config carrying `[data].val_offset` is refused naming the key, not run unshifted."""
+    """A nonzero `[data].val_offset` is refused naming the key; the inert 0 still loads."""
     from tailcyclenet.scorer.train import loader_config
 
+    assert loader_config({'val_offset': 0}, {}).val_stride == 0
+    assert qc._loader_config({'data': {'val_offset': 0}}).val_stride == 0
     with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
         qc._loader_config({'data': {'val_offset': 3}})
     with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):

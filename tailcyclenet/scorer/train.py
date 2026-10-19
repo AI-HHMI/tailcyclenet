@@ -81,13 +81,14 @@ def resolve_selection_metric(config: dict, output_granularity: str) -> str:
 
 _ALIAS = 'a duplicate spelling no config or run folder ever used; set '
 DELETED_CORRUPTION_KEYS = {
-    'sequence_far_gate': 'no run folder ever enabled it; frame mode is the gated scorer, and '
-                         'sequence mode keeps its ungated legacy loss',
-    'reference_margin_px': 'it only parameterised the deleted reference_gate = "independent_far"',
-    'n_segments': _ALIAS + 'segment_count',
-    'segment_length_frames': _ALIAS + 'segment_len_frames',
-    'segment_full_window_share': _ALIAS + 'full_window_share',
-    'segment_full_window_prob': _ALIAS + 'full_window_share',
+    'sequence_far_gate': (False, 'no run folder ever enabled it; frame mode is the gated scorer, '
+                                 'and sequence mode keeps its ungated legacy loss'),
+    'reference_margin_px': (0.0, 'it only parameterised the deleted reference_gate = '
+                                 '"independent_far"'),
+    'n_segments': (1, _ALIAS + 'segment_count'),
+    'segment_length_frames': ([1, 1], _ALIAS + 'segment_len_frames'),
+    'segment_full_window_share': (0.0, _ALIAS + 'full_window_share'),
+    'segment_full_window_prob': (0.0, _ALIAS + 'full_window_share'),
 }
 
 
@@ -113,9 +114,10 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         raise SystemExit(f'[scorer].output_granularity must be one of '
                          f'{SCORER_OUTPUT_GRANULARITIES}, got {mode!r}')
     corr = dict(scorer.get('corruption', {}))
-    for key, why in DELETED_CORRUPTION_KEYS.items():
-        if key in corr:
-            raise SystemExit(f'[scorer.corruption].{key} is deleted: {why}')
+    for key, (inert, why) in DELETED_CORRUPTION_KEYS.items():
+        if key in corr and corr.pop(key) != inert:
+            raise SystemExit(f'[scorer.corruption].{key} is deleted: {why}; only its inert '
+                             f'value {inert!r} is still accepted')
     if 'output_granularity' in corr and str(corr['output_granularity']).lower() != mode:
         raise SystemExit(
             '[scorer.corruption].output_granularity must match '
@@ -261,6 +263,7 @@ def loader_config(data_cfg: dict, model_cfg: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming the unknown keys.
     """
+    data_cfg = dict(data_cfg)
     refuse_deleted_data_keys(data_cfg)
     known = set(LoaderConfig.__dataclass_fields__) | {
         'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}

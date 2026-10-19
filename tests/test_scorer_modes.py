@@ -95,13 +95,15 @@ def test_scorer_window_length_may_differ_from_model_stride():
     assert validate_scorer_config(config) == 'sequence'
 
 
-@pytest.mark.parametrize('key, value', [
-    ('sequence_far_gate', False), ('reference_margin_px', 0.0), ('n_segments', 1),
-    ('segment_length_frames', [2, 6]), ('segment_full_window_share', 0.1),
-    ('segment_full_window_prob', 0.1)])
-def test_a_deleted_corruption_key_is_refused_by_name(key, value):
-    """Deleted `[scorer.corruption]` keys raise naming themselves, whatever value they carry."""
-    config = {'scorer': {'output_granularity': 'frame', 'corruption': {key: value}}}
+@pytest.mark.parametrize('key, inert, live', [
+    ('sequence_far_gate', False, True), ('reference_margin_px', 0.0, 2.0),
+    ('n_segments', 1, [1, 2]), ('segment_length_frames', [1, 1], [2, 6]),
+    ('segment_full_window_share', 0.0, 0.1), ('segment_full_window_prob', 0.0, 0.1)])
+def test_a_deleted_corruption_key_is_refused_by_name_unless_inert(key, inert, live):
+    """A deleted key at its inert value (an old run folder's config) loads; any other raises."""
+    config = {'scorer': {'output_granularity': 'frame', 'corruption': {key: inert}}}
+    assert validate_scorer_config(config) == 'frame'
+    config['scorer']['corruption'][key] = live
     with pytest.raises(SystemExit, match=rf'\[scorer\.corruption\]\.{key} is deleted'):
         validate_scorer_config(config)
 

@@ -29,21 +29,24 @@ if TYPE_CHECKING:
 
 
 DELETED_DATA_KEYS = {
-    'val_offset': 'the scorer window-offset lever is deleted: report 60 measured that offsetting '
-                  'the window lattice does not make the scorer catch more errors',
+    'val_offset': (0, 'the scorer window-offset lever is deleted: report 60 measured that offsetting '
+                  'the window lattice does not make the scorer catch more errors'),
 }
 
 
 def refuse_deleted_data_keys(data_cfg: dict) -> None:
     """Refuse a deleted `[data]` key by name, with the reason it was deleted.
 
-    Inputs: data_cfg -- a `[data]` block.
+    Its inert value is accepted and removed, so an old run folder's config still loads.
+
+    Inputs: data_cfg -- a `[data]` block, edited in place.
     Outputs: None.
-    Side effects: raises SystemExit naming the first deleted key present.
+    Side effects: pops inert deleted keys; raises SystemExit naming a deleted key set otherwise.
     """
-    for key, why in DELETED_DATA_KEYS.items():
-        if key in data_cfg:
-            raise SystemExit(f'[data].{key} is deleted: {why}')
+    for key, (inert, why) in DELETED_DATA_KEYS.items():
+        if key in data_cfg and data_cfg.pop(key) != inert:
+            raise SystemExit(f'[data].{key} is deleted: {why}; only {key} = {inert!r} is still '
+                             f'accepted')
 
 
 def _loader_config(config: dict) -> LoaderConfig:

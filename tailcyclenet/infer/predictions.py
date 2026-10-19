@@ -161,7 +161,8 @@ class SessionWriter:
 
         Inputs: out -- output session directory (created here).
                 source -- the source session (calibration, mode, keypoint axis).
-                registry -- keypoint registry; its `names` win over the session's.
+                registry -- keypoint registry; not used for the tables: every table writes
+                    the SOURCE session's `names`, the axis the predictions are indexed on.
                 provenance -- dict or (key, value) pairs; duplicate keys with differing
                     values raise.
                 groups -- group ids in run order, recorded in groups.pq.

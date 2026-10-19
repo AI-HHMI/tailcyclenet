@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.scorer.checkpoint import load_scorer_run  # noqa: E402
 from tailcyclenet.config import SCORER_CONFIG, load_config  # noqa: E402
-from tailcyclenet.dataset import PoseDataset  # noqa: E402
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.dataset import scorer_collate  # noqa: E402
 from tailcyclenet.scorer.model import flatten_sequence_triplet  # noqa: E402

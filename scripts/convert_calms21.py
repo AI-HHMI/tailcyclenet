@@ -19,7 +19,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet import format as fmt, video
+from tailcyclenet import format as fmt
+from tailcyclenet.data import video
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/CalMS21')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/calms21')

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet.dataset import read_frames
+from tailcyclenet.data.pixels import read_frames
 from tailcyclenet.detector import BoxDataset, letterbox
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.transfer_aug import PAD, composite, invert, normalize_input

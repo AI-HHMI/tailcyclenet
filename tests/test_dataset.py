@@ -12,8 +12,10 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet import crop as cropmod
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
+from tailcyclenet.data import crop as cropmod
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
+from tailcyclenet.loader.sampling import pose_collate
 from tailcyclenet.format import MISSING, UNLABELED, VISIBLE, Registry, load_dataset
 
 from .conftest import KPTS_2D
@@ -86,7 +88,8 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
     import cv2
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import crop_affine, resize_camera
+    from tailcyclenet.data.pixels import crop_affine
+    from tailcyclenet.data.camera import resize_camera
     from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
     from tracktail.model.cube import project_points_torch
 
@@ -124,12 +127,12 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
 
 @pytest.mark.parametrize('angle', [-128.0])
 def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
-    """`_rotate_2d` loses no source pixel (unlike the library's inscribed crop) and its 2x3 matches
+    """`rotate_2d` loses no source pixel (unlike the library's inscribed crop) and its 2x3 matches
     the camera it returns."""
     from aniposelib.cameras import CameraGroup
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import _rotate_2d
+    from tailcyclenet.data.camera import rotate_2d
 
     W, H = 4696, 2048
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
@@ -138,7 +141,7 @@ def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
     # the four frame corners plus its centre -- if any of these leaves the canvas, an animal can
     corners = torch.tensor([[[0.0, 0.0], [W, 0.0], [W, H], [0.0, H], [W / 2, H / 2]]])
 
-    out, moved, (M, size) = _rotate_2d(cam, corners, angle)
+    out, moved, (M, size) = rotate_2d(cam, corners, angle)
 
     assert tuple(out['size'].tolist()) == tuple(size)
     # TIGHT: the rotated frame's bounding box is the canvas EXACTLY -- nothing lost off an edge and
@@ -160,7 +163,7 @@ def test_computed_frame_paths_match_the_listing(dataset_3d, monkeypatch):
     repeated index decodes once but is not aliased (cutout writes in place)."""
     import cv2
 
-    from tailcyclenet.dataset import load_warps, read_frames
+    from tailcyclenet.data.pixels import load_warps, read_frames
 
     sess = dataset_3d.sessions['train'][0]
     group = sess.groups['g000']
@@ -376,9 +379,9 @@ class _FakeDataset:
 def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
     """A camera's appearance holds steady down a clip (an identity cue) while per-image noise varies;
     val pixels are never augmented."""
-    from tailcyclenet.dataset import _build_augmenters
+    from tailcyclenet.loader.augment import build_augmenters
 
-    per_camera, per_image = _build_augmenters(
+    per_camera, per_image = build_augmenters(
         LoaderConfig(aug_prob=1.0, per_image_aug_prob=1.0))
     img = (np.mgrid[0:64, 0:64][0][..., None] * np.ones((1, 1, 3))).astype(np.uint8)
 
@@ -415,15 +418,16 @@ def test_invert_augmentation_complements_pixels(tiny_root):
     # Keep this unit test focused on inversion rather than imgaug's independent appearance draws.
     ds._aug = (_Identity(), _Identity())
     imgs = [np.array([[[0, 1, 127], [128, 254, 255]]], dtype=np.uint8)]
-    got = ds._augment([imgs[0].copy()], 0, torch.tensor([2, 1]), None, None, False,
-                      np.random.default_rng(0), invert=True)
+    from tailcyclenet.loader.augment import augment_views
+    got = augment_views(ds._aug, ds.cfg, [imgs[0].copy()], 0, torch.tensor([2, 1]), None, None,
+                        False, np.random.default_rng(0), invert=True)
     np.testing.assert_array_equal(got[0], 255 - imgs[0])
     assert got[0].dtype == np.uint8
 
 
 def test_cutout_marks_covered_keypoints_not_visible():
     """A keypoint under a cutout rect must be labelled not-visible, including where it was NaN."""
-    from tailcyclenet.dataset import _cutout_rects
+    from tailcyclenet.loader.augment import cutout_rects
 
     rng = np.random.default_rng(0)
     T, K, C = 4, 6, 2
@@ -435,7 +439,7 @@ def test_cutout_marks_covered_keypoints_not_visible():
     covered_nan = False
     for _ in range(40):                            # rects are random; drive it until NaN is hit
         v = vis_2d.clone()
-        rects = _cutout_rects(rng, size, p2d, v, 0)
+        rects = cutout_rects(rng, size, p2d, v, 0)
         assert rects, 'cutout produced no rectangles'
         for x1, y1, x2, y2, fill in rects:
             assert 0 <= x1 < x2 <= 200 and 0 <= y1 < y2 <= 160
@@ -454,7 +458,7 @@ def test_workers_do_not_share_a_random_stream(tiny_root):
     """Two workers must not produce identically-augmented items: torch reseeds per worker, but
     imgaug's own global RNG is fork-copied and needs `worker_init`.
     """
-    from tailcyclenet.dataset import worker_init
+    from tailcyclenet.loader.sampling import worker_init
 
     cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=1.0,
                        per_image_aug_prob=0.0, grayscale_prob=0.0,
@@ -789,15 +793,15 @@ def test_crop_inflate_widens_the_crop(tiny_root):
 def test_crop_inflate_draw(tiny_root):
     """A scalar is returned as-is; `[low, high]` draws in range on train and is the exact midpoint on
     val (so `checkpoint_best` reads one geometry) -- also end to end through a real item."""
-    from tailcyclenet.dataset import _crop_inflate
+    from tailcyclenet.loader.augment import crop_inflate
 
     rng = np.random.default_rng(0)
     cfg = LoaderConfig(crop_inflate=1.3)
-    assert _crop_inflate(cfg, rng, True) == _crop_inflate(cfg, rng, False) == 1.3
+    assert crop_inflate(cfg, rng, True) == crop_inflate(cfg, rng, False) == 1.3
     cfg = LoaderConfig(crop_inflate=[0.9, 1.5])
-    train_draws = [_crop_inflate(cfg, rng, True) for _ in range(50)]
+    train_draws = [crop_inflate(cfg, rng, True) for _ in range(50)]
     assert all(0.9 <= v <= 1.5 for v in train_draws) and len(set(train_draws)) > 1
-    assert _crop_inflate(cfg, rng, False) == pytest.approx(1.2)
+    assert crop_inflate(cfg, rng, False) == pytest.approx(1.2)
 
     range_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                              crop_jitter=0.0, prompt_dropout=0.0, min_crop_dim=8,
@@ -830,7 +834,7 @@ def test_crop_inflate_draw(tiny_root):
 # the reader cache size
 # ----------------------------------------------------------------------------------------------
 
-# `_reader_cache_size` is pure given `ram_gb`, which is the whole point: the sizing rule is
+# `reader_cache_size` is pure given `ram_gb`, which is the whole point: the sizing rule is
 # asserted here on any host, with no video, no decode and no GPU.
 
 def test_reader_cache_size(monkeypatch):
@@ -838,53 +842,53 @@ def test_reader_cache_size(monkeypatch):
     before the OOM killer, never below 1; and the rule opens nothing (gotcha 10)."""
     import builtins
 
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
     def boom(*a, **k):
         raise AssertionError('the sizing rule must not open anything')
 
     monkeypatch.setattr(builtins, 'open', boom)
     monkeypatch.setattr('os.stat', boom)
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16
-    assert _reader_cache_size(1, (1024, 570), None, ram_gb=503) == 4   # narrow rig still gets mix
-    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=503) == 4   # not x worker count
-    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=32) < 4
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=8) < 16
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=64) == 16
-    assert _reader_cache_size(16, (3208, 2200), 64, ram_gb=1) == 1
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16
+    assert reader_cache_size(1, (1024, 570), None, ram_gb=503) == 4   # narrow rig still gets mix
+    assert reader_cache_size(16, (3208, 2200), 12, ram_gb=503) == 4   # not x worker count
+    assert reader_cache_size(16, (3208, 2200), 12, ram_gb=32) < 4
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=8) < 16
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=64) == 16
+    assert reader_cache_size(16, (3208, 2200), 64, ram_gb=1) == 1
 
 
 def test_the_advertised_ram_actually_buys_every_reader():
     """The `--max-ram` the warning advertises buys a reader per camera, and is not padded."""
     from tailcyclenet import memory
-    from tailcyclenet.dataset import _reader_cache_size, reader_cache_ram_gb
+    from tailcyclenet.data.reader_cache import reader_cache_size, reader_cache_ram_gb
 
     n_cams, wh = 16, (3208, 2200)                                     # johnson
     need = reader_cache_ram_gb(n_cams, wh)
-    at = _reader_cache_size(n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need).budget_gb)
+    at = reader_cache_size(n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need).budget_gb)
     assert at >= n_cams, f'--max-ram {need:.1f} advertised for {n_cams} cameras but bought {at}'
-    below = _reader_cache_size(
+    below = reader_cache_size(
         n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need - 1).budget_gb)
     assert below < n_cams, f'{need:.1f} GB is padded: {need - 1:.1f} already buys {below}'
 
 
 def test_the_reader_price_is_linear_not_quadratic():
     """Doubling the budget doubles the count; the old quadratic law capped a 16-camera rig at 10."""
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
-    a = _reader_cache_size(64, (3208, 2200), None, ram_gb=16)
-    b = _reader_cache_size(64, (3208, 2200), None, ram_gb=32)
+    a = reader_cache_size(64, (3208, 2200), None, ram_gb=16)
+    b = reader_cache_size(64, (3208, 2200), None, ram_gb=32)
     assert b / a == pytest.approx(2.0, rel=0.2), f'{a} -> {b} is not linear in the budget'
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=32) == 16
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=32) == 16
 
 
 def test_reader_cache_env_var_is_deleted_and_raises_by_name(monkeypatch):
     """The override is gone; `--max-ram` is the only knob, and a stale export must not be ignored."""
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
     monkeypatch.setenv('TAILCYCLENET_READER_CACHE', '1')
     with pytest.raises(SystemExit, match='TAILCYCLENET_READER_CACHE is deleted'):
-        _reader_cache_size(16, (3208, 2200), None, ram_gb=503)
+        reader_cache_size(16, (3208, 2200), None, ram_gb=503)
 
 
 def test_a_whole_body_offset_moves_every_keypoint_the_same_way(tiny_root):
@@ -935,7 +939,7 @@ def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
     """
     import cv2
 
-    from tailcyclenet.dataset import resize_camera
+    from tailcyclenet.data.camera import resize_camera
 
     cam = {'size': torch.tensor([2000, 1], dtype=torch.int32),
            'mat': torch.eye(3), 'offset': torch.zeros(2)}
@@ -1288,7 +1292,7 @@ def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
 
     import torch.multiprocessing  # noqa: F401  (registers torch's shared-memory reducers)
 
-    from tailcyclenet.dataset import SpawnHandoff
+    from tailcyclenet.loader.sampling import SpawnHandoff
 
     ds = _Squares()
     wrapped = SpawnHandoff(ds)
@@ -1302,7 +1306,7 @@ def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
 @pytest.mark.slow
 def test_a_spawn_worker_sees_the_wrapped_dataset():
     """A real spawn DataLoader worker (~5 s of interpreter start-up) reads the wrapped dataset."""
-    from tailcyclenet.dataset import SpawnHandoff
+    from tailcyclenet.loader.sampling import SpawnHandoff
 
     ds = _Squares()
     loader = torch.utils.data.DataLoader(SpawnHandoff(ds), batch_size=None, num_workers=2,
@@ -1356,7 +1360,7 @@ def test_loader_config_accepts_every_legal_value():
 
 def test_loader_config_from_refuses_unknown_keys_and_allows_the_callers_plumbing():
     """The one `[data]` -> `LoaderConfig` path: a typo is refused by name, plumbing is not passed."""
-    from tailcyclenet.dataset import SCORER_PLUMBING, loader_config_from
+    from tailcyclenet.loader.config import SCORER_PLUMBING, loader_config_from
 
     lc = loader_config_from({'path': 'x', 'num_workers': 2, 'n_frames': 6})
     assert lc.n_frames == 6

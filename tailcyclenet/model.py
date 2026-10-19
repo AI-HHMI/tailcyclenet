@@ -652,7 +652,7 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_
     imported here, not at module level: `dataset` pulls pandas through tracktail, and table-only
     modules that import the model must not.
     """
-    from .dataset import prior_out_of_bounds
+    from .data.camera import prior_out_of_bounds
 
     p = first['coords_pred'][0].detach()
     prior = p[0][None].clone()

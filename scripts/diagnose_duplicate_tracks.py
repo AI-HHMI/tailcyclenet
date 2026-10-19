@@ -17,7 +17,7 @@ import numpy as np
 
 from tailcyclenet.eval import label_lookup
 from tailcyclenet.identity_diagnostic import switch_diagnostics
-from tailcyclenet.infer.predictions import load_predictions
+from tailcyclenet.format.prediction import load_predictions
 from tailcyclenet.metrics import label_extent
 
 

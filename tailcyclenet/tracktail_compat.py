@@ -3,7 +3,8 @@
 The installed tracktail forward projection already multiplies by the full upper-triangular
 intrinsic matrix. Its inverse path historically extracted only fx/fy/cx/cy, however, which makes
 nonzero-skew cameras inconsistent. This module preserves the old path for zero-skew cameras and
-replaces only the inverse normalization for skewed cameras.
+replaces only the inverse normalization for skewed cameras. `rotate_camera_image_plane_3d` is the
+same full-K fix for the image-plane rotation augmentation. Both belong upstream.
 """
 from __future__ import annotations
 
@@ -120,6 +121,45 @@ def projection_sensitivity(cam, points):
     J_cam = torch.matmul(cam['mat'].to(torch.float64)[:2, :2],
                          torch.matmul(J_dist, J_q))
     return torch.matmul(J_cam, ext[:3, :3])
+
+
+def _needs_full_image_rotation(cam):
+    """Whether an image-plane rotation cannot commute with this camera model."""
+    K2 = cam['mat'][:2, :2]
+    unequal_focal = not torch.isclose(K2[0, 0], K2[1, 1], rtol=1e-6, atol=1e-6)
+    nonzero_distortion = bool(torch.count_nonzero(cam['dist']))
+    return has_skew(cam) or unequal_focal or nonzero_distortion
+
+
+def rotate_camera_image_plane_3d(cam, angle_deg):
+    """Rotate a 3D image and keep a full intrinsic matrix projection-consistent.
+
+    tracktail's helper implements the equivalent camera update by rolling the camera frame. That
+    relies on the image transform commuting with the intrinsic/distortion model, which is only
+    safe for the narrow isotropic, zero-distortion case. For skew, unequal focal lengths, or
+    nonzero distortion, leave extrinsics fixed and left-multiply the complete homogeneous `K` by
+    the image affine, transforming offsets by its linear part. The projected 3D points then follow
+    exactly the same affine as the warped image.
+    """
+    from tracktail.datasets.tracktail_dataset import (
+        rotate_camera_image_plane_3d as _tracktail_rotate_camera_image_plane_3d,
+    )
+
+    cam_rot, rotation = _tracktail_rotate_camera_image_plane_3d(cam, angle_deg)
+    if not _needs_full_image_rotation(cam):
+        return cam_rot, rotation
+
+    M, _ = rotation
+    H = torch.eye(3, dtype=cam['mat'].dtype, device=cam['mat'].device)
+    H[:2] = torch.as_tensor(M, dtype=H.dtype, device=H.device)
+    cam_rot['mat'] = H @ cam['mat']
+    cam_rot['ext'] = cam['ext']
+    cam_rot['ext_inv'] = cam['ext_inv']
+    cam_rot['center'] = cam['center']
+    linear = H[:2, :2]
+    offset = cam['offset']
+    cam_rot['offset'] = torch.matmul(offset, linear.t())
+    return cam_rot, rotation
 
 
 def install_full_intrinsics() -> None:

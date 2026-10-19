@@ -22,8 +22,9 @@ import torch
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
 from tailcyclenet.config import BASE_CONFIG, check_image_size, load_config
-from tailcyclenet.dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
-                                  pose_collate, worker_init)
+from tailcyclenet.loader.dataset import PoseDataset
+from tailcyclenet.loader.sampling import SpawnHandoff, StepSampler, pose_collate, worker_init
+from tailcyclenet.loader.config import loader_config_from
 from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
 from tailcyclenet.optim import KNOWN_OPTIMIZER_KEYS

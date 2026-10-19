@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from ..checkpoints import load_run, peek_registry, provenance
-from ..dataset import LoaderConfig
+from ..loader.config import LoaderConfig
 from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
 
@@ -477,7 +477,7 @@ def run_dataset(args):
     assoc_res_max_px = (args.assoc_res_max_px if args.assoc_res_max_px is not None else 30.0)
 
     if args.videos:
-        from .. import adopt
+        from . import adopt
         adopt.check_flags(args)
         reg = peek_registry(args.run)
         vplan = adopt.plan(args.videos, args.calibration, args.cam_regex,

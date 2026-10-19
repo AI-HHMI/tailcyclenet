@@ -27,7 +27,7 @@ from .contract import scorer_contract, scorer_output_granularity
 # table-only import free of pandas; scoring imports the loader only when it actually runs.
 PoseDataset = None
 if TYPE_CHECKING:
-    from ..dataset import LoaderConfig
+    from ..loader.config import LoaderConfig
 
 
 DELETED_DATA_KEYS = {
@@ -58,7 +58,7 @@ def _loader_config(config: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming unknown keys.
     """
-    from ..dataset import SCORER_PLUMBING, loader_config_from
+    from ..loader.config import SCORER_PLUMBING, loader_config_from
 
     data_cfg = dict(config.get('data', {}))
     refuse_deleted_data_keys(data_cfg)
@@ -174,7 +174,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
         lc = replace(lc, val_stride=int(val_stride))
     dataset_cls = PoseDataset
     if dataset_cls is None:
-        from ..dataset import PoseDataset as dataset_cls
+        from ..loader.dataset import PoseDataset as dataset_cls
     ds = dataset_cls(data, split, lc, registry_base=registry, train=False)
     _check_names(registry, ds.registry, data)
 

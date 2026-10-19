@@ -39,7 +39,7 @@ def _session_with_boxes(path):
 def test_renders_a_sheet_a_crop_and_a_chunked_video(tmp_path, monkeypatch):
     """The sheet is the MIDDLE labelled frame, crops land, and `--video` decodes in chunks of at
     most `VIDEO_CHUNK` (whole-group decode OOMed on a 23,810-frame group) yet writes every frame."""
-    from tailcyclenet import video
+    from tailcyclenet.data import video
 
     r = _mod()
     sess = _session_with_boxes(tmp_path / 'ds' / 'train' / 'a')

@@ -19,7 +19,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from tailcyclenet import format as fmt
-from tailcyclenet.video import PyAVReader
+from tailcyclenet.data.video import PyAVReader
 
 SRC = Path('/groups/voigts/voigtslab/alison_temp/minimaze_calibration_test_data/sleap/minimaze.v004.slp')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/comrie-minimaze')

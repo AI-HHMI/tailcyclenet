@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.crop import BOX_SOURCES
+from tailcyclenet.data.crop import BOX_SOURCES
 from tailcyclenet.detector import NMS_CENTER_DIST_DEPLOY, BoxDataset, load_detector
 from tailcyclenet.detector.evaluate import deployment_score, score_dataset
 from tailcyclenet.format import load_datasets

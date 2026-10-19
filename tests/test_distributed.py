@@ -14,7 +14,7 @@ import torch.nn as nn
 import tailcyclenet.train as tr
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet import runtime
-from tailcyclenet.dataset import _reader_cache_size
+from tailcyclenet.data.reader_cache import reader_cache_size
 from tailcyclenet.optim import build_muon, group_lr
 from tailcyclenet.unfreeze import apply_staged_unfreeze
 
@@ -95,12 +95,12 @@ def test_reader_cache_divides_by_ranks_as_well_as_workers(monkeypatch):
     READ from the environment (never probed); absent, it is one process; the clamp never hits 0."""
     monkeypatch.delenv('TAILCYCLENET_LOCAL_WORLD_SIZE', raising=False)
     kw = dict(n_cams=16, wh=(1024, 570), workers=8, ram_gb=500.0)
-    one = _reader_cache_size(**kw, procs=1)
-    assert _reader_cache_size(**kw) == one
-    assert _reader_cache_size(**kw, procs=4) <= one
-    assert _reader_cache_size(n_cams=16, wh=(3208, 2200), workers=8, ram_gb=64.0, procs=8) >= 1
+    one = reader_cache_size(**kw, procs=1)
+    assert reader_cache_size(**kw) == one
+    assert reader_cache_size(**kw, procs=4) <= one
+    assert reader_cache_size(n_cams=16, wh=(3208, 2200), workers=8, ram_gb=64.0, procs=8) >= 1
     monkeypatch.setenv('TAILCYCLENET_LOCAL_WORLD_SIZE', '8')
-    assert _reader_cache_size(**kw) == _reader_cache_size(**kw, procs=8)
+    assert reader_cache_size(**kw) == reader_cache_size(**kw, procs=8)
 
 
 # -- the straggler fix: equal COST per rank, per step ---------------------------------------
@@ -110,14 +110,15 @@ CGROUP = 4          # `_item`'s field order: views, coords, vis, frames, cgroup,
 
 def _ds(root, **over):
     """`prob_2d_only = 0` unless stated, so camera-count variation comes from `cams_to_sample`."""
-    from tailcyclenet.dataset import LoaderConfig, PoseDataset
+    from tailcyclenet.loader.config import LoaderConfig
+    from tailcyclenet.loader.dataset import PoseDataset
     return PoseDataset(root, 'train', LoaderConfig(**{'prob_2d_only': 0.0, **over}))
 
 
 def test_the_sampler_yields_an_ordinal_that_is_the_step_number():
     """The ordinal is the STREAM position (what every rank agrees on); the index stream stays
     per-rank."""
-    from tailcyclenet.dataset import StepSampler
+    from tailcyclenet.loader.sampling import StepSampler
     a = list(StepSampler(100, num_samples=8, generator=torch.Generator().manual_seed(23)))
     b = list(StepSampler(100, num_samples=8, generator=torch.Generator().manual_seed(24)))
     assert [k for k, _ in a] == [k for k, _ in b] == list(range(8)), 'ordinals must agree'

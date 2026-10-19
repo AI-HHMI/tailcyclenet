@@ -17,7 +17,7 @@ import numpy as np
 from tailcyclenet.format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.infer.predictions import load_predictions
 from tailcyclenet.metrics import (ERR_PCTS, per_frame_means, error_and_coverage, idf1,
-                                  idf1_from_state, idf1_merge, idsw_stability_band,
+                                  idf1_from_state, idf1_merge, idsw_stability_band, label_extent,
                                   match_instances, matched_error, mota, motion_ratio,
                                   paired_bootstrap, pck)
 
@@ -68,9 +68,7 @@ def chunk_frames(preds, labels, n):
         lab, sess = labels[key]
         T = int(np.asarray(out['pred']).shape[1])
         full = lab.points3d if str(out['mode']) == '3d' else lab.points2d[..., 0, :]
-        with np.errstate(all='ignore'):
-            span = np.nanmax(full, axis=2) - np.nanmin(full, axis=2)
-            extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+        extent = label_extent(full)
         lab_T = int(np.asarray(full).shape[1])
         starts = list(range(0, T, n))
         if len(starts) > 1 and T - starts[-1] < 2:
@@ -187,12 +185,8 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         if Sp == 0 and St:
             m = error_and_coverage(np.full_like(true[:St], np.nan), true[:St])
         if S > 1 or (Sp == 0 and St >= 1):
-            if '__extent__' in out:
-                extent = float(out['__extent__'])
-            else:
-                with np.errstate(all='ignore'):
-                    span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-                    extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+            extent = (float(out['__extent__']) if '__extent__' in out
+                      else label_extent(true))
             max_dist = extent if np.isfinite(extent) and extent > 0 else np.inf
             mm = matched_error(pred, true, max_dist=max_dist,
                                min_kpts_frac=min_kpts_frac, cost=match_cost)
@@ -312,12 +306,7 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
     """
     pred, true = m['_pred'], m['_true']
     St, T = true.shape[0], true.shape[1]
-    if extent_override is not None:
-        extent = float(extent_override)
-    else:
-        with np.errstate(all='ignore'):
-            span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-            extent = np.nanmedian(np.linalg.norm(span, axis=-1))
+    extent = float(extent_override) if extent_override is not None else label_extent(true)
     radius = float(mota_dist) if mota_dist is not None else float(extent) * 0.5
     if not radius > 0:
         radius = np.inf

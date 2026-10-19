@@ -11,11 +11,9 @@ signature (two rows ~2 mm apart on a ~200 mm animal) into a number that looked "
 """
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 
-from .metrics import match_instances
+from .metrics import label_extent, match_instances
 
 
 def _mean_distance(first, second):
@@ -61,10 +59,7 @@ def switch_diagnostics(pred, true, scale, near_scale=1.0, bin_frames=100):
         raise ValueError(f'expected pred/true with four dimensions, got {pred.shape}/{true.shape}')
     T = min(pred.shape[1], true.shape[1])
     pred, true = pred[:, :T], true[:, :T]
-    with warnings.catch_warnings(), np.errstate(all='ignore'):
-        warnings.simplefilter('ignore', RuntimeWarning)
-        span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-        extent = float(np.nanmedian(np.linalg.norm(span, axis=-1))) if span.size else float('nan')
+    extent = label_extent(true)
     radius = extent * 0.5 if np.isfinite(extent) and extent > 0 else np.inf
     matches = match_instances(pred, true, radius, 0.0, 'mean')
     switches = []

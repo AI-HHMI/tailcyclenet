@@ -221,9 +221,8 @@ def test_a_one_keypoint_instance_frame_does_not_collapse_the_match_radius():
     true = np.full((2, 2, 3, 2), np.nan, np.float32)
     true[0, :, 0] = [10.0, 10.0]
     true[1, :, 0] = [90.0, 90.0]
-    with np.errstate(all='ignore'):
-        span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-        extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+    from tailcyclenet.metrics import label_extent
+    extent = label_extent(true)
     assert extent == 0.0, 'the degenerate case must actually be degenerate, or this proves nothing'
 
     pred = true + 0.5                       # a very good prediction: half a pixel out

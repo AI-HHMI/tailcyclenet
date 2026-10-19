@@ -161,7 +161,7 @@ def _frame_trip(in_view):
 def test_evaluate_frame_metrics_use_active_rows_and_do_not_mutate_masks(monkeypatch):
     """Frame val metrics read active rows + pointwise labels; the localization count must not
     erase out-of-view slots from `observed_mask` (which pinned out_of_view_fraction at 0)."""
-    from tailcyclenet.scorer import train as st
+    from tailcyclenet.scorer import evaluate as st
     from tailcyclenet.scorer.losses import FrameTripletScorerLoss
 
     class FrameModel(_FakeModel):
@@ -225,7 +225,7 @@ def test_validation_measures_the_averaged_iterate_and_it_round_trips(tmp_path, m
     `model_state_eval` reproduces exactly that prediction, and that both normal completion and a
     raised error leave the model and the optimizer in TRAIN mode.
     """
-    from tailcyclenet.scorer import train as st
+    from tailcyclenet.scorer import evaluate as st
     from tailcyclenet.pose.optim import build_optimizer
 
     monkeypatch.setattr(st, 'triplet_to_device', lambda trip, device: trip)
@@ -276,7 +276,7 @@ def test_validation_measures_the_averaged_iterate_and_it_round_trips(tmp_path, m
 
 def test_a_failing_optimizer_restore_still_puts_the_model_back_in_train_mode(monkeypatch):
     """The cleanup is nested: the model's restore must not depend on the optimizer's succeeding."""
-    from tailcyclenet.scorer import train as st
+    from tailcyclenet.scorer import evaluate as st
 
     class _RudeOptimizer(_FakeOptimizer):
         def train(self):

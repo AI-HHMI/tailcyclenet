@@ -14,7 +14,7 @@ from tailcyclenet.scorer.contract import (
     scorer_output_granularity,
 )
 from tailcyclenet.scorer.losses import FrameTripletScorerLoss
-from tailcyclenet.scorer.train import validate_scorer_config
+from tailcyclenet.scorer.config import validate_scorer_config
 
 
 def test_new_family_config_defaults_to_frame_but_absent_run_key_is_sequence():

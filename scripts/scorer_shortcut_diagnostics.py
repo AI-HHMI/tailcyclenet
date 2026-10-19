@@ -39,9 +39,10 @@ from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.dataset import scorer_collate  # noqa: E402
 from tailcyclenet.scorer.model import flatten_sequence_triplet  # noqa: E402
-from tailcyclenet.scorer.train import (corruption_config, loader_config,  # noqa: E402
-                                       _frame_pointwise_arrays, _weighted_binary_metrics,
-                                       scorer_output_granularity)
+from tailcyclenet.scorer.config import corruption_config  # noqa: E402
+from tailcyclenet.scorer.contract import scorer_output_granularity  # noqa: E402
+from tailcyclenet.scorer.evaluate import frame_pointwise_arrays, weighted_binary_metrics  # noqa: E402
+from tailcyclenet.scorer.train import loader_config  # noqa: E402
 from tailcyclenet.scorer.corruption import GENERATORS  # noqa: E402
 from tailcyclenet.scorer.triplet import seed_worker  # noqa: E402
 
@@ -139,10 +140,10 @@ def _arms(model, loader, device, max_batches, output_granularity='sequence'):
                 type_mask = fired.to(correct_for_type.device).bool()
                 if output_granularity == 'frame':
                     arms[arm]['pointwise'].append(
-                        _frame_pointwise_arrays(scores, labels, t))
+                        frame_pointwise_arrays(scores, labels, t))
                     for gi, name in enumerate(GENERATORS):
                         arms[arm]['pointwise_types'].setdefault(name, []).append(
-                            _frame_pointwise_arrays(scores, labels, t, gi))
+                            frame_pointwise_arrays(scores, labels, t, gi))
                 if scores.ndim == 2 and type_mask.ndim == 3:
                     type_mask = type_mask[0]
                 if output_granularity == 'frame' and active is not None:
@@ -168,7 +169,7 @@ def _arms(model, loader, device, max_batches, output_granularity='sequence'):
             point_scores = np.concatenate([chunk[0] for chunk in pointwise])
             point_targets = np.concatenate([chunk[1] for chunk in pointwise])
             point_weights = np.concatenate([chunk[2] for chunk in pointwise])
-            point_auc, point_ap = _weighted_binary_metrics(
+            point_auc, point_ap = weighted_binary_metrics(
                 point_scores, point_targets, point_weights)
         else:
             point_auc = point_ap = float('nan')
@@ -180,7 +181,7 @@ def _arms(model, loader, device, max_batches, output_granularity='sequence'):
             typed_scores = np.concatenate([chunk[0] for chunk in typed])
             typed_targets = np.concatenate([chunk[1] for chunk in typed])
             typed_weights = np.concatenate([chunk[2] for chunk in typed])
-            type_pointwise[name] = _weighted_binary_metrics(
+            type_pointwise[name] = weighted_binary_metrics(
                 typed_scores, typed_targets, typed_weights)
         out[arm] = {
             'n': d['n'],

@@ -734,7 +734,8 @@ def run_dataset(args):
                   f'detections it offers. q01 {det_objq.get("q01", float("nan")):.4f} '
                   f'q10 {det_objq.get("q10", float("nan")):.4f} '
                   f'q90 {det_objq.get("q90", float("nan")):.4f}. This detector is NOT saturated; '
-                  'sweep the threshold -- 0.97 maximises identity, 0.5 coverage.', flush=True)
+                  'sweep --det-score per checkpoint (the 0.01 default favours recall; raising '
+                  'it was measured to cost coverage).', flush=True)
         trained_datasets = list(getattr(det, 'trained_datasets', []) or ([det_ds] if det_ds else []))
         det_boxsrc = _detector_box_source(det, ds_name, det_boxsrc)
         trained_label = (trained_datasets[0] if len(trained_datasets) == 1 else

@@ -1,12 +1,9 @@
 """Train the track-quality scorer.
 
-Cloned from `train.py`'s shape but NOT from its loop: the objective is a triplet ranking loss, the
-best checkpoint is selected on held-out synthetic triplet accuracy rather than on MPJPE, and the
-staged encoder unfreeze, the pose losses and the pose eval all have no meaning here. What IS
-reused, by import, is the parts that must not diverge: `config.load_config` (so the scorer
-family layers over `configs/scorer.toml`), `pose.checkpoint.warm_start` (the pose checkpoint),
-`scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and
-`optim.build_optimizer` (so Muon routing and the fresh-parameter rule are one implementation).
+Pose-shaped but not the pose loop: a triplet ranking loss, best checkpoint selected on held-out
+synthetic triplet accuracy, no staged unfreeze. Shared by import so they cannot diverge:
+`config.load_config` (layering over `configs/scorer.toml`), `pose.checkpoint.warm_start`,
+`save_run_meta(kind='scorer')` and `pose.optim.build_optimizer`.
 
     pixi run python scripts/train_scorer.py --config configs/scorer.toml --data <root> \
         --out <results>/scorers/scorer-3dpop --checkpoint <pose run folder>
@@ -585,26 +582,15 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         num_workers: int | None = None, devices_arg: int | None = None) -> None:
     """Train one scorer run.
 
-    The per-step training metrics are averaged over the last `print_freq` steps before printing,
-    because ONE step is one window: with K keypoints that is K triplets (7 on calms21), so a
-    single step's `triplet_acc` is quantised in units of 1/K and swings over the full range while
-    the model learns. The val pass is the number to read; this is the trace. A synchronized DDP
-    step advances the headline iteration by `world`; `step` counts completed local optimizer steps.
-
     Inputs: config_path -- a config layering over `configs/scorer.toml`; data_path -- the dataset
             root (overrides `[data].path`); out -- the run folder; checkpoint -- a pose run folder
-            or checkpoint to warm-start from, or a scorer run folder's checkpoint to RESUME from;
-            device -- torch device; max_iterations -- override `[training].n_iterations`;
-            no_wandb -- skip wandb; fresh -- ignore this run folder's own checkpoint and start
-            from the warm start, which is what `--fresh` is for.
-    A warm start receives the source run's registry names, not this run's grown registry, so its
-    identity rows remain keyed to the same keypoints.
-    `[training].n_iterations` (and `--iterations`) is a TOTAL, not an increment: resuming a
-    60000-iteration run whose checkpoint sits at 40000 runs 20000 more and stops at 60000. Without
-    that, a re-submitted job would silently train past its own budget.
-
-    Outputs: none.
-    Side effects: writes the run folder, checkpoints and wandb logs.
+            or checkpoint to warm-start from, or a scorer checkpoint to RESUME from; device;
+            max_iterations -- override `[training].n_iterations`, a TOTAL, not an increment
+            (a resumed 60000-iteration run at 40000 runs 20000 more); no_wandb; fresh -- ignore
+            this run folder's own checkpoint (`--fresh`).
+    Side effects: writes the run folder, checkpoints and wandb logs. Train metrics are averaged
+    over `print_freq` steps (one step is K triplets, so one step's accuracy is quantised in 1/K);
+    the val pass is the number to read. A warm start gets the SOURCE run's registry names.
     """
     world = int(fabric.world_size) if fabric is not None else 1
     is0 = bool(fabric.is_global_zero) if fabric is not None else True

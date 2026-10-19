@@ -42,13 +42,7 @@ def main(argv: list[str] | None = None) -> None:
     `sys.argv[1:]`, which requires the token to be ABSENT. The two needs conflict on a single
     `sys.argv`, so they are separated: `sys.argv` keeps the token (respawn-safe) and `rest` is
     passed in explicitly (parse-correct). This is why the subcommand modules take an `argv`
-    parameter at all -- `infer/cli.py` already did.
-
-    The previous version folded the command into `argv[0]` (`'<script> <command>'`) to name it in
-    argparse's `prog`. That satisfied neither: the `-m` route then dropped the subcommand (the
-    dispatcher saw `--data`), and the script route was handed `os.path.abspath()` of a path with an
-    embedded space. Both failed only above one GPU, because a single-GPU run never spawns a rank.
-    The subcommand name now reaches argparse through each parser's `prog` instead.
+    parameter at all.
     """
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv or argv[0] in ('-h', '--help'):

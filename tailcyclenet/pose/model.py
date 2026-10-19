@@ -269,31 +269,16 @@ def share_video_encoder_if_identical(pose_model, scorer_model):
 
 
 def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **extra) -> PoseTrackerEncoder:
-    """`[model]` splatted into the constructor, with this repo's two keys pulled out first. Two
-    library options are checked here because both are wrong in a way that produces numbers
-    instead of exceptions.
+    """`[model]` splatted into the constructor, with this repo's keys pulled out and checked first.
 
-    `cls` selects the class to construct and `**extra` is forwarded to it verbatim; both exist
-    for one caller (`scorer.build_scorer`, which wants a `PoseScorer` and its head kwargs). The
-    defaults reproduce the historical behaviour exactly, so every refusal below is shared rather
-    than copied -- a second copy of these checks is how two builders come to disagree
-    about what a config means.
-
-    The two query terms are derived from `query` -- see PoseTrackerEncoder.__init__.
-    gridresid_offset has NO DEFAULT, DELIBERATELY: the two values are different architectures
-    sharing one set of tensor shapes, so a checkpoint trained under one and loaded under the
-    other produces numbers instead of an exception -- which is exactly what happened to one 3D
-    run, silently. A pre-key run folder must be told which it was (load_run(model_overrides=...)
-    / --gridresid-offset). The two query terms DEFAULT to `query`; setting one gives pos without
-    patch. 'none' is a plain wide model, byte-identical to a config without the key.
-    n_keypoints is derived from the registry, never configured. The library DEFAULTS to
-    'direct', so omitting the key is as dangerous as setting it wrong: both gridresid_offset
-    paths need the output query-anchored, which the library only does for 'residual' and
-    'gridresid'. Upstream uses mode_3d to select the CLASS; here it is stored and never read, so
-    anything else would be accepted and quietly ignored (and TrackerTapNext is not
-    moving-cam-safe anyway). use_volume_embedding is consumed only by the stock QueryEncoder,
-    which is no longer built -- refused rather than accepted-and-ignored, so it cannot read as a
-    knob.
+    `cls`/`**extra` exist for `scorer.build_scorer` (a `PoseScorer` and its head kwargs), so every
+    refusal below is shared rather than copied. `gridresid_offset` has NO DEFAULT: its two values
+    are different architectures with identical tensor shapes, so loading under the wrong one
+    produces numbers, not an exception (a pre-key run folder states it via
+    `load_run(model_overrides=...)` / `--gridresid-offset`). `output_mode` must be `gridresid`
+    (both offsets assume a query-anchored residual; the library default `direct` is not);
+    `mode_3d` and `use_volume_embedding` would be silently ignored, so they are refused.
+    `n_keypoints` is derived from the registry, never configured.
     """
     cfg = dict(model_cfg)
     query = cfg.pop('query', 'prior')

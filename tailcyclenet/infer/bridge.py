@@ -527,7 +527,7 @@ def summarise(decisions: dict) -> str:
 def config_provenance(cfg: BridgeConfig) -> list[tuple[str, float]]:
     """The bridge's own levers, for the prediction's provenance block.
 
-    Unconditional membership, the same rule `_box_provenance`/`_identity_provenance` follow: an
+    Unconditional membership, the same rule `box_provenance`/`identity_provenance` follow: an
     absent key would read as "not used" when it means "unknown", and that is what makes a
     partial record lie.
     """
@@ -538,7 +538,7 @@ def _write_bridge_provenance(path: Path, cfg: BridgeConfig, complete: bool | Non
     """Merge the bridge's config into an already-written session's `[provenance]`, in place.
 
     `--identity-bridge` runs AFTER `SessionWriter.close()` (`session.toml` is frozen by then, so
-    `_box_provenance`/`_identity_provenance` never see it), which otherwise leaves a bridged
+    `box_provenance`/`identity_provenance` never see it), which otherwise leaves a bridged
     prediction indistinguishable from an unbridged one in its own provenance -- exactly the gap
     CLAUDE.md's "record every identity lever in the prediction" rule exists to close. Called
     unconditionally at the top of `bridge_session`, before any early return, so a run that found

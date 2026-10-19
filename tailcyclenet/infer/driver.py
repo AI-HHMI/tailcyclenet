@@ -15,198 +15,14 @@ import torch
 
 from ..checkpoints import load_run, peek_registry, provenance
 from ..dataset import LoaderConfig
-from .predictions import SessionWriter, refuse_multi_session
+from .detect import detector_boxes
+from .loading import detector_box_source, detector_matches_source, share_pose_scorer_encoder
+from .predictions import refuse_multi_session
+from .provenance import box_provenance, identity_provenance
+from .resolve import check_frame_range, refuse_selector_beside_file
+from .session_writer import SessionWriter
+from .traces import write_det_trace, write_overlap_trace
 from .window import InferConfig, run_blocks
-
-
-def _refuse_selector_beside_file(path, selector, flag, selector_flag, default=None):
-    """A checkpoint selector picks a file INSIDE a run folder; beside a file it means nothing.
-
-    Pure (no checkpoint load), so the refusal lands before any model or video is touched.
-    """
-    if path is None:
-        return
-    path = Path(path)
-    if path.is_file() and selector is not None and selector != default:
-        raise SystemExit(f'{flag} {path} is already a checkpoint file; {selector_flag} '
-                         f'{selector!r} selects a file inside a run folder and is refused here')
-
-
-def _share_pose_scorer_encoder(pose_model, scorer_model, *, allow_mismatch,
-                               pose_run, scorer_run) -> bool:
-    """Share the raw video backbone, refusing unequal weights without explicit opt-in."""
-    from ..model import share_video_encoder_if_identical
-
-    shared = share_video_encoder_if_identical(pose_model, scorer_model)
-    if not shared and not allow_mismatch:
-        raise SystemExit(f'{scorer_run}: raw video-encoder weights do not exactly match '
-                         f'{pose_run}; refusing two different scoring/pose encoders. Pass '
-                         '--allow-pose-scorer-mismatch to opt in to separate encoder passes.')
-    return shared
-
-
-def _dataset_family(name: str) -> str:
-    """The leading `-`-token of a dataset name: 'rat-city-combined' and 'rat-city-tracked' are
-    both 'rat'; 'johnson-mouse-combined-aug' and 'johnson-mouse-combined' are both 'johnson'.
-
-    A detector-vs-session dataset check needs SOME notion of "the same dataset", but this repo
-    routinely trains a detector and a pose run, and evaluates them, on differently-suffixed roots
-    that are the same underlying species/rig (`-combined` / `-aug` / `-tracked` / `-annotated`
-    variants -- see `scratch/phase15/run.sh`'s own `rat-city-tracked` session against a
-    `rat-city-combined` detector). Exact string equality would refuse that ALREADY-WORKING,
-    ALREADY-CHECKED pairing. The first token is a coarse but effective family key for every
-    dataset name in this repo; it is not exact by construction, so it only guards the unambiguous
-    cross-species accident (a calms21 detector on a rat-city session), not a same-family variant.
-    """
-    return str(name).split('-', 1)[0].strip().lower()
-
-
-def _detector_matches_source(trained_datasets, trained_on, ds_name):
-    """Multi-root checkpoints require exact membership; legacy/single-root keeps family matching."""
-    if len(trained_datasets) > 1:
-        return ds_name in trained_datasets
-    return bool(trained_on and ds_name
-                and _dataset_family(trained_on) == _dataset_family(ds_name))
-
-
-def detector_box_source(det, ds_name, default):
-    """Effective detector target for this source root, with a unique-family fallback."""
-    by_root = getattr(det, 'box_sources', {}) or {}
-    if ds_name in by_root:
-        return by_root[ds_name]
-    family = _dataset_family(ds_name) if ds_name else ''
-    matches = [value for name, value in by_root.items()
-               if family and _dataset_family(name) == family]
-    return matches[0] if len(matches) == 1 else default
-
-
-def _box_provenance(args, det_tile, det_red, det_boxsrc):
-    """Every input the detections depend on, recorded beside the numbers they produced.
-
-    Unconditional and always complete (a provenance record has no cache-invalidation pressure),
-    so two runs that look alike differ in their output file where a reader can see it. Keyed by
-    the CLI name where it differs from `detect_raw`'s parameter name -- that is what a reader has
-    to type to reproduce it. `tests/test_detector.py` walks `detect_raw`'s signature against this
-    dict, so a new box-affecting parameter must land here too. The frame range is recorded because
-    it changes the detections (which frames, and the aligned lead-in); the detector's box target
-    is recorded as `det_box_source`, NOT `box_source`, because the two are the detector's training
-    target and the pose model's crop rule respectively -- they are allowed to disagree, which is
-    why both are recorded.
-    """
-    return {
-        'detector': str(Path(args.detector).resolve()) if args.detector else '',
-        'detector_checkpoint': str(getattr(args, '_detector_checkpoint', '') or ''),
-        'det_score': float(args.det_score),
-        'det_nms_iou': float(args.det_nms_iou),
-        'det_nms_center_dist': (float(args.det_nms_center_dist)
-                               if args.det_nms_center_dist is not None else 0.0),
-        'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
-        'max_animals': int(args.max_animals),
-        'max_frames': int(args.max_frames),
-        'frame_start': int(args.frame_start),
-        'frame_stop': int(args.frame_stop),
-        'tile_scale': float(det_tile) if det_tile else 0.0,
-        'reduce': bool(det_red),
-        'det_box_source': str(det_boxsrc or 'keypoints') if args.detector else '',
-    }
-
-
-def _identity_provenance(args):
-    """Every lever that decides which ROW a detection lands in, recorded beside its numbers.
-
-    The sibling of `_box_provenance`, and it exists for the same reason one frame later in the
-    pipeline: detection provenance answers "which boxes", this answers "whose". Without it two
-    runs differing only in `--link-boxes` are distinguishable **only by their
-    directory name**, which is how the two stored 2D suppression arms in `scratch/dupfollow/pred`
-    ended up unmatched -- their `[provenance]` records the detector, the crop and the checkpoint,
-    and says nothing about the identity mechanism whose effect they were built to measure. Eval
-    rule 4 (match the controls) and rule 12 (a same-recipe replicate) both need these keys to be
-    checkable from the artifact rather than assumed.
-
-    Unconditional and always complete, exactly as `_box_provenance` is: the same keys at every
-    value, since conditional membership is what makes a record lie. `tests/test_detector.py`
-    walks `associate_group`'s signature against this dict, so a new identity-affecting parameter
-    must land here too.
-    """
-    return {
-        'track': bool(args.track),
-        'link_boxes': bool(args.link_boxes),
-        'min_views': int(args.min_views),
-        'max_move': float(args.max_move),
-        'max_age': int(args.max_age),
-        'identity_bridge': bool(args.identity_bridge),
-        'duplicate_radius': float(args.duplicate_radius),
-        'duplicate_persist': int(args.duplicate_persist),
-    }
-
-
-def _write_overlap_trace(path, per_group):
-    """Write the overlap test-retest capture as one npz. Output-neutral, a scratch diagnostic.
-
-    Inputs: path -- destination npz; per_group -- {group key: (rows, census)} as accumulated in
-        `stats` by `window._capture_overlap_agreement`.
-    Outputs: None.
-    Side effects: writes `path`.
-
-    Flat parallel arrays rather than one object array per row, because the consumer is an offline
-    join against labels and `windows.pq` (plan 7.1/7.2/7.5) and a structured npz is what pandas
-    and numpy both read without unpickling. `prev`/`new` are the two estimates of the SAME frame
-    -- the earlier window's discarded one and the later window's kept one -- stacked as
-    `(n, K, R)`; keeping both is the whole point of the capture, since asking which the seam rule
-    SHOULD keep needs each scored against labels separately.
-
-    The census travels with the rows, not in a separate file: a coverage figure separated from
-    the population it describes is how a selection bias gets quoted as a result.
-    """
-    import json
-
-    keys, animal, frame, pos, dist, n_shared, prev, new = [], [], [], [], [], [], [], []
-    ob_key, ob_animal, ob_frame, ob_nan, ob_k = [], [], [], [], []
-    mc_animal, mc_frame, mc_mean, mc_min = [], [], [], []
-    for key, (_rows, _census, oob, conf) in sorted(per_group.items()):
-        for a, f0, n_nan, n_k in oob:
-            ob_key.append(key)
-            ob_animal.append(a)
-            ob_frame.append(f0)
-            ob_nan.append(n_nan)
-            ob_k.append(n_k)
-        for a, t, mean_c, min_c, _n_cam in conf:
-            mc_animal.append(a)
-            mc_frame.append(t)
-            mc_mean.append(mean_c)
-            mc_min.append(min_c)
-    for key, (rows, _census, _oob, _conf) in sorted(per_group.items()):
-        for r in rows:
-            keys.append(key)
-            animal.append(r['animal'])
-            frame.append(r['frame'])
-            pos.append(r['pos'])
-            dist.append(r['dist'])
-            n_shared.append(r['n_shared'])
-            prev.append(r['prev'])
-            new.append(r['new'])
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        group=np.array(keys, dtype=object), animal=np.asarray(animal, np.int32),
-        frame=np.asarray(frame, np.int32), pos=np.asarray(pos, np.int32),
-        dist=np.asarray(dist, np.float32), n_shared=np.asarray(n_shared, np.int32),
-        prev=(np.stack(prev) if prev else np.zeros((0, 0, 0), np.float32)),
-        new=(np.stack(new) if new else np.zeros((0, 0, 0), np.float32)),
-        oob_group=np.array(ob_key, dtype=object), oob_animal=np.asarray(ob_animal, np.int32),
-        oob_frame=np.asarray(ob_frame, np.int32), oob_nan=np.asarray(ob_nan, np.int32),
-        oob_k=np.asarray(ob_k, np.int32),
-        conf_animal=np.asarray(mc_animal, np.int32), conf_frame=np.asarray(mc_frame, np.int32),
-        conf_mean=np.asarray(mc_mean, np.float32), conf_min=np.asarray(mc_min, np.float32),
-        census=np.array(json.dumps({k: c for k, (_r, c, _o, _m) in sorted(per_group.items())})))
-    total = {k: sum(c.get(k, 0) for _r, c, _o, _m in per_group.values())
-             for k in ('pairs_seen', 'pairs_no_prev', 'pairs_no_shared',
-                       'block_boundary_seams', 'block_boundary_frames')}
-    print(f'wrote overlap trace {path}: {len(dist)} (row, seam) pair(s); census {total}')
-
-
-_DET_BATCH = 16
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -256,125 +72,6 @@ class _Progress:
               f'({rate:.1f} frames/s)', flush=True)
 
 
-def check_frame_range(args) -> None:
-    """Refusals on `--start-frame` / `--end-frame`; pure argument arithmetic, so it fires above
-    both input branches and before the checkpoint loads.
-
-    Resolves the ONE quantity the loop reads: `args.frame_start` / `args.frame_stop`, with
-    `--max-frames N` folding into `frame_stop = N`. The group-length check lives in the group loop.
-    Three refusals fire here, numbered 15-17 in the infer/adopt refusal ledger.
-    """
-    if args.max_frames and (args.start_frame or args.end_frame):
-        raise SystemExit(
-            f'--max-frames {args.max_frames} together with --start-frame {args.start_frame} / '
-            f'--end-frame {args.end_frame} has two readings of equal force -- "N frames from the '
-            'start" and "up to frame N, from the start" -- and no defensible precedence, so a '
-            'rule here would make one of them silently wrong. --max-frames N IS --start-frame 0 '
-            '--end-frame N; pick one spelling.')
-    if args.start_frame < 0 or args.end_frame < 0:
-        raise SystemExit(
-            f'--start-frame {args.start_frame} / --end-frame {args.end_frame}: negative frame '
-            'indices are not Python negative indexing here. "-1 means the last frame" and "-1 '
-            'means one before the end" are both obvious and differ by one, which is the class of '
-            'ambiguity that costs a day.')
-    if args.end_frame and args.end_frame <= args.start_frame:
-        raise SystemExit(
-            f'--end-frame {args.end_frame} is not past --start-frame {args.start_frame}. The '
-            'range is half-open [start, end), so this predicts nothing; an empty range is a typo, '
-            'not a protocol.')
-    args.frame_start = int(args.start_frame)
-    args.frame_stop = int(args.end_frame or args.max_frames or 0)
-
-
-def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
-                    stats=None, box_source=None):
-    """-> `boxes_for(store, lo, hi)`, detecting and associating on demand for one group.
-
-    The detection cursor is not the block cursor: blocks are sized by free memory, and a
-    budget-derived batch would change the input shape and move the boxes. Detection advances in
-    its own globally `batch`-aligned runs and overshoots the block by up to `batch - 1` frames,
-    which the buffer below holds. `associate_group` carries its state, so identity sees one
-    continuous clip. Frames come from `store.read`, so the detector consumes the same decode the
-    pose loop crops -- one pass over the video.
-
-    One association state serves the whole group: restarting every `_DET_BATCH` frames would
-    break identity every 16 frames. The cursor starts on a global `_DET_BATCH` boundary at or
-    below `frame_start`, and the lead-in is discarded -- `detect_raw` asserts a slice starts on a
-    multiple of `batch`, since a short leading batch is an input SHAPE the whole-clip pass never
-    produces, so the boxes stay byte-identical to the whole-clip run's (do not relax the assert
-    or quantise `--start-frame` by 16). The cost is at most `batch - 1` extra frame-cameras,
-    once per group; leaving the cursor at 0 would decode every frame from 0 to `frame_start`
-    into a store sized for the work.
-    """
-    from tailcyclenet.infer.associate import associate_group
-    from tailcyclenet.infer.detect import detect_raw
-
-    T = min(sess.groups[gid].n_frames, args.frame_stop or sess.groups[gid].n_frames)
-    assoc_state, buf = {}, {}
-    cursor = args.frame_start - args.frame_start % _DET_BATCH
-
-    def boxes_for(store, lo, hi):
-        """Boxes for the frames [lo, hi): detect/associate on demand, served from the buffer.
-
-        Detection advances a group-wide cursor in `_DET_BATCH` runs and overshoots `hi`; the
-        results are buffered by source frame and sliced to the requested range on return.
-
-        Every frame is consumed by this window; later windows may need only the suffix beginning
-        at their start, so buffered raw detections before that next start are discarded.
-
-        `max_frames=T` passes the resolved STOP index -- not `args.max_frames` (0 whenever the
-        range came in as --start-frame/--end-frame): it tells `detect_raw` where the clip ends,
-        and its alignment assert accepts a short final slice only at that end. The aligned lead-in
-        below `frame_start` was detected to keep the batch partition and associated so the tracker
-        enters the range warm; it falls out of the buffer with every frame below `lo`, which can
-        never be asked for again (blocks advance monotonically).
-        """
-        nonlocal cursor
-        while cursor < hi:
-            end = min(cursor + _DET_BATCH, T)
-            raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
-                             score_thresh=args.det_score, reduce=det_red,
-                             iou_thresh=args.det_nms_iou,
-                             center_dist_thresh=args.det_nms_center_dist,
-                             max_frames=T, tile_scale=det_tile, box_source=box_source,
-                             frames=np.arange(cursor, end),
-                             trace=(stats.setdefault('decode_trace', [])
-                                    if args.det_trace else None),
-                             read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
-                                 ci, cam, fr, pool=pool, reduce=reduce))
-            b, s = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
-                                   min_views=args.min_views, track=args.track,
-                                   max_move=args.max_move,
-                                   max_age=args.max_age, stats=stats,
-                                   state=assoc_state,
-                                   duplicate_radius=args.duplicate_radius,
-                                   duplicate_persist=args.duplicate_persist,
-                                   frame_base=cursor)
-            for j, t in enumerate(range(cursor, end)):
-                buf[t] = (b[:, j], s[:, j])
-            if stats is not None:
-                stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
-                stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
-                if assoc_state.get('tracker') is not None:
-                    stats['identity_events'] = assoc_state['tracker'].events
-            cursor = end
-        want = range(lo, min(hi, T))
-        out = tuple(np.stack([buf[t][i] for t in want], 1) for i in range(2))
-        for t in [t for t in buf if t < lo]:
-            del buf[t]
-        return out
-
-    return boxes_for
-
-
-def _write_det_trace(path, groups):
-    """Write the `--det-trace` JSON: one decode trace list per group key, newline-terminated."""
-    import json
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(groups, indent=1) + '\n')
-
-
 def run_dataset(args):
     """One inference run.
 
@@ -415,11 +112,11 @@ def run_dataset(args):
         raise SystemExit('--scorer-checkpoint requires --scorer')
     if scorer_path is None and allow_pose_scorer_mismatch:
         raise SystemExit('--allow-pose-scorer-mismatch requires --scorer')
-    _refuse_selector_beside_file(args.run, args.checkpoint, '--pose',
+    refuse_selector_beside_file(args.run, args.checkpoint, '--pose',
                                  '--pose-checkpoint')
-    _refuse_selector_beside_file(scorer_path, scorer_checkpoint_name, '--scorer',
+    refuse_selector_beside_file(scorer_path, scorer_checkpoint_name, '--scorer',
                                  '--scorer-checkpoint')
-    _refuse_selector_beside_file(args.detector, args.detector_checkpoint,
+    refuse_selector_beside_file(args.detector, args.detector_checkpoint,
                                  '--detector', '--detector-checkpoint', default='latest')
     if args.anchor == 'labels':
         if args.detector or args.boxes:
@@ -432,7 +129,7 @@ def run_dataset(args):
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
 
     if args.oracle_corrupt:
-        from .window import ORACLE_CORRUPTIONS
+        from .oracle import ORACLE_CORRUPTIONS
         kind = args.oracle_corrupt.split(':')[0]
         if kind not in ORACLE_CORRUPTIONS:
             raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '
@@ -569,7 +266,7 @@ def run_dataset(args):
         if scorer_px != trained_px:
             raise SystemExit(f'{scorer_path}: scorer image_size={scorer_px} must equal pose '
                              f'image_size={trained_px}')
-        scorer_shared_encoder = _share_pose_scorer_encoder(
+        scorer_shared_encoder = share_pose_scorer_encoder(
             model, scorer, allow_mismatch=allow_pose_scorer_mismatch,
             pose_run=args.run, scorer_run=scorer_path)
         if scorer_shared_encoder:
@@ -674,7 +371,7 @@ def run_dataset(args):
               + (f' TILE at scale {det_tile:g}, whole-frame input derived per camera'
                  if det_tile else '')
               + f', trained on {trained_label!r}, boxes={det_boxsrc or "keypoints"})')
-        if ds_name and trained_datasets and not _detector_matches_source(
+        if ds_name and trained_datasets and not detector_matches_source(
                 trained_datasets, det_ds, ds_name) and not args.allow_detector_transfer:
             if len(trained_datasets) > 1:
                 raise SystemExit(
@@ -751,8 +448,8 @@ def run_dataset(args):
                                ('scorer_encoder_shared', bool(scorer_shared_encoder)),
                                ('pose_scorer_mismatch_allowed',
                                 bool(allow_pose_scorer_mismatch))]),
-                            *_box_provenance(args, det_tile, det_red, det_boxsrc).items(),
-                            *_identity_provenance(args).items()],
+                            *box_provenance(args, det_tile, det_red, det_boxsrc).items(),
+                            *identity_provenance(args).items()],
                            gids, quality_enabled=scorer is not None)
     det_trace_groups = {}
     overlap_rows = {}
@@ -772,7 +469,7 @@ def run_dataset(args):
                 print(f'{key}: detecting up to {n_det} per camera, {n_want} animal row(s)'
                       f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
                       flush=True)
-                boxes_for = _detector_boxes(
+                boxes_for = detector_boxes(
                     det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
                     stats=det_stats, box_source=det_boxsrc)
             if args.boxes and key not in boxes:
@@ -837,10 +534,10 @@ def run_dataset(args):
         writer.close(complete=_completed)
     progress.update(0, force=True)
     if args.det_trace:
-        _write_det_trace(args.det_trace, det_trace_groups)
+        write_det_trace(args.det_trace, det_trace_groups)
         print(f'wrote detector trace {args.det_trace}')
     if args.overlap_trace:
-        _write_overlap_trace(args.overlap_trace, overlap_rows)
+        write_overlap_trace(args.overlap_trace, overlap_rows)
     if args.identity_bridge:
         from . import bridge as _bridge
         _cfg = _bridge.BridgeConfig()

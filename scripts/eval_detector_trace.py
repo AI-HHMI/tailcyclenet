@@ -29,7 +29,7 @@ from tailcyclenet.infer.detect import detect_raw
 from tailcyclenet.detector.checkpoint import load_detector
 from tailcyclenet.detector.boxes import NMS_CENTER_DIST_DEPLOY, box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
-from tailcyclenet.infer.driver import detector_box_source
+from tailcyclenet.infer.loading import detector_box_source
 from tracktail.model.cube import project_points_torch
 
 

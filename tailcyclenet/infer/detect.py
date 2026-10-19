@@ -1,4 +1,8 @@
-"""The DETECTION half of deployment: decoded frames -> per-camera detections (`detect_raw`)."""
+"""The DETECTION half of deployment: frames -> per-camera detections (`detect_raw`), and the
+driver's detection cursor over a group (`detector_boxes`)."""
+from __future__ import annotations
+
+import numpy as np
 import torch
 
 from ..detector.boxes import NMS_CENTER_DIST_SELECT
@@ -187,3 +191,86 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         frame_pool.shutdown()
         pool.shutdown()
     return out, sc
+
+
+DET_BATCH = 16
+
+
+def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
+                    stats=None, box_source=None):
+    """-> `boxes_for(store, lo, hi)`, detecting and associating on demand for one group.
+
+    The detection cursor is not the block cursor: blocks are sized by free memory, and a
+    budget-derived batch would change the input shape and move the boxes. Detection advances in
+    its own globally `batch`-aligned runs and overshoots the block by up to `batch - 1` frames,
+    which the buffer below holds. `associate_group` carries its state, so identity sees one
+    continuous clip. Frames come from `store.read`, so the detector consumes the same decode the
+    pose loop crops -- one pass over the video.
+
+    One association state serves the whole group: restarting every `DET_BATCH` frames would
+    break identity every 16 frames. The cursor starts on a global `DET_BATCH` boundary at or
+    below `frame_start`, and the lead-in is discarded -- `detect_raw` asserts a slice starts on a
+    multiple of `batch`, since a short leading batch is an input SHAPE the whole-clip pass never
+    produces, so the boxes stay byte-identical to the whole-clip run's (do not relax the assert
+    or quantise `--start-frame` by 16). The cost is at most `batch - 1` extra frame-cameras,
+    once per group; leaving the cursor at 0 would decode every frame from 0 to `frame_start`
+    into a store sized for the work.
+    """
+    from .associate import associate_group
+
+    T = min(sess.groups[gid].n_frames, args.frame_stop or sess.groups[gid].n_frames)
+    assoc_state, buf = {}, {}
+    cursor = args.frame_start - args.frame_start % DET_BATCH
+
+    def boxes_for(store, lo, hi):
+        """Boxes for the frames [lo, hi): detect/associate on demand, served from the buffer.
+
+        Detection advances a group-wide cursor in `DET_BATCH` runs and overshoots `hi`; the
+        results are buffered by source frame and sliced to the requested range on return.
+
+        Every frame is consumed by this window; later windows may need only the suffix beginning
+        at their start, so buffered raw detections before that next start are discarded.
+
+        `max_frames=T` passes the resolved STOP index -- not `args.max_frames` (0 whenever the
+        range came in as --start-frame/--end-frame): it tells `detect_raw` where the clip ends,
+        and its alignment assert accepts a short final slice only at that end. The aligned lead-in
+        below `frame_start` was detected to keep the batch partition and associated so the tracker
+        enters the range warm; it falls out of the buffer with every frame below `lo`, which can
+        never be asked for again (blocks advance monotonically).
+        """
+        nonlocal cursor
+        while cursor < hi:
+            end = min(cursor + DET_BATCH, T)
+            raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
+                             score_thresh=args.det_score, reduce=det_red,
+                             iou_thresh=args.det_nms_iou,
+                             center_dist_thresh=args.det_nms_center_dist,
+                             max_frames=T, tile_scale=det_tile, box_source=box_source,
+                             frames=np.arange(cursor, end),
+                             trace=(stats.setdefault('decode_trace', [])
+                                    if args.det_trace else None),
+                             read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
+                                 ci, cam, fr, pool=pool, reduce=reduce))
+            b, s = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
+                                   min_views=args.min_views, track=args.track,
+                                   max_move=args.max_move,
+                                   max_age=args.max_age, stats=stats,
+                                   state=assoc_state,
+                                   duplicate_radius=args.duplicate_radius,
+                                   duplicate_persist=args.duplicate_persist,
+                                   frame_base=cursor)
+            for j, t in enumerate(range(cursor, end)):
+                buf[t] = (b[:, j], s[:, j])
+            if stats is not None:
+                stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
+                stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
+                if assoc_state.get('tracker') is not None:
+                    stats['identity_events'] = assoc_state['tracker'].events
+            cursor = end
+        want = range(lo, min(hi, T))
+        out = tuple(np.stack([buf[t][i] for t in want], 1) for i in range(2))
+        for t in [t for t in buf if t < lo]:
+            del buf[t]
+        return out
+
+    return boxes_for

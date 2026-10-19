@@ -1820,12 +1820,12 @@ def test_provenance_records_every_box_affecting_option():
     import inspect
 
     from tailcyclenet.infer.detect import detect_raw
-    from tailcyclenet.infer.driver import _box_provenance
+    from tailcyclenet.infer.provenance import box_provenance
 
     args = argparse.Namespace(detector=None, det_score=0.5, det_top_k=0,
                               max_animals=0, max_frames=0, frame_start=0, frame_stop=0,
                               det_nms_iou=0.5, det_nms_center_dist=None)
-    prov = _box_provenance(args, None, False, None)
+    prov = box_provenance(args, None, False, None)
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
     # `batch` is in there under protest: it is NOT inert but it is pinned rather
@@ -1852,7 +1852,7 @@ def test_provenance_records_every_box_affecting_option():
                                det_top_k=24, max_animals=2, max_frames=120,
                                frame_start=300, frame_stop=500, det_nms_iou=0.65,
                                det_nms_center_dist=0.25)
-    assert set(_box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
+    assert set(box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
 
 
@@ -1862,19 +1862,19 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     import inspect
 
     from tailcyclenet.infer.associate import associate_group
-    from tailcyclenet.infer.driver import _identity_provenance
+    from tailcyclenet.infer.provenance import identity_provenance
 
     from tailcyclenet.infer.cli import build_parser
 
     args = build_parser().parse_args(['--run', 'r', '--out', 'o'])
-    prov = _identity_provenance(args)
+    prov = identity_provenance(args)
 
     # Everything `associate_group` takes that can change which row a detection lands in. The rest
     # is plumbing: `raw`/`session`/`gid` are the inputs themselves, `max_instances` is already
-    # recorded as `max_animals` by `_box_provenance`, `stats` is a diagnostic sink, `state` is
+    # recorded as `max_animals` by `box_provenance`, `stats` is a diagnostic sink, `state` is
     # the block-boundary carry (recorded nowhere because it is derived, not chosen), and
     # `frame_base` is derived from `--start-frame`, already recorded as `frame_start` by
-    # `_box_provenance` -- it does not choose which row a detection lands in, only which
+    # `box_provenance` -- it does not choose which row a detection lands in, only which
     # SOURCE frame the tracker's own step 0 is (A6a).
     plumbing = {'raw', 'session', 'gid', 'max_instances', 'stats', 'state', 'frame_base'}
     params = set(inspect.signature(associate_group).parameters) - plumbing
@@ -1886,15 +1886,15 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
         f'{missing}. Two runs differing in one of them would be indistinguishable from their '
         'output alone, which is exactly how the stored 2D suppression arms became unmatchable.')
 
-    # UNCONDITIONAL, every key, always -- same rule as `_box_provenance`: conditional membership
+    # UNCONDITIONAL, every key, always -- same rule as `box_provenance`: conditional membership
     # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
     args2 = build_parser().parse_args([
         '--run', 'r', '--out', 'o', '--no-track', '--no-link-boxes', '--min-views', '1',
         '--max-move', '2.0', '--max-age', '24', '--duplicate-radius', '0.9',
         '--duplicate-persist', '8', '--identity-bridge'])
-    assert set(_identity_provenance(args2)) == set(prov), \
+    assert set(identity_provenance(args2)) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
-    assert _identity_provenance(args2)['max_age'] == 24
+    assert identity_provenance(args2)['max_age'] == 24
 
 
 def test_detector_run_directory_resolves_latest_last_and_best(tmp_path):

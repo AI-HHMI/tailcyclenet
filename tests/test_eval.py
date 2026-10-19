@@ -38,7 +38,7 @@ def _ranged_prediction(tmp_path, provenance):
     import conftest as cf
 
     from tailcyclenet.format import load_dataset
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
 
     root = tmp_path / 'data'
     cf._session_2d(root / 'test' / 's', T=8)

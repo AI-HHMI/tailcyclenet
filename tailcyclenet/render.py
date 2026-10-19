@@ -67,7 +67,7 @@ def project(session, pred, cam, gid=None, frames=None):
     is in SENSOR coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
     `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
     `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
-    pixels already -- the same call `infer._fill_box_agreement` makes, for the same reason. The
+    pixels already -- the same call `infer.crops.fill_box_agreement` makes, for the same reason. The
     projection is PER ANIMAL: `project_points_torch` aligns the (T,4,4) extrinsic against axis
     -3, so flattening (S,T) would project animal i through frame i's pose. Static cameras
     retain aniposelib's projection at zero skew; skewed cameras use the full-matrix path.

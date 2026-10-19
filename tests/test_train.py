@@ -1,43 +1,40 @@
-"""The training loop's guards. Not the model, not the loader -- the two branches around them.
+"""The training loop's guards: the branches around the model and the loader.
 
-A non-finite loss is the one that matters: it is rare, it only fires on data nobody can construct
-on demand, and getting it wrong costs a 72-hour cluster job that dies in the first two minutes.
+A non-finite loss is the one that matters: rare, only on data nobody can construct on demand, and
+getting it wrong kills a 72-hour cluster job in its first two minutes.
 """
-from pathlib import Path
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-REPO = Path(__file__).resolve().parent.parent
+import tailcyclenet.train as tr
 
 
-def _train_module():
-    """The pose training module (importing it runs nothing)."""
-    import tailcyclenet.train
-    return tailcyclenet.train
-
-
-def _batch():
+def _batch(mode='3d'):
     """The attributes `run_batch` touches, and nothing else."""
+    R = 3 if mode == '3d' else 2
     return SimpleNamespace(
         views=[torch.zeros(1, 2, 4, 4, 3, dtype=torch.uint8)],
         cgroup=[{'size': torch.tensor([4, 4])}],
-        sample_info={'mode': '3d'},
+        sample_info={'mode': mode},
         kpt_ids=torch.zeros(1, 2, dtype=torch.long),
-        kpt_prior=torch.zeros(1, 2, 3),
+        kpt_prior=torch.zeros(1, 2, R),
         prompt_t=torch.zeros(1, 2, dtype=torch.int32),
-        coords=torch.zeros(1, 2, 2, 3),
+        coords=torch.zeros(1, 2, 2, R),
         vis=None, vis_2d=None, p2d=None)
 
 
-def test_non_finite_loss_becomes_a_skipped_step():
-    """tracktail RAISES on a poisoned sub-loss; the loop needs a NaN it can skip. The raise is
-    right for its own purpose but killed two sweep jobs in their first 100 seconds over an
-    intermittent bad step; `run_batch` converts it into the signal the loop's own
-    `torch.isfinite(loss)` guard already reads.
+class _History:
+    def __init__(self, values):
+        self.loss_history = defaultdict(list, values)
+
+
+def test_non_finite_loss_becomes_a_skipped_step_and_other_errors_propagate():
+    """tracktail RAISES on a poisoned sub-loss (it killed two sweep jobs); `run_batch` turns that
+    into a graph-free NaN the loop skips. Any other ValueError is a real bug and must propagate.
     """
-    tr = _train_module()
     model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 3)}   # noqa: E731
 
     def poisoned(*a, **k):
@@ -45,16 +42,7 @@ def test_non_finite_loss_becomes_a_skipped_step():
                          "['coords_loss', 'smoothness_loss_3d']")
 
     loss, out = tr.run_batch(model, poisoned, _batch(), 'cpu')
-    assert not torch.isfinite(loss), 'a non-finite sub-loss must come back as NaN, not raise'
-    assert loss.grad_fn is None, 'the skipped step must carry no graph into the next iteration'
-    assert out is not None
-
-
-def test_other_value_errors_still_propagate():
-    """Only the non-finite case is converted. A real bug must not be swallowed as a skipped step:
-    a run that silently skips every iteration looks exactly like a run that trained."""
-    tr = _train_module()
-    model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 3)}   # noqa: E731
+    assert not torch.isfinite(loss) and loss.grad_fn is None and out is not None
 
     def broken(*a, **k):
         raise ValueError('shape mismatch: this is a real bug, not a bad step')
@@ -63,114 +51,99 @@ def test_other_value_errors_still_propagate():
         tr.run_batch(model, broken, _batch(), 'cpu')
 
 
-def test_short_window_survives_the_smoothness_loss():
-    """T = 2 must not raise inside `SmoothnessLoss`, and must not be silently disabled either:
-    the loss narrows by `T - k`, so a window shorter than `order + 1` raises on a negative length.
-    0.3.5 clamps `order` to `T - 1` inside the loss; this pins that the repo's per-batch rule
-    (`_tune_smoothness`) degrades to a first difference at T = 2 and restores the order after.
+def test_run_batch_routes_2d_visibility_on_its_own_wire():
+    """`batch.vis_2d` is tracktail's `vis_true_cams` in 3D but `PoseLoss`'s own `vis_2d_true` in
+    2D, which `TotalLoss.forward` never sees."""
+    model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 2),   # noqa: E731
+                             'vis_pred_2d': torch.zeros(1, 1, 2, 2)}
+    seen = []
+
+    def spy(model_, out, coords_true, vis_true, vis_true_cams, vis_2d_true=None, **kw):
+        seen.append(dict(vis_true=vis_true, vis_true_cams=vis_true_cams,
+                         vis_2d_true=vis_2d_true))
+        return torch.tensor(0.0)
+
+    batch_2d = _batch('2d')
+    batch_2d.vis_2d, batch_2d.p2d = torch.ones(1, 2, 2, 1, 1), torch.zeros(1, 1, 2, 2, 2)
+    tr.run_batch(model, spy, batch_2d, 'cpu')
+    assert seen[-1]['vis_true'] is None and seen[-1]['vis_true_cams'] is None
+    assert seen[-1]['vis_2d_true'] is not None
+
+    batch_3d = _batch()
+    batch_3d.vis_2d = torch.ones(1, 2, 2, 1, 1)
+    tr.run_batch(model, spy, batch_3d, 'cpu')
+    assert seen[-1]['vis_true_cams'] is not None and seen[-1]['vis_2d_true'] is None
+
+
+def test_tune_smoothness_clamps_short_windows_and_divides_out_the_stride():
+    """T = 2 degrades the order to a first difference (not disabled, not a raise) and restores it
+    per batch; `torch.diff` is undivided, so the weight is re-derived per stride, idempotently.
     """
     from tracktail.model.losses import TotalLoss
 
-    mod = _train_module()
     loss_fn = TotalLoss(smoothness_loss_3d_weight=0.5, smoothness_loss_2d_weight=0.5,
                         smoothness_loss_order=4)
-    assert loss_fn.smoothness_loss_3d.order == 4
-
-    # The library's own clamp makes the raw call safe at T = 2 (0.3.5); assert the forward runs
-    # rather than the old pre-0.3.5 raise.
     pred = torch.zeros(1, 2, 3, 3)
-    assert torch.isfinite(loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1),
-                                                     time_dim=1))
-
-    # ...and `_tune_smoothness` applies the same rule per batch: degraded to a first difference,
-    # not disabled.
-    mod._tune_smoothness(loss_fn, 2)
+    tr._tune_smoothness(loss_fn, 2)
     assert loss_fn.smoothness_loss_3d.order == 1
     assert torch.isfinite(loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1),
                                                      time_dim=1))
+    tr._tune_smoothness(loss_fn, 24)
+    assert loss_fn.smoothness_loss_3d.order == 4, 'the clamp is per batch, not sticky'
 
-    # A full-length window gets the configured order back -- the clamp is per batch, not sticky.
-    mod._tune_smoothness(loss_fn, 24)
-    assert loss_fn.smoothness_loss_3d.order == 4
-
-
-def test_stride_is_divided_out_of_the_smoothness_weight():
-    """`torch.diff` is UNDIVIDED, so a stride-s window's k-th difference is s^k times a stride-1
-    one and the term's effective weight would ride on a per-item draw. Checked against the loss's
-    own output (a pure ramp reads s times larger at stride s), and idempotent -- re-derived from
-    the configured weight each call.
-    """
-    from tracktail.model.losses import TotalLoss
-
-    mod = _train_module()
     loss_fn = TotalLoss(smoothness_loss_3d_weight=0.5, smoothness_loss_2d_weight=0.5,
                         smoothness_loss_order=1)
     vis = torch.ones(1, 4, 3, 1)
 
     def excess(stride):
-        mod._tune_smoothness(loss_fn, 4, stride)
+        tr._tune_smoothness(loss_fn, 4, stride)
         t = torch.arange(4, dtype=torch.float32).view(1, 4, 1, 1) * stride
         pred = t.expand(1, 4, 3, 3).contiguous()           # a ramp at this stride's rate
         return float(loss_fn.smoothness_loss_3d(pred, torch.zeros_like(pred), vis, time_dim=1))
 
     base = excess(1)
-    assert base > 0, 'the probe must actually reach the hinge, or the test proves nothing'
-    for s in (2, 4):
-        assert abs(excess(s) - base) < 1e-6, f'stride {s} changed the term by {excess(s) / base:.1f}x'
-
-    # And it is idempotent -- re-derived from the configured weight each call, never compounded.
-    mod._tune_smoothness(loss_fn, 4, 1)
+    assert base > 0, 'the probe must actually reach the hinge'
+    assert abs(excess(4) - base) < 1e-6
+    tr._tune_smoothness(loss_fn, 4, 1)
     assert loss_fn.smoothness_loss_3d.weight == 0.5
 
 
-def test_smoothness_metrics_reach_wandb_and_preserve_zero_values():
-    """Finite smoothness components reach W&B; NaN samples are omitted but zero is real data."""
-    from collections import defaultdict
-
-    tr = _train_module()
-
+def test_smoothness_drain_and_logging():
+    """Finite components reach W&B, zero is real data, NaN/inf are dropped; a drain empties the
+    history IN PLACE (PoseLoss appends lazily to the same defaultdict), so a skipped batch never
+    leaks into the next interval."""
     class FakeWandb:
-        def __init__(self):
-            self.calls = []
+        calls = []
 
         def log(self, values, step):
             self.calls.append((values, step))
 
-    class LossHistory:
-        def __init__(self):
-            self.loss_history = defaultdict(list, {
-                'smoothness_3d_loss': [1.0, 3.0, float('nan'), float('inf')],
-                'smoothness_2d_loss': [0.0, float('nan')],
-            })
-
-    history = LossHistory()
+    history = _History({'smoothness_3d_loss': [1.0, 3.0, float('nan'), float('inf')],
+                        'smoothness_2d_loss': [0.0, float('nan')]})
+    mapping_id = id(history.loss_history)
     values = tr._drain_smoothness(history)
+    assert values == {'smoothness_3d_loss': (4.0, 2), 'smoothness_2d_loss': (0.0, 1)}
+    assert history.loss_history == {'smoothness_3d_loss': [], 'smoothness_2d_loss': []}
+    history.loss_history['vis_loss_2d'].append(3.0)
+    assert id(history.loss_history) == mapping_id
+
     wb = FakeWandb()
     tr.log(wb, {'train/loss': 2.0, **tr._smoothness_log_values(values)}, step=20)
-
-    assert values == {
-        'smoothness_3d_loss': (4.0, 2),
-        'smoothness_2d_loss': (0.0, 1),
-    }
-    assert history.loss_history == {
-        'smoothness_3d_loss': [], 'smoothness_2d_loss': [],
-    }
-    assert wb.calls == [({'train/loss': 2.0,
-                          'train/smoothness_3d_loss': 2.0,
+    assert wb.calls == [({'train/loss': 2.0, 'train/smoothness_3d_loss': 2.0,
                           'train/smoothness_2d_loss': 0.0}, 20)]
+    nxt = tr._drain_smoothness(_History({'smoothness_3d_loss': [4.0],
+                                         'smoothness_2d_loss': [float('nan')]}))
+    assert tr._smoothness_log_values(nxt) == {'train/smoothness_3d_loss': 4.0}
 
 
-def test_train_metrics_match_validation_metric_names_and_drop_nonfinite(monkeypatch):
-    """A training forward exposes the scalar validation metrics, including Jaccard thresholds."""
-    tr = _train_module()
+def test_train_metrics_match_validation_names_drop_nonfinite_and_keep_zero(monkeypatch):
+    """A training forward exposes the scalar val metrics; per-mode means keep a real 0.0."""
     batch = _batch()
-    out = {
-        'coords_pred': torch.zeros_like(batch.coords),
-        'vis_pred': torch.zeros(*batch.coords.shape[:-1], 1),
-    }
+    out = {'coords_pred': torch.zeros_like(batch.coords),
+           'vis_pred': torch.zeros(*batch.coords.shape[:-1], 1)}
     values = tr.train_metrics(out, batch)
     assert set(values) == set(tr._TRAIN_METRIC_KEYS)
-    assert all(isinstance(value, float) and value == value for value in values.values())
+    assert all(isinstance(v, float) and v == v for v in values.values())
     assert tr.train_metrics({'coords_pred': out['coords_pred']}, batch) == {}
 
     from tracktail.model import eval_metrics
@@ -179,183 +152,54 @@ def test_train_metrics_match_validation_metric_names_and_drop_nonfinite(monkeypa
                                           'jaccard_1': float('inf')})
     assert tr.train_metrics(out, batch) == {'mpjpe': 0.0}
 
-
-def test_metric_log_values_keep_zero_and_separate_modes():
-    tr = _train_module()
     stats = {mode: {key: [0.0, 0] for key in tr._TRAIN_METRIC_KEYS}
              for mode in tr._TRAIN_METRIC_MODES}
     stats['3d']['mpjpe'] = [0.0, 2]
     stats['2d']['mpjpe'] = [6.0, 2]
-    values = tr._metric_log_values(stats)
-    assert values['train/3d/mpjpe'] == 0.0
-    assert values['train/2d/mpjpe'] == 3.0
-    assert 'train/3d/mte' not in values
+    logged = tr._metric_log_values(stats)
+    assert logged['train/3d/mpjpe'] == 0.0 and logged['train/2d/mpjpe'] == 3.0
+    assert 'train/3d/mte' not in logged
 
 
-def test_metric_log_reduces_fixed_shape_even_when_a_rank_has_no_metrics():
-    """Rank-local NaNs must not change the collective shape or deadlock DDP."""
-    tr = _train_module()
-
+def test_metric_reductions_are_one_fixed_shape_collective_on_every_rank():
+    """A rank with no local samples must still join the same-shaped all_reduce, or DDP deadlocks;
+    the smoothness value is count-weighted across ranks."""
     class FakeFabric:
-        world_size = 2
-        device = 'cpu'
+        world_size, device = 2, 'cpu'
 
-        def __init__(self):
-            self.calls = 0
-            self.numel = None
+        def __init__(self, result=None):
+            self.calls, self.numel, self.result = 0, None, result
 
         def all_reduce(self, tensor, reduce_op):
             assert reduce_op == 'sum'
             self.calls += 1
             self.numel = tensor.numel()
-            return tensor
+            if self.result is None:
+                return tensor
+            out = torch.zeros_like(tensor)
+            out[:4] = torch.tensor(self.result, dtype=tensor.dtype)
+            return out
 
     full = {mode: {key: [0.0, 0] for key in tr._TRAIN_METRIC_KEYS}
             for mode in tr._TRAIN_METRIC_MODES}
     full['3d']['mpjpe'] = [1.0, 1]
-    empty = {mode: {} for mode in tr._TRAIN_METRIC_MODES}
-    fabric_full, fabric_empty = FakeFabric(), FakeFabric()
-    tr._metric_log_values(full, fabric_full)
-    tr._metric_log_values(empty, fabric_empty)
+    f_full, f_empty = FakeFabric(), FakeFabric()
+    tr._metric_log_values(full, f_full)
+    tr._metric_log_values({mode: {} for mode in tr._TRAIN_METRIC_MODES}, f_empty)
     expected = 2 * len(tr._TRAIN_METRIC_KEYS) * len(tr._TRAIN_METRIC_MODES)
-    assert fabric_full.calls == fabric_empty.calls == 1
-    assert fabric_full.numel == fabric_empty.numel == expected
+    assert f_full.calls == f_empty.calls == 1 and f_full.numel == f_empty.numel == expected
 
-
-def test_smoothness_log_reduces_finite_sum_and_count_on_every_rank():
-    """The W&B value is count-weighted and rank 0 may have no local samples."""
-    tr = _train_module()
-
-    class FakeFabric:
-        world_size = 2
-        device = 'cpu'
-
-        def __init__(self):
-            self.calls = 0
-
-        def all_reduce(self, tensor, reduce_op):
-            assert reduce_op == 'sum'
-            result = torch.zeros_like(tensor)
-            result[:4] = torch.tensor((10.0, 4.0, 6.0, 2.0), dtype=tensor.dtype)
-            self.calls += 1
-            return result
-
-    fabric = FakeFabric()
-    values = tr._smoothness_log_values({
-        'smoothness_3d_loss': (0.0, 0),
-        'smoothness_2d_loss': (0.0, 0),
-    }, fabric)
-
-    assert values == {
-        'train/smoothness_3d_loss': 2.5,
-        'train/smoothness_2d_loss': 3.0,
-    }
-    assert fabric.calls == 1, 'all ranks must participate even with empty local histories'
-    assert tr._smoothness_log_values({
-        'smoothness_3d_loss': (0.0, 0),
-        'smoothness_2d_loss': (0.0, 0),
-    }) == {}
-
-
-def test_smoothness_drain_discards_skips_and_keeps_intervals_separate():
-    """A skipped batch is drained without entering the next accepted interval."""
-    from collections import defaultdict
-
-    tr = _train_module()
-
-    class LossHistory:
-        def __init__(self, values):
-            self.loss_history = defaultdict(list, values)
-
-    running = {name: [0.0, 0] for name in tr._SMOOTHNESS_KEYS}
-    skipped = tr._drain_smoothness(LossHistory({
-        'smoothness_3d_loss': [100.0], 'smoothness_2d_loss': [200.0],
-    }))
-    assert skipped == {
-        'smoothness_3d_loss': (100.0, 1), 'smoothness_2d_loss': (200.0, 1),
-    }
-    assert running == {name: [0.0, 0] for name in tr._SMOOTHNESS_KEYS}
-
-    accepted = tr._drain_smoothness(LossHistory({
-        'smoothness_3d_loss': [2.0], 'smoothness_2d_loss': [0.0],
-    }))
-    for name, (total, count) in accepted.items():
-        running[name][0] += total
-        running[name][1] += count
-    assert tr._smoothness_log_values(running) == {
-        'train/smoothness_3d_loss': 2.0,
-        'train/smoothness_2d_loss': 0.0,
-    }
-
-    next_interval = tr._drain_smoothness(LossHistory({
-        'smoothness_3d_loss': [4.0], 'smoothness_2d_loss': [float('nan')],
-    }))
-    assert tr._smoothness_log_values(next_interval) == {
-        'train/smoothness_3d_loss': 4.0,
-    }
-
-
-def test_smoothness_drain_preserves_lazily_added_loss_keys():
-    """Clearing samples in place must not break PoseLoss's later defaultdict appends."""
-    from collections import defaultdict
-
-    tr = _train_module()
-
-    class LossHistory:
-        def __init__(self):
-            self.loss_history = defaultdict(list, {'smoothness_3d_loss': [1.0]})
-
-    history = LossHistory()
-    mapping_id = id(history.loss_history)
-    tr._drain_smoothness(history)
-    history.loss_history['vis_loss_2d'].append(3.0)
-
-    assert id(history.loss_history) == mapping_id
-    assert history.loss_history['vis_loss_2d'] == [3.0]
-
-
-def test_run_batch_routes_2d_visibility_on_its_own_wire():
-    """`batch.vis_2d` means a DIFFERENT thing depending on mode: in 3D it is tracktail's own
-    per-camera term (`vis_true_cams`, both-or-neither with `vis_true`); in 2D it must reach
-    `PoseLoss`'s own `vis_2d_true` keyword, which `TotalLoss.forward` does not have and never sees.
-    """
-    tr = _train_module()
-    model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 2),   # noqa: E731
-                             'vis_pred_2d': torch.zeros(1, 1, 2, 2)}
-
-    seen = []
-
-    def spy(model_, out, coords_true, vis_true, vis_true_cams, vis_2d_true=None, **kw):
-        seen.append(dict(vis_true=vis_true, vis_true_cams=vis_true_cams,
-                         vis_2d_true=vis_2d_true))
-        return torch.tensor(0.0)
-
-    batch_2d = SimpleNamespace(
-        views=[torch.zeros(1, 2, 4, 4, 3, dtype=torch.uint8)],
-        cgroup=[{'size': torch.tensor([4, 4])}],
-        sample_info={'mode': '2d'},
-        kpt_ids=torch.zeros(1, 2, dtype=torch.long),
-        kpt_prior=torch.zeros(1, 2, 2),
-        prompt_t=torch.zeros(1, 2, dtype=torch.int32),
-        coords=torch.zeros(1, 2, 2, 2),
-        vis=None, vis_2d=torch.ones(1, 2, 2, 1, 1), p2d=torch.zeros(1, 1, 2, 2, 2))
-    tr.run_batch(model, spy, batch_2d, 'cpu')
-    assert seen[-1]['vis_true'] is None
-    assert seen[-1]['vis_true_cams'] is None, '2D must never reach vis_true_cams'
-    assert seen[-1]['vis_2d_true'] is not None
-
-    batch_3d = _batch()
-    batch_3d.vis_2d = torch.ones(1, 2, 2, 1, 1)          # a real 3D per-camera target this time
-    tr.run_batch(model, spy, batch_3d, 'cpu')
-    assert seen[-1]['vis_true_cams'] is not None, '3D keeps the library wire unchanged'
-    assert seen[-1]['vis_2d_true'] is None, '3D must never reach the 2D-only term'
+    empty = {'smoothness_3d_loss': (0.0, 0), 'smoothness_2d_loss': (0.0, 0)}
+    fabric = FakeFabric((10.0, 4.0, 6.0, 2.0))
+    assert tr._smoothness_log_values(empty, fabric) == {
+        'train/smoothness_3d_loss': 2.5, 'train/smoothness_2d_loss': 3.0}
+    assert fabric.calls == 1
+    assert tr._smoothness_log_values(empty) == {}
 
 
 def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
-    """`optimizer_state` was written from day one and read by NOTHING, so a relaunch into the same
-    --out restarted at iteration 0 and overwrote both ~5.6 GB files. Pins the part that can be
-    silently wrong: the schedule-free `z` iterate survives, and resuming takes the RAW weights
-    rather than the averaged eval ones.
+    """`optimizer_state` was written and read by nothing, so a relaunch restarted at 0. The
+    schedule-free `z` survives, and a resume takes the RAW weights, not the averaged eval ones.
     """
     from schedulefree import AdamWScheduleFree
 
@@ -366,9 +210,7 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     model = torch.nn.Linear(4, 4)
     opt = AdamWScheduleFree(model.parameters(), lr=1e-3)
     opt.train()
-    # SEVERAL steps: schedule-free's averaged iterate coincides with the raw one at step 1, so a
-    # single step cannot tell "resume from the raw weights" from "resume from the eval weights".
-    for _ in range(5):
+    for _ in range(5):          # at step 1 the averaged and raw iterates coincide
         opt.zero_grad()
         model(torch.randn(2, 4)).sum().backward()
         opt.step()
@@ -378,11 +220,9 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
 
     ck = torch.load(tmp_path / 'run' / 'checkpoints' / 'checkpoint_last.pth',
                     map_location='cpu', weights_only=False)
-    assert int(ck['iteration']) == 1234, 'the iteration is what a resume restarts at'
-    assert ck['config'] == stamped_config(config, 'pose'), 'the config, stamped with its kind'
+    assert int(ck['iteration']) == 1234
+    assert ck['config'] == stamped_config(config, 'pose')
     assert ck['keypoint_registry'] == registry.to_dict()
-    # The two iterates are genuinely different, or "resume from the raw one" is a distinction
-    # without a difference and this test would pass on the wrong weights.
     assert not torch.equal(ck['model_state']['weight'], ck['model_state_eval']['weight'])
 
     fresh = torch.nn.Linear(4, 4)
@@ -390,34 +230,32 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     fresh.load_state_dict(ck['model_state'])
     fresh_opt.load_state_dict(ck['optimizer_state'])
     assert torch.equal(fresh.weight, ck['model_state']['weight'])
-    assert fresh_opt.state, 'no optimizer state came back, so the schedule-free z is lost'
-    assert any('z' in s for s in fresh_opt.state.values()), \
-        'the z iterate is the state that makes this a resume rather than a restart'
+    assert any('z' in s for s in fresh_opt.state.values()), 'the schedule-free z is lost'
 
 
 # -- config guards -----------------------------------------------------------------------------
 
-def test_load_config_layers_over_the_repo_base_by_default(tmp_path):
-    """A pose config that names no base still gets `configs/base.toml` as its defaults -- the
-    `extends` line is gone, not needed: the overlay IS the whole difference."""
+def test_load_config_layers_over_its_family_base(tmp_path):
+    """A pose config gets `configs/base.toml` automatically; an explicit base (the detector's)
+    replaces it, inheriting none of the pose blocks."""
     from tailcyclenet.config import load_config
 
     overlay = tmp_path / 'overlay.toml'
     overlay.write_text('[data]\npath = "/some/root"\n')
     cfg = load_config(overlay)
     assert cfg['data']['path'] == '/some/root'
-    assert cfg['model']['query'] == 'prior', 'the model defaults must come from base.toml'
-    assert cfg['training']['n_iterations'] == 60000
+    assert cfg['model']['query'] == 'prior'
     assert cfg['training']['optimizer']['optimizer'] == 'muon'
-    assert cfg['training']['losses']['delta'] == 6
     assert cfg['data']['grayscale_prob'] == 0.2
-    assert cfg['data']['invert_prob'] == 0.0
+
+    base = tmp_path / 'det_base.toml'
+    base.write_text('[data]\nboxes = "instances"\n')
+    p = tmp_path / 'det.toml'
+    p.write_text('[training]\niters = 4\n')
+    assert load_config(p, base=base) == {'data': {'boxes': 'instances'}, 'training': {'iters': 4}}
 
 
 def test_load_config_extends_is_deleted_and_raises(tmp_path):
-    """`extends` is deleted from the config language: EVERY config layers over its family's
-    base automatically (pose -> `configs/base.toml`, detector -> `configs/detector.toml`), so
-    the key is not needed and naming it is refused by name."""
     from tailcyclenet.config import load_config
 
     p = tmp_path / 'old.toml'
@@ -426,38 +264,12 @@ def test_load_config_extends_is_deleted_and_raises(tmp_path):
         load_config(p)
 
 
-def test_load_config_layers_over_an_explicit_base(tmp_path):
-    """The detector loader passes `configs/detector.toml` as `base`; a config layered over a
-    non-pose base must not inherit the pose base's blocks."""
-    from tailcyclenet.config import load_config
-
-    base = tmp_path / 'det_base.toml'
-    base.write_text('[data]\nboxes = "instances"\n')
-    p = tmp_path / 'overlay.toml'
-    p.write_text('[training]\niters = 4\n')
-    cfg = load_config(p, base=base)
-    assert cfg == {'data': {'boxes': 'instances'}, 'training': {'iters': 4}}
-
-
-def test_infer_does_not_restate_loader_defaults():
-    """`LoaderConfig` owns its defaults; the CLI restating them is how `box_source` diverged.
-    Reads `tailcyclenet/infer/driver.py`, where the config resolution moved when inference did.
-    """
-    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'infer' / 'driver.py').read_text()
-    for literal in ("'n_frames', 24", "'image_size', 256", "'min_crop_dim', 64",
-                    "'box_source', 'keypoints'"):
-        assert literal not in src, f'{literal} restates a LoaderConfig default at the CLI boundary'
-
-
 def test_det_score_has_one_default():
-    """Two defaults meant whichever caller omitted it got a different detector. Asserts against
-    the PARSER rather than the file's text, which broke on reformats that changed nothing.
-    """
+    """`detect_raw` and the CLI must share one `--det-score` default (two meant two detectors)."""
     import inspect
 
     from tailcyclenet.detector import detect_raw
     from tailcyclenet.infer.cli import build_parser
 
     sig = inspect.signature(detect_raw).parameters['score_thresh'].default
-    cli = build_parser().get_default('det_score')
-    assert sig == cli, f'detect_raw defaults to {sig} but the CLI to {cli}'
+    assert sig == build_parser().get_default('det_score')

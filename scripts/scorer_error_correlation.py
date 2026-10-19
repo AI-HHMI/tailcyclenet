@@ -17,7 +17,7 @@ are assigned to the LAST window containing them (CLAUDE.md eval rule 11) -- a pe
 must use the seam rule's own frame->window assignment.
 
     pixi run python scripts/scorer_error_correlation.py --scores qc/scores.pq \\
-        --pred-root scratch/gated/predroot --ref-root <3dpop root> --config configs/scorer-3dpop.toml
+        --pred-root scratch/gated/predroot --ref-root <3dpop root> --config <scorers>/scorer-3dpop/config.toml
 """
 
 from __future__ import annotations

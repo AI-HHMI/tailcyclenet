@@ -8,7 +8,7 @@ family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose ch
 `checkpoints.save_checkpoint` / `save_run_meta` with `kind='scorer'`, and `train.build_optimizer`
 (so Muon routing and the fresh-parameter rule are one implementation).
 
-    pixi run python scripts/train_scorer.py --config configs/scorer-3dpop.toml --data <root> \
+    pixi run python scripts/train_scorer.py --config configs/scorer.toml --data <root> \
         --out <results>/scorers/scorer-3dpop --checkpoint <pose run folder>
 """
 from __future__ import annotations

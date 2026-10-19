@@ -107,7 +107,6 @@ def rig_from_metadata(meta: dict) -> fmt.Rig:
 
 def rig_from_pixels(trial: Path, spec: dict) -> fmt.Rig:
     """No metadata.yaml (rat-city, branson-fly): one uncalibrated camera, size from the images."""
-    from aniposelib.cameras import CameraGroup
     from PIL import Image
 
     cam_dirs = sorted(p for p in (trial / 'img').iterdir() if p.is_dir())
@@ -118,9 +117,7 @@ def rig_from_pixels(trial: Path, spec: dict) -> fmt.Rig:
     if wh is None:
         with Image.open(sorted(cam_dirs[0].iterdir())[0]) as im:
             wh = im.size
-    cam = fmt.nominal_camera(name, wh)
-    return fmt.Rig(CameraGroup([cam]), offset={name: (0.0, 0.0)},
-                   moving={name: False}, calibrated={name: False})
+    return fmt.nominal_rig(name, wh)
 
 
 def rig_key(rig: fmt.Rig) -> str:

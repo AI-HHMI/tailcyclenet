@@ -41,9 +41,6 @@ import toml
 
 from .predictions import load_predictions
 
-# Every per-row field a permutation must carry, so a repaired session stays self-consistent.
-ROW_FIELDS = ('pred', 'pred2d', 'boxes', 'conf', 'box_agree', 'kpt_agree')
-
 # The events that mark a hard interaction. Both are written by the duplicate backstop: the loser
 # is `retired_duplicate`, the winner is `shielded`. A `born`/`birth_refused` row is churn, not an
 # interaction, and including it would widen every episode to no purpose.
@@ -338,73 +335,6 @@ def _is_noop(plan: dict) -> bool:
     return not plan.get('windows') and plan.get('release') is None
 
 
-def apply_plan(rows: dict, segments: dict[int, np.ndarray], plan: dict,
-               n_frames: int) -> dict:
-    """Apply one episode's plan to the row arrays: fill the quarantine, permute from the release.
-
-    The permutation is applied to EVERY per-row field together, so a bridged session cannot end
-    up with pose from one animal and boxes from another. Rows outside the component are
-    byte-unchanged, and so is every frame before the quarantine.
-
-    The release PERSISTS to the end of the clip, not just to the end of the bridged range: a
-    resolved identity holds until something else changes it, and stopping at the range edge would
-    re-introduce the very swap this just repaired, one window later.
-    """
-    component = np.asarray(plan['component'])
-    quarantined = [w for w in plan['windows']
-                   if plan['release'] is None or w < plan['release']]
-    quarantine = (np.concatenate([segments[w] for w in quarantined])
-                  if quarantined else np.empty(0, int))
-    if plan['release'] is None:
-        released = np.empty(0, int)
-    else:
-        tail = [segments[w] for w in plan['windows'] if w >= plan['release']]
-        last = int(np.concatenate(tail)[-1]) if tail else -1
-        released = (np.concatenate(tail + [np.arange(last + 1, n_frames, dtype=int)])
-                    if tail else released)
-    out = {}
-    for key, value in rows.items():
-        if key not in ROW_FIELDS or not isinstance(value, np.ndarray) or not value.size:
-            out[key] = value
-            continue
-        changed = value.copy()
-        if len(released):
-            original = value[:, released]
-            for logical, local in zip(plan['component'], plan['mapping']):
-                changed[logical, released] = original[local]
-        if len(quarantine):
-            changed[component[:, None], quarantine] = np.nan
-        out[key] = changed
-    return out
-
-
-def bridge_group(rows: dict, windows: pl.DataFrame, events: pl.DataFrame, gid: str,
-                 n_frames: int, window_length: int, cfg: BridgeConfig) -> tuple[dict, list[dict]]:
-    """Bridge every episode in one group, latest first. Returns the rows and the decisions.
-
-    Episodes are applied LATEST FIRST so an earlier episode's quarantine and persistence cannot
-    be overwritten by a later one's tail: each repair's persistence runs to the end of the clip,
-    so they must be laid down in reverse temporal order to compose correctly.
-    """
-    cfg.validate()
-    pred = rows.get('pred')
-    if pred is None or not isinstance(pred, np.ndarray) or pred.ndim != 4:
-        return rows, []
-    segments = owned_segments(windows, gid, n_frames, window_length)
-    found = episodes(events, gid, cfg.max_event_gap)
-    decisions = []
-    for ep in sorted(found, key=lambda e: e['first_frame'], reverse=True):
-        plan = plan_episode(rows['pred'], segments, ep, cfg)
-        if plan is None:
-            decisions.append({'component': list(ep['component']), 'skipped': True,
-                              'event_frames': [ep['first_frame'], ep['last_frame']]})
-            continue
-        if not _is_noop(plan):
-            rows = apply_plan(rows, segments, plan, n_frames)
-        decisions.append(plan)
-    return rows, list(reversed(decisions))
-
-
 def _plan_frames(segments: dict[int, np.ndarray], plan: dict, n_frames: int):
     """The (quarantined, released) frame index arrays this plan implies."""
     quarantined = [w for w in plan['windows']
@@ -420,151 +350,14 @@ def _plan_frames(segments: dict[int, np.ndarray], plan: dict, n_frames: int):
     return quarantine, np.concatenate(tail + [np.arange(last + 1, n_frames, dtype=int)])
 
 
-def boundary_fill_map(pred: np.ndarray, fill_pred: np.ndarray, frame: int,
-                      component: tuple[int, ...]) -> dict[int, int] | None:
-    """Map standard slots onto fill slots at one boundary frame, one-to-one by centre distance.
-
-    `pred` is the standard session's (S, T, N, 3) pose array and `fill_pred` the fill pass's, both
-    over the same clip. At `frame` the standard's component slots are still themselves -- the
-    quarantine starts after -- so their centroids are the identification the map needs; the fill
-    pass's rows are matched one-to-one by 3D centre distance (Hungarian on the rectangular
-    matrix, each standard slot to its nearest distinct fill row). Returns {standard_slot:
-    fill_slot}, or None when any centroid is missing or `frame` is outside the clip: a boundary
-    the map cannot be computed at is a boundary the fill refuses rather than guesses at.
-    """
-    from scipy.optimize import linear_sum_assignment
-    if frame < 0 or frame >= pred.shape[1] or frame >= fill_pred.shape[1]:
-        return None
-    rows = [int(i) for i in component]
-    std = np.array([np.nanmean(pred[i, frame], axis=0) if np.isfinite(pred[i, frame]).any()
-                    else np.full(pred.shape[-1], np.nan) for i in rows])
-    fill_rows = [j for j in range(fill_pred.shape[0])
-                 if np.isfinite(fill_pred[j, frame]).any()]
-    if not fill_rows or not np.isfinite(std).all():
-        return None
-    fill_c = np.array([np.nanmean(fill_pred[j, frame], axis=0) for j in fill_rows])
-    dist = np.linalg.norm(std[:, None, :] - fill_c[None, :, :], axis=-1)
-    si, fj = linear_sum_assignment(dist)
-    return {rows[a]: fill_rows[b] for a, b in zip(si, fj)}
-
-
-# Columns a fill row BORROWS wholesale; everything else ((group_id, frame, animal_id) plus the
-# structural bodypart/camera) stays the standard session's own.
-_FILL_MEAS_COLS = frozenset({'status', 'x', 'y', 'z', 'score', 'score_logit',
-                             'box_agree', 'x0', 'y0', 'x1', 'y1',
-                             'visibility_logit', 'visibility_probability',
-                             'confidence_logit', 'confidence_probability',
-                             'confidence_2d', 'confidence_2d_logit',
-                             'quality_score', 'quality_precision'})
-
-
-def _key_value(value):
-    """Make scalar parquet values safe and null-aware as Python dict keys."""
-    if value is None:
-        return ("__null__",)
-    if isinstance(value, (float, np.floating)) and np.isnan(value):
-        return ("__nan__",)
-    if isinstance(value, np.generic):
-        value = value.item()
-    return value
-
-
-def _fill_slice(ftable: pl.DataFrame, fill_name: str, table: pl.DataFrame, sel: np.ndarray,
-                match_cols: list[str], replace_cols: list[str]) -> tuple[np.ndarray, dict]:
-    """Left-join selected rows to one fill animal, preserving left row order.
-
-    The fill side must be unique on ``match_cols``.  A duplicate would make a pandas-style
-    left join multiply rows and silently misalign the update, so reject it explicitly instead.
-    """
-    selected = np.flatnonzero(sel)
-    got = np.zeros(len(selected), bool)
-    if not len(selected):
-        return got, {}
-    sub = ftable.filter(pl.col('animal_id').cast(pl.String) == str(fill_name))
-    if sub.is_empty():
-        return got, {}
-    missing = [c for c in [*match_cols, *replace_cols] if c not in sub.columns]
-    if missing:
-        raise ValueError(f'fill table lacks columns {missing}')
-    lookup = {}
-    for row in sub.select([*match_cols, *replace_cols]).iter_rows(named=True):
-        key = tuple(_key_value(row[c]) for c in match_cols)
-        if key in lookup:
-            raise ValueError(f'fill table has duplicate key {key!r}')
-        lookup[key] = row
-    vals = {c: [] for c in replace_cols}
-    selected_rows = table.select([*match_cols]).gather(selected.tolist()).iter_rows(named=True)
-    for i, row in zip(range(len(selected)), selected_rows):
-        match = lookup.get(tuple(_key_value(row[c]) for c in match_cols))
-        if match is None:
-            continue
-        got[i] = True
-        for c in replace_cols:
-            vals[c].append(match[c])
-    return got, vals
-
-
-def _prediction_2d_stem(path: Path) -> str | None:
-    """Prediction 2D table, allowing only provenance-identified legacy output."""
-    import tomllib
-
-    path = Path(path)
-    try:
-        with open(path / 'session.toml', 'rb') as f:
-            session = tomllib.load(f)
-    except (OSError, ValueError):
-        session = {}
-    provenance = session.get('provenance', {})
-    if session.get('independent_windows', provenance.get('independent_windows', False)):
-        raise ValueError(f'{path}: identity bridge/fill refuses independent-window IDs')
-    if (path / 'points2d.pq').exists():
-        return 'points2d'
-    legacy = path / 'keypoints.pq'
-    if not legacy.exists():
-        return None
-    try:
-        with open(path / 'session.toml', 'rb') as f:
-            prov = tomllib.load(f).get('provenance', {})
-    except (OSError, ValueError):
-        prov = {}
-    if prov.get('run') and prov.get('checkpoint'):
-        return 'keypoints'
-    raise ValueError(f'{path}: keypoints.pq without run+checkpoint provenance is ambiguous; '
-                     'refusing to treat annotation observations as predictions')
-
-
 def _prediction_tables(path: Path):
     """Table stems to mutate/read as prediction output, never source annotations."""
-    stem = _prediction_2d_stem(path)
-    return ('points3d', *((stem,) if stem else ()), 'instances')
-
-
-def _fill_session(fill_dir: Path, fill_preds: dict) -> dict:
-    """Per-group slice of the fill pass's session: its pred array, animal ids, and tables.
-
-    `fill_preds` is `load_predictions(fill_dir)`'s own shape. The tables are read once and
-    filtered to the group, so a lookup can never adopt another group's row (a prediction session
-    may hold many groups, and the animal names repeat across them). A group the fill pass did not
-    produce is absent from the result, which is a refusal at the caller, not a guess.
-    """
-    out = {}
-    for gid, rows in fill_preds.items():
-        key = str(rows.get('group_id', gid))
-        tables = {}
-        for stem in _prediction_tables(fill_dir):
-            f = fill_dir / f'{stem}.pq'
-            if not f.exists():
-                continue
-            t = pl.read_parquet(f)
-            t = t.filter(pl.col('group_id').cast(pl.String) == key)
-            if not t.is_empty():
-                tables[stem] = t
-        out[key] = {'pred': rows['pred'], 'animal_ids': rows['animal_ids'], 'tables': tables}
-    return out
+    return ('points3d', *(('points2d',) if (Path(path) / 'points2d.pq').exists() else ()),
+            'instances')
 
 
 def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndarray],
-                   plans: list[dict], n_frames: int, fill: dict | None = None) -> dict[str, int]:
+                   plans: list[dict], n_frames: int) -> dict[str, int]:
     """Apply bridge plans while retaining all columns and the stored row order.
 
     Tables are read as Polars, but updates use Python lists and NumPy masks.  This deliberately
@@ -574,8 +367,6 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
     from ..format import DICT_COLS, write_table
     counts = {}
     slot_of = _slot_map(path, gid)
-    ftables = (fill or {}).get('tables', {})
-    fill_ids = (fill or {}).get('animal_ids')
     for stem in _prediction_tables(path):
         f = path / f'{stem}.pq'
         if not f.exists():
@@ -601,34 +392,13 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
         mine = gcol == str(gid)
         drop = np.zeros(len(frame), bool)
         new_animal = animal.copy()
-        match_cols = [c for c in columns
-                      if c not in _FILL_MEAS_COLS and c not in ('group_id', 'animal_id')]
-        replace_cols = [c for c in columns if c in _FILL_MEAS_COLS]
         for plan in sorted(plans, key=lambda p: (p['windows'] or [0])[0], reverse=True):
             if plan.get('skipped') or plan.get('identity'):
                 continue
             names = [str(animal_ids[i]) for i in plan['component']]
             quarantine, released = _plan_frames(segments, plan, n_frames)
-            fmap = plan.get('fill_map')
             if len(quarantine):
-                inq = np.isin(frame, quarantine) & np.isin(animal, names) & mine
-                here = inq.copy()
-                if fmap and fill_ids is not None and ftables.get(stem) is not None:
-                    ftable = ftables[stem]
-                    for i in plan['component']:
-                        if i not in fmap:
-                            continue
-                        sel = here & (animal == str(animal_ids[i]))
-                        if not sel.any():
-                            continue
-                        got, vals = _fill_slice(ftable, str(fill_ids[fmap[i]]), table, sel,
-                                                match_cols, replace_cols)
-                        hit = np.flatnonzero(sel)[got]
-                        here[hit] = False
-                        for c, replacement in vals.items():
-                            for row_idx, value in zip(hit, replacement):
-                                values[c][int(row_idx)] = (np.nan if value is None else value)
-                drop |= here
+                drop |= np.isin(frame, quarantine) & np.isin(animal, names) & mine
             if len(released) and plan['mapping'] is not None:
                 inr = np.isin(frame, released) & mine
                 source = new_animal.copy()
@@ -665,8 +435,8 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
 def _slot_map(path: Path, gid: str) -> dict[str, int]:
     """`animal_id -> slot` for one group, read from the tables before any rewrite.
 
-    Outside `--independent-windows` (which the bridge refuses) a slot IS its animal's row, so
-    the pairing is one-to-one; a relabelled row takes its new animal's slot with it.
+    A slot IS its animal's row, so the pairing is one-to-one; a relabelled row takes its new
+    animal's slot with it.
     """
     out = {}
     for stem in (*_prediction_tables(path), 'windows'):
@@ -684,8 +454,7 @@ def _slot_map(path: Path, gid: str) -> dict[str, int]:
     return out
 
 
-def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
-                   fill_dir: Path | None = None) -> dict:
+def bridge_session(path: Path, cfg: BridgeConfig, window_length: int) -> dict:
     """Bridge a written prediction session IN PLACE, editing its parquet tables. Reads no labels.
 
     This is what `--identity-bridge` runs after the writer closes. It re-reads the session it just
@@ -693,34 +462,17 @@ def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
     already-bridged session is NOT a no-op and is not supported -- the events that defined the
     episodes are still in the log, but the rows they describe have already moved.
 
-    `fill_dir` (plan section 6.4, default None): a fill pass's prediction session -- built by
-    running `infer.py` again over the same clip with `--anchor carry --box-prompt none` -- whose
-    quarantined frames fill this session's instead of being dropped. The fill session is bridged
-    IN PLACE first (its own episodes repaired, so the row assignment the boundary map needs is
-    stable through the quarantine), then read; each real plan's quarantine boundary frame maps
-    this session's component slots onto the fill pass's rows one-to-one by centre distance, and a
-    quarantined row the fill pass observed is kept with the fill pass's measurements. A session
-    lacking the group, a boundary the map cannot be computed at, or a frame the fill pass did not
-    observe is a refusal, not a guess: those rows stay dropped exactly as the quarantine leaves
-    them.
     """
     cfg.validate()
     path = Path(path)
-    if fill_dir is not None:
-        fill_dir = Path(fill_dir)
-        if not (fill_dir / 'windows.pq').exists():
-            raise FileNotFoundError(
-                f'{fill_dir} is required to carry windows.pq: the fill maps per OWNED window '
-                'segment, and without the window table it cannot be bridged first.')
-        bridge_session(fill_dir, cfg, window_length)
     predictions, _ = load_predictions(path)
     _write_bridge_provenance(path, cfg, complete=False)
-    out = _bridge_loaded(path, cfg, window_length, fill_dir, predictions)
+    out = _bridge_loaded(path, cfg, window_length, predictions)
     _write_bridge_provenance(path, cfg, complete=True)
     return out
 
 
-def _bridge_loaded(path, cfg, window_length, fill_dir, predictions):
+def _bridge_loaded(path, cfg, window_length, predictions):
     """`bridge_session`'s body, on a session its caller has marked incomplete for the edit."""
     windows = pl.read_parquet(path / 'windows.pq')
     epath = path / 'identity_events.pq'
@@ -729,10 +481,6 @@ def _bridge_loaded(path, cfg, window_length, fill_dir, predictions):
     events = pl.read_parquet(epath)
     if events.is_empty():
         return {}
-    fill = None
-    if fill_dir is not None:
-        fill_preds, _ = load_predictions(fill_dir)
-        fill = _fill_session(fill_dir, fill_preds)
     out = {}
     for key, rows in predictions.items():
         pred = rows.get('pred')
@@ -750,15 +498,7 @@ def _bridge_loaded(path, cfg, window_length, fill_dir, predictions):
                           'event_frames': [ep['first_frame'], ep['last_frame']]})
         real = [p for p in plans if not p.get('skipped') and not p.get('identity')]
         if real:
-            this_fill = fill.get(gid) if fill is not None else None
-            if this_fill is not None:
-                for p in real:
-                    qframes, _ = _plan_frames(segments, p, n_frames)
-                    p['fill_map'] = (boundary_fill_map(pred, this_fill['pred'],
-                                                       int(qframes[0]) - 1, tuple(p['component']))
-                                     if len(qframes) and int(qframes[0]) > 0 else None)
-            rewrite_tables(path, gid, rows['animal_ids'], segments, real, n_frames,
-                           fill=this_fill)
+            rewrite_tables(path, gid, rows['animal_ids'], segments, real, n_frames)
         out[key] = list(reversed(plans))
     return out
 

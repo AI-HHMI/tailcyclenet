@@ -53,3 +53,25 @@ def test_renders_a_sheet_a_crop_and_a_video(tmp_path):
     assert stat['label_frames'] == 4
     assert (out / 'stem_f2.jpg').exists() and (out / 'stem.mp4').exists()
     assert list(out.glob('stem_f2_a0*.jpg'))
+
+
+def test_the_group_video_is_decoded_in_bounded_chunks(tmp_path, monkeypatch):
+    """`--video` used to decode the WHOLE group before writing (OOM on a 23,810-frame group);
+    every decode is now at most `VIDEO_CHUNK` frames, and every frame still lands."""
+    from tailcyclenet import video
+
+    r = _mod()
+    sess = _session_with_boxes(tmp_path / 'ds' / 'train' / 'a')
+    out = tmp_path / 'out'
+    out.mkdir()
+    asked = []
+    real = r.read_frames
+    monkeypatch.setattr(r, 'read_frames', lambda g, c, f, **kw: asked.append(len(f)) or real(g, c, f, **kw))
+    monkeypatch.setattr(r, 'VIDEO_CHUNK', 3)
+    args = Namespace(width=200, video=True, fps=10.0, crops=False)
+    stat = r.render_group(sess, 'g000', out, 'stem', args)
+    assert stat['videos'] == 1
+    assert max(asked) <= 3
+    reader = video.open_reader(str(out / 'stem.mp4'))
+    assert len(reader) == sess.groups['g000'].n_frames
+    reader.close()

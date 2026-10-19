@@ -18,6 +18,7 @@ import numpy as np
 from tailcyclenet.eval import label_lookup
 from tailcyclenet.identity_diagnostic import switch_diagnostics
 from tailcyclenet.infer.predictions import load_predictions
+from tailcyclenet.metrics import label_extent
 
 
 def _scales(points):
@@ -31,10 +32,7 @@ def _scales(points):
     filled only to make the scale probe well-defined; they never enter the switch matcher. The
     fill copies the nearest measured frame's scale, not a prediction.
     """
-    points = np.asarray(points, float)
-    with np.errstate(all='ignore'):
-        span = np.nanmax(points, axis=2) - np.nanmin(points, axis=2)
-        scale = np.nanmedian(np.linalg.norm(span, axis=-1), axis=0)
+    scale = label_extent(np.asarray(points, float), axis=0)
     good = np.isfinite(scale) & (scale > 0)
     if not good.any():
         raise ValueError('could not derive a finite body-extent scale from the labels')

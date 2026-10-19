@@ -109,8 +109,8 @@ class ScorerDataset(torch.utils.data.Dataset):
         last_reason = 'no_selection'
         for attempt in range(GETITEM_MAX_RETRIES):
             rng, shape_rng, frozen = self._streams(base_idx, ordinal=ordinal)
-            shape = self.base._shape(shape_rng)
-            sel = self.base._select(base_idx, rng, shape)
+            shape = self.base.shape(shape_rng)
+            sel = self.base.select(base_idx, rng, shape)
             if sel is not None:
                 try:
                     trip = make_triplet(self.base, sel, rng, self.cfg, self.corruptors)

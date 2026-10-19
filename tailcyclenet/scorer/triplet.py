@@ -16,7 +16,7 @@ FULL, UN-AUGMENTED frames and owns the whole geometry chain itself, whereas this
 `PoseDataset` returns already-cropped, already-resized, already-augmented uint8 with the rotation
 baked into the decode. Nothing about that ordering is recoverable by an adapter shim.
 
-The seam (`PoseDataset._select` / `_realise`) is what makes the rewrite possible: ONE selection,
+The seam (`PoseDataset.select` / `realise`) is what makes the rewrite possible: ONE selection,
 TWO independent realisations. Calling `__getitem__` twice would select a DIFFERENT sample -- `_pick`
 re-draws the pool entry and `_frames` re-draws the anchor and stride.
 """
@@ -31,7 +31,6 @@ from tracktail.datasets.scorer_corruption import (GENERATORS, PointCorruptor, ap
 from tracktail.model.cube import (get_camera_scale, is_point_visible,
                                      project_points_torch)
 
-TRIPLET_KEYS = ('good', 'bad', 'anchor')
 
 # The corruption types that can move a SINGLE observed slot, which is all a sparse window can be
 # trained on. `gradual_drift` and `sinusoid` ramp from or through zero, so at one observed frame
@@ -131,7 +130,7 @@ def source_frame_weights(frames, shape=None, eligible=None, device=None,
 
 def _segment_range(cfg, n_unique):
     """Parse the inclusive segment length range and full-window share."""
-    raw = cfg.get('segment_len_frames', cfg.get('segment_length_frames', (1, n_unique)))
+    raw = cfg.get('segment_len_frames', (1, n_unique))
     if isinstance(raw, (int, float)):
         lo = hi = int(raw)
     else:
@@ -143,9 +142,7 @@ def _segment_range(cfg, n_unique):
         raise ValueError(f'segment_len_frames must satisfy 1 <= lo <= hi, got {(lo, hi)}')
     lo = min(lo, max(n_unique, 1))
     hi = min(hi, max(n_unique, 1))
-    full = cfg.get('segment_full_window_share',
-                   cfg.get('full_window_share', cfg.get('segment_full_window_prob', 0.0)))
-    full = float(full)
+    full = float(cfg.get('full_window_share', 0.0))
     if not 0.0 <= full <= 1.0:
         raise ValueError(f'segment full-window share must be in [0,1], got {full}')
     return lo, hi, full
@@ -156,7 +153,7 @@ def _segment_mask(P, n_unique, device, cfg, names):
 
     A segment gate is a *partial-subsequence probability*: when a full-trajectory corruption type
     fires, ``segment_prob`` says how often its otherwise full-window contribution is restricted to
-    a random interval.  ``segment_full_window_share`` is an explicit escape hatch for the identity
+    a random interval.  ``full_window_share`` is an explicit escape hatch for the identity
     swap/failure case.  Segment starts and lengths are sampled over unique source-frame positions,
     never over clamp-duplicated local slots.
 
@@ -167,7 +164,7 @@ def _segment_mask(P, n_unique, device, cfg, names):
     p = float(cfg.get('segment_prob', 0.0))
     if not 0.0 <= p <= 1.0:
         raise ValueError(f'segment_prob must be in [0,1], got {p}')
-    count_cfg = cfg.get('n_segments', cfg.get('segment_count', 1))
+    count_cfg = cfg.get('segment_count', 1)
     if isinstance(count_cfg, (list, tuple)):
         if len(count_cfg) != 2:
             raise ValueError('segment_count must be an integer or inclusive [lo, hi] pair')
@@ -216,43 +213,7 @@ def _segment_mask(P, n_unique, device, cfg, names):
     return all_masks, metadata
 
 
-def tagged_draw_segmented(corruptor, P, T, D, device, cfg):
-    """`tagged_draw` with optional full-trajectory segment gates.
-
-    This deliberately lives beside (rather than inside) :func:`tagged_draw`: the latter is a
-    byte-for-byte reproduction of tracktail's draw and is used by the legacy sequence regression.
-    """
-    names = corruptor.names
-    slot = {n: i for i, n in enumerate(GENERATORS)}
-    fired = torch.zeros(P, len(GENERATORS), dtype=torch.bool, device=device)
-    contributions = {}
-    applied = torch.zeros(P, dtype=torch.bool, device=device)
-    total = torch.zeros(P, T, D, device=device)
-    segment_masks, metadata = _segment_mask(P, T, device, cfg, names)
-    for name in names:
-        shift = GENERATORS[name](P, T, D, device, corruptor.mags[name])
-        contributions[name] = shift
-        mask = torch.rand(P, device=device) < corruptor.probs[name]
-        type_ix = slot[name]
-        shift = shift * segment_masks[:, :, type_ix, None].float()
-        total = total + shift * mask[:, None, None].float()
-        applied = applied | mask
-        fired[:, type_ix] |= mask
-
-    need = ~applied
-    if need.any():
-        pick = torch.randint(0, len(names), (P,), device=device)
-        for ci, name in enumerate(names):
-            m = need & (pick == ci)
-            if m.any():
-                type_ix = slot[name]
-                shift = contributions[name] * segment_masks[:, :, type_ix, None].float()
-                total = total + shift * m[:, None, None].float()
-                fired[:, type_ix] |= m
-    return total, fired, segment_masks, metadata
-
-
-def tagged_draw(corruptor, P, T, D, device):
+def tagged_draw(corruptor, P, T, D, device, segment_masks=None):
     """A `PointCorruptor` draw that ALSO reports which types fired for each point.
 
     Gate B needs `triplet_acc` broken out per corruption type: an aggregate that hides
@@ -264,8 +225,12 @@ def tagged_draw(corruptor, P, T, D, device):
     `PointCorruptor` produce the SAME tensor from the same RNG state -- without that, the tags
     would describe a different draw from the one the model was trained on.
 
+    `segment_masks` ([P,T,len(GENERATORS)] bool, from `_segment_mask`, drawn by the caller BEFORE
+    this call so the RNG order is unchanged) restricts each type's contribution to its segments;
+    None is the library's full-trajectory draw, byte for byte.
+
     Inputs: corruptor -- a `PointCorruptor`; P, T, D -- points, frames, coordinate dim;
-            device -- where to build the draw.
+            device -- where to build the draw; segment_masks -- optional per-type segment gates.
     Outputs: (shift [P,T,D] in unit magnitude space, fired [P, len(GENERATORS)] bool).
     Side effects: draws from the ambient torch RNG.
     """
@@ -279,6 +244,8 @@ def tagged_draw(corruptor, P, T, D, device):
         shift = GENERATORS[name](P, T, D, device, corruptor.mags[name])
         contributions[name] = shift
         mask = torch.rand(P, device=device) < corruptor.probs[name]
+        if segment_masks is not None:
+            shift = shift * segment_masks[:, :, slot[name], None].float()
         total = total + shift * mask[:, None, None].float()
         applied = applied | mask
         fired[:, slot[name]] |= mask
@@ -289,7 +256,10 @@ def tagged_draw(corruptor, P, T, D, device):
         for ci, name in enumerate(names):
             m = need & (pick == ci)
             if m.any():
-                total = total + contributions[name] * m[:, None, None].float()
+                shift = contributions[name]
+                if segment_masks is not None:
+                    shift = shift * segment_masks[:, :, slot[name], None].float()
+                total = total + shift * m[:, None, None].float()
                 fired[:, slot[name]] |= m
     return total, fired
 
@@ -463,23 +433,10 @@ def _visible_points_mask(coords, cgroup, mode, cam_thresh):
 
     Inputs: coords -- [t,k,R] for ONE member; cgroup -- its cameras; mode -- '2d' or '3d';
             cam_thresh -- how many cameras must see it.
-    Outputs: [k] bool.
+    Outputs: [k] bool, the any-frame reduction of `_frame_visibility`.
     Side effects: none.
     """
-    t, k, _ = coords.shape
-    if mode == '3d':
-        flat = rearrange(coords, 't k r -> (t k) r')
-        vis = torch.stack([is_point_visible(cam, flat) for cam in cgroup])
-        vis = rearrange(vis, 'cams (t k) -> t k cams', t=t, k=k)
-        n_cams_vis = vis.sum(dim=-1)
-    else:
-        size = cgroup[0]['size']
-        c = torch.nan_to_num(coords, nan=-1e9)
-        w, h = float(size[0]), float(size[1])
-        inside = ((c[..., 0] >= 0) & (c[..., 0] < w) & (c[..., 1] >= 0) & (c[..., 1] < h))
-        n_cams_vis = inside.to(torch.int64)
-    return (n_cams_vis >= cam_thresh).any(dim=0)
-
+    return _frame_visibility(coords[None], cgroup, mode, cam_thresh)[0][0].any(dim=0)
 
 
 def _frame_visibility(coords, camera_group, mode, cam_thresh=1):
@@ -548,47 +505,8 @@ def _distance_2d(a, b):
     return torch.where(finite, d, torch.full_like(d, float('nan')))
 
 
-def _reference_distances(good, bad, reference, mode, camera_group, good_per_camera,
-                         good_proj=None, bad_proj=None):
-    """Return ``(good-reference, bad-reference)`` pixel distances.
-
-    ``reference`` is expected in view A's final coordinate system.  For 3-D all distances use the
-    same cameras where ``good`` is visible, matching the primary displacement gate.  A reference
-    with no finite/evaluable coordinate yields NaN and therefore cannot certify a negative.
-    """
-    if reference is None:
-        return None, None
-    if reference.ndim == good.ndim - 1:
-        reference = reference.unsqueeze(0)
-    if tuple(reference.shape) != tuple(good.shape):
-        raise ValueError(
-            f'reference must match good shape {tuple(good.shape)}, got {tuple(reference.shape)}')
-    if mode == '2d':
-        return _distance_2d(good, reference), _distance_2d(bad, reference)
-    rp = project_points_torch(camera_group, reference)
-    if good_proj is None:
-        good_proj = project_points_torch(camera_group, good)
-    if bad_proj is None:
-        bad_proj = project_points_torch(camera_group, bad)
-    finite_ref = torch.isfinite(rp).all(-1)
-    gfinite = torch.isfinite(good_proj).all(-1)
-    bfinite = torch.isfinite(bad_proj).all(-1)
-    good_use = good_per_camera.permute(3, 0, 1, 2)
-    use_g = good_use & finite_ref & gfinite
-    use_b = good_use & finite_ref & bfinite
-    gd = torch.linalg.vector_norm(good_proj - rp, dim=-1)
-    bd = torch.linalg.vector_norm(bad_proj - rp, dim=-1)
-    ng, nb = use_g.sum(0), use_b.sum(0)
-    g = torch.where(use_g, gd, torch.zeros_like(gd)).sum(0) / ng.clamp_min(1)
-    b = torch.where(use_b, bd, torch.zeros_like(bd)).sum(0) / nb.clamp_min(1)
-    g = torch.where(ng > 0, g, torch.full_like(g, float('nan')))
-    b = torch.where(nb > 0, b, torch.full_like(b, float('nan')))
-    return g, b
-
-
 def displacement_masks(good, bad, anchor, camera_group, mode, cfg=None, *,
-                       anchor_camera_group=None, moved_mask=None, reference=None,
-                       cam_thresh=1):
+                       anchor_camera_group=None, moved_mask=None, cam_thresh=1):
     """Build framewise displacement, visibility, reference and supervision masks.
 
     This is the data-side contract consumed by :class:`FrameTripletScorerLoss`.  All returned
@@ -596,10 +514,9 @@ def displacement_masks(good, bad, anchor, camera_group, mode, cfg=None, *,
     in final-crop pixels.  In 3-D the displacement is the maximum selected-camera reprojection
     distance over cameras where the clean point is visible; in 2-D it is the direct pixel norm.
 
-    ``reference`` is optional independent/reference coordinates in view A.  With
-    ``reference_gate='independent_far'`` it is required.  ``source_far`` deliberately uses the
-    stored clean point as a proxy and is reported in ``reference_source``; it is not a claim that
-    the stored track is ground truth.  ``reference_gate='none'`` leaves the base far state alone.
+    ``reference_gate='source_far'`` deliberately uses the stored clean point as a proxy and is
+    reported in ``reference_source``; it is not a claim that the stored track is ground truth.
+    ``reference_gate='none'`` leaves the base far state alone.
 
     Outputs include ``base_far_mask`` (before reference gating), ``reference_far_mask``,
     ``reference_rejected_mask``, ``far_mask``, ``near_mask``, ``ambiguous_mask``, ``active_mask``,
@@ -622,13 +539,12 @@ def displacement_masks(good, bad, anchor, camera_group, mode, cfg=None, *,
     anchor_view, _ = _frame_visibility(anchor, anchor_camera_group, mode, cam_thresh)
     in_view = good_view & bad_view & anchor_view
 
-    good_proj = bad_proj = None
     if mode == '2d':
         displacement = _distance_2d(good, bad)
         displacement_mean = displacement.clone()
     elif mode == '3d':
-        (displacement, displacement_mean, good_proj, bad_proj, good_per_cam) = (
-            _projected_displacement(good, bad, camera_group, good_per_cam))
+        displacement, displacement_mean, _, _, good_per_cam = _projected_displacement(
+            good, bad, camera_group, good_per_cam)
     else:
         raise ValueError(f'unknown scorer triplet mode {mode!r}')
 
@@ -649,8 +565,7 @@ def displacement_masks(good, bad, anchor, camera_group, mode, cfg=None, *,
     near = finite_d & (displacement <= max_px)
     ambiguous = finite_d & ~base_far & ~near
 
-    gate_default = 'source_far'
-    reference_gate = str(cfg.get('reference_gate', gate_default))
+    reference_gate = str(cfg.get('reference_gate', 'source_far'))
     reference_source = 'none'
     good_ref = bad_ref = None
     if reference_gate == 'none':
@@ -660,23 +575,9 @@ def displacement_masks(good, bad, anchor, camera_group, mode, cfg=None, *,
         good_ref = torch.zeros_like(displacement)
         bad_ref = displacement.clone()
         reference_far = finite_d & moved & (bad_ref >= min_px if min_px > 0 else moved)
-    elif reference_gate == 'independent_far':
-        if reference is None:
-            raise ValueError(
-                'reference_gate="independent_far" requires independent reference coordinates')
-        reference_source = 'independent'
-        good_ref, bad_ref = _reference_distances(
-            good, bad, reference, mode, camera_group, good_per_cam, good_proj, bad_proj)
-        margin = float(cfg.get('reference_margin_px', 0.0))
-        if margin < 0:
-            raise ValueError(f'reference_margin_px must be non-negative, got {margin}')
-        reference_far = (torch.isfinite(good_ref) & torch.isfinite(bad_ref)
-                         & (bad_ref >= min_px if min_px > 0 else (bad_ref > 0))
-                         & (bad_ref >= good_ref + margin))
     else:
         raise ValueError(
-            f'unknown reference_gate {reference_gate!r}; expected none, source_far or '
-            'independent_far')
+            f'unknown reference_gate {reference_gate!r}; expected none or source_far')
 
     reference_rejected = base_far & ~reference_far
     far = base_far & reference_far
@@ -757,23 +658,6 @@ def _raw_view_kpt_permutation(view, *, device):
     return perm
 
 
-def _source_to_view_2d(points, view):
-    """Transform source-axis 2-D points into one view's crop and semantic slot axis.
-
-    The dataset stores ``kpt_perm[j]`` as the source/session slot represented by view slot ``j``.
-    Thus source-axis points become view-axis points by gathering ``[..., kpt_perm, :]`` *after* the
-    source->view affine.  This is intentionally a separate operation from ``transfer_points_2d``:
-    an affine cannot encode a keypoint-axis permutation.
-    """
-    if points.ndim != 3 or points.shape[-1] != 2:
-        raise ValueError(f'2D source points must be [T,K,2], got {tuple(points.shape)}')
-    n = points.shape[-2]
-    perm = _view_kpt_permutation(view, n, device=points.device)
-    identity = torch.eye(3, dtype=torch.float64, device=points.device)
-    transformed = transfer_points_2d(points, identity, view_affine_2d(view))
-    return transformed.index_select(-2, perm)
-
-
 def _make_anchor(source, anchor_label, mode, view_a, view_b, source_slots=None):
     """Carry a source coordinate tensor from view A into the independent anchor view.
 
@@ -834,7 +718,7 @@ def _make_anchor(source, anchor_label, mode, view_a, view_b, source_slots=None):
     return transfer_points_2d(gathered, ha, hb)[None]
 
 
-def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=None):
+def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
     """Build a (good, bad, anchor) triplet and its framewise supervision metadata.
 
     The historical geometry is intentionally unchanged: one clean view A is shared by ``good``
@@ -842,10 +726,8 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     after the shared drop mask and final crop.  ``frames`` is carried explicitly, and corruption
     draws use the unique source-frame sequence before being gathered back to local slots.
 
-    ``reference`` is optional independent coordinates in the *source* coordinate system.  It is
-    transformed into view A for 2-D and used directly for 3-D.  Normal tracked-root operation has
-    no independent reference; selecting ``reference_gate='source_far'`` therefore records the
-    stored clean track as a proxy rather than silently implying ground truth.
+    A tracked root has no independent reference; ``reference_gate='source_far'`` therefore records
+    the stored clean track as a proxy rather than silently implying ground truth.
 
     Outputs retain the old keys (including ``fired`` [B,K,G], good/bad/anchor tuples and counts)
     and add aligned ``[B,T,K]`` masks: ``observed_mask``, ``anchor_observed_mask``,
@@ -859,15 +741,15 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     retry cap when the distance gate leaves them with no active far slot. Pin-memory workers
     require the returned `fired_frame` frame axis to be materialized, not an expanded view.
 
-    Gated modes (framewise or ``sequence_far_gate``) redraw only unresolved sparse keypoints, then
+    Frame mode redraws only unresolved sparse keypoints, then
     drop any still unresolved after the cap via ``keep`` instead of rejecting the whole window
     (which would discard most mocap windows with marker dropouts); legacy sequence mode raises.
     """
     dense_3d, dense_2d, sparse_3d, sparse_2d = corruptors
-    view_a = dataset._realise(sel, rng, world_gauge=False)
+    view_a = dataset.realise(sel, rng, world_gauge=False)
     if view_a is None:
         return None
-    view_b = dataset._realise(sel, rng, world_gauge=False)
+    view_b = dataset.realise(sel, rng, world_gauge=False)
     if view_b is None:
         return None
 
@@ -898,11 +780,9 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     shift_dense, fired_dense, seg_dense, meta_dense = _draw_shift(
         dense, coords, frames=sel.frames, cfg=cfg, return_metadata=True)
     frame_mode = str(cfg.get('output_granularity', 'sequence')) == 'frame'
-    sequence_far_gate = bool(cfg.get('sequence_far_gate', False))
-    gated = frame_mode or sequence_far_gate
     shift_sparse, fired_sparse, seg_sparse, meta_sparse = _draw_sparse_moved(
         sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True,
-        allow_stuck=gated)
+        allow_stuck=frame_mode)
     pick = is_dense.view(1, 1, K, 1)
     pick_type = is_dense.view(1, K, 1)
     shift = torch.where(pick, shift_dense, shift_sparse)
@@ -916,18 +796,6 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     good = apply_drop_mask(coords, drop_mask)
 
     anchor_label = 1.0 if float(rng.random()) < 0.5 else -1.0
-    reference_a = None
-    if reference is not None:
-        reference_a = torch.as_tensor(reference, dtype=coords.dtype, device=coords.device)
-        if reference_a.ndim == 3:
-            reference_a = reference_a[None]
-        if reference_a.ndim != 4 or reference_a.shape[:2] != coords.shape[:2]:
-            raise ValueError(
-                f'reference must align with source [T,K,R], got {tuple(reference_a.shape)}')
-        if mode == '2d':
-            reference_a = _source_to_view_2d(reference_a[0], view_a)[None]
-        reference_a = reference_a[:, :, alive]
-
     mask_data = None
     keep = None
     unresolved_sparse = torch.zeros_like(is_dense)
@@ -941,14 +809,13 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
             good, bad, anchor, view_a.cgroup, mode, cfg,
             anchor_camera_group=view_b.cgroup,
             moved_mask=shift.abs().sum(-1) > 0,
-            reference=reference_a,
             cam_thresh=cam_thresh)
         keep = (_visible_points_mask(good[0], view_a.cgroup, mode, cam_thresh)
                 & _visible_points_mask(bad[0], view_a.cgroup, mode, cam_thresh)
                 & _visible_points_mask(anchor[0], view_b.cgroup, mode, cam_thresh))
         sparse_active = mask_data['active_mask'][0].any(dim=0) & (~is_dense)
         redo = (~is_dense) & (~sparse_active)
-        if not gated or not bool(redo.any()):
+        if not frame_mode or not bool(redo.any()):
             break
         if sparse_attempt >= SPARSE_DRAW_RETRIES:
             unresolved_sparse = redo
@@ -971,14 +838,14 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
         return None
 
     active_before_keep = mask_data['active_mask']
-    if (frame_mode or sequence_far_gate) and not bool(active_before_keep.any()):
+    if frame_mode and not bool(active_before_keep.any()):
         return None
 
     gv = [v[None] for v in view_a.views]
     av = [v[None] for v in view_b.views]
     masks = {key: value[:, :, keep] if torch.is_tensor(value) and value.ndim >= 3 else value
              for key, value in mask_data.items()}
-    if (frame_mode or sequence_far_gate) and not bool(masks['active_mask'].any()):
+    if frame_mode and not bool(masks['active_mask'].any()):
         return None
     fired_keep = fired[:, keep, :]
     type_mask = fired_keep[:, None, :, :].expand(-1, coords.shape[1], -1, -1)
@@ -996,8 +863,6 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
         'anchor_label': anchor_label,
         'mode': mode,
         'source': sel.sess.label_source,
-        'sequence_far_gate': sequence_far_gate,
-        'reuse_scene_for_anchor': False,
         'occlusion': None,
         'counts': counts[:, keep],
         'fired': fired_keep,
@@ -1017,11 +882,8 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
         'n_sparse_dropped': int(unresolved_sparse.sum()),
     }
     for key, value in masks.items():
-        if key in ('reference_gate', 'reference_source'):
-            out[key] = value
-        elif key not in ('good_reference_distance_px', 'bad_reference_distance_px'):
-            out[key] = value
-        elif value is not None:
+        if value is not None or key not in ('good_reference_distance_px',
+                                            'bad_reference_distance_px'):
             out[key] = value
     out['shift'] = shift[:, :, keep]
     return out
@@ -1040,8 +902,7 @@ def _draw_shift(corruptor, coords, frames=None, cfg=None, return_metadata=False)
     if frames is None:
         frames = np.arange(t, dtype=np.int64)
     cfg = {} if cfg is None else cfg
-    gated_mode = (str(cfg.get('output_granularity', 'sequence')) == 'frame'
-                  or bool(cfg.get('sequence_far_gate', False)))
+    gated_mode = str(cfg.get('output_granularity', 'sequence')) == 'frame'
     if gated_mode:
         unique, inverse = _unique_source_frames(frames)
     else:
@@ -1049,8 +910,8 @@ def _draw_shift(corruptor, coords, frames=None, cfg=None, return_metadata=False)
         inverse = np.arange(len(unique), dtype=np.int64)
     use_segments = gated_mode and float(cfg.get('segment_prob', 0.0)) > 0.0
     if use_segments:
-        shifts_u, fired, seg_u, metadata = tagged_draw_segmented(
-            corruptor, b * k, len(unique), dim, coords.device, cfg)
+        seg_u, metadata = _segment_mask(b * k, len(unique), coords.device, cfg, corruptor.names)
+        shifts_u, fired = tagged_draw(corruptor, b * k, len(unique), dim, coords.device, seg_u)
     else:
         shifts_u, fired = tagged_draw(corruptor, b * k, len(unique), dim, coords.device)
         seg_u = torch.ones((b * k, len(unique), len(GENERATORS)), dtype=torch.bool,

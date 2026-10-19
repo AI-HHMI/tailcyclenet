@@ -204,10 +204,7 @@ def convert(src: Path, out: Path, *, val_frames: int = VAL_FRAMES,
         names = COLLECTIONS[collection]['names']
         session_id = f'udarp_{collection}_{width}x{height}'
         session_dir = out / split / session_id
-        from aniposelib.cameras import CameraGroup
-        camera = fmt.nominal_camera(CAMERA, (width, height))
-        rig = fmt.Rig(cgroup=CameraGroup([camera]), offset={CAMERA: (0.0, 0.0)},
-                      moving={CAMERA: False}, calibrated={CAMERA: False})
+        rig = fmt.nominal_rig(CAMERA, (width, height))
         groups, labels = {}, {}
         for index, record in members:
             group_id = f'g{index:05d}'

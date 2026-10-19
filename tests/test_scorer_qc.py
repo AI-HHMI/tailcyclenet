@@ -119,7 +119,7 @@ def test_get_once_does_not_retry_a_failed_index():
     ds.train = False
     ds.seed = 23
     calls = []
-    ds._shape = lambda rng: {'n_cams': 1, 'single_view_draw': 0.0}
+    ds.shape = lambda rng: {'n_cams': 1, 'single_view_draw': 0.0}
     ds._item = lambda idx, rng, shape: calls.append(idx) or None
 
     assert ds.get_once(7) is None
@@ -382,3 +382,23 @@ def test_score_session_help_requires_explicit_best_checkpoint(capsys):
     assert '--session' in help_text
     assert '--start' in help_text
     assert '--stop' in help_text
+
+
+def test_the_deleted_window_offset_flag_is_refused_by_name():
+    """`--window-offset` was refuted (report 60): the CLI names it and says why, before loading."""
+    from tailcyclenet.scorer.score import main
+
+    with pytest.raises(SystemExit, match='--window-offset is deleted'):
+        main(['--run', 'r', '--data', 'd', '--out', 'o', '--window-offset', '4'])
+
+
+def test_the_deleted_val_offset_data_key_is_refused_by_name():
+    """A nonzero `[data].val_offset` is refused naming the key; the inert 0 still loads."""
+    from tailcyclenet.scorer.train import loader_config
+
+    assert loader_config({'val_offset': 0}, {}).val_stride == 0
+    assert qc._loader_config({'data': {'val_offset': 0}}).val_stride == 0
+    with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
+        qc._loader_config({'data': {'val_offset': 3}})
+    with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
+        loader_config({'val_offset': 3}, {})

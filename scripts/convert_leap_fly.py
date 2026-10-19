@@ -125,10 +125,7 @@ def convert(src: Path, out: Path, clean: bool = False) -> None:
         Image.fromarray(boxes[i, 0], mode='L').save(pixel_dir / '000000.png',
                                                    format='PNG', compress_level=1)
 
-    rig = fmt.Rig(
-        cgroup=__import__('aniposelib.cameras', fromlist=['CameraGroup']).CameraGroup([
-            fmt.nominal_camera('cam0', (192, 192))]),
-        offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': False})
+    rig = fmt.nominal_rig('cam0', (192, 192))
     fmt.write_session(
         session, mode='2d', units='px', label_source='annotated', names=names, rig=rig,
         groups=groups, labels=labels, skeleton=edges, flip_pairs=FLIP_PAIRS,

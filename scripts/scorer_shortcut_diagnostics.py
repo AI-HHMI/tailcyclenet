@@ -18,7 +18,7 @@ mind: a small gap does not prove the corruption design is the whole problem, and
 partly reflect out-of-distribution inputs rather than genuine pixel-grounding.
 
     pixi run python scripts/scorer_shortcut_diagnostics.py --run <scorers>/scorer-3dpop \\
-        --config configs/scorer-3dpop.toml --split val --batches 40
+        --config <scorers>/scorer-3dpop/config.toml --split val --batches 40
 """
 
 from __future__ import annotations

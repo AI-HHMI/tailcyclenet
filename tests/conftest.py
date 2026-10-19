@@ -28,8 +28,10 @@ def _detector_checkpoint(model=None, **overrides):
     """
     from tailcyclenet.detector.yolox import YOLOXNano
 
-    m = model if model is not None else YOLOXNano(n_keypoints=0)
-    return {'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn', **overrides}
+    m = model if model is not None else YOLOXNano(version='hybrid')
+    return {'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
+            'yolox_version': m.version, 'p2': m.p2, 'shared_head': m.head.shared_head,
+            'fpn_upsample': m.neck.fpn_upsample, **overrides}
 
 # Cap the intraop pool, or `-n` makes the suite slower: `nproc`-wide torch pool vs many xdist workers.
 torch.set_num_threads(4)
@@ -138,6 +140,20 @@ def _session_2d_tracked_dense(path, T=4, S=2):
                       provenance={'source': 'synthetic', 'visibility': 'none'})
     _write_frames(path / 'groups' / 'g000', 'cam0', T, (W, H))
     return lab
+
+
+@pytest.fixture(autouse=True)
+def _small_hybrid_detector(monkeypatch):
+    """Build every test `hybrid` detector at a test width: the shipped one is ~54M params, and the
+    detector training tests save several checkpoints each, which filled /tmp under `-n 32`.
+
+    Only widths change (backbone base 8, one transformer block per stage, neck 32); the module
+    graph and every code path are the shipped ones, and `load_detector` rebuilds the same width.
+    """
+    from tailcyclenet.detector import vit_backbone, yolox
+    monkeypatch.setattr(yolox, 'NECK_WIDTH', 32)
+    init = vit_backbone.HybridBackbone.__init__
+    monkeypatch.setattr(init, '__defaults__', (8, (1, 1), 8, 4.0, True))
 
 
 @pytest.fixture(scope='session')

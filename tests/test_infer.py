@@ -16,7 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from tailcyclenet.format import Registry, load_dataset
-from tailcyclenet.infer import InferConfig, run_group
+from tailcyclenet.infer.window import InferConfig, run_group
 from tailcyclenet.model import build_model
 from test_model import SMALL
 
@@ -56,7 +56,7 @@ def scene(request):
 def multiwindow_scene(request):
     """The same two shapes as `scene`, but T=16 -- SEVERAL windows at n_frames=4/overlap=2
 
-    (`_window_starts(16, 4, 2)` is 7 starts), which `scene`'s T=4 cannot exercise at all (one
+    (`window_starts(16, 4, 2)` is 7 starts), which `scene`'s T=4 cannot exercise at all (one
     window only). This is what a prefetch-ahead pipeline needs to be tested against: with one
     window there is nothing to prefetch and `prefetch_windows` is a no-op by construction.
     """
@@ -86,7 +86,7 @@ def cli():
     return mod
 
 
-def _boxes_for(boxes, kpts=None):
+def _boxes_for(boxes):
     """Adapt a whole-clip (S,T,C,4) array to `run_blocks`' `boxes_for` callback.
 
     The tests build the box array up front because that is the clearest way to state a scenario;
@@ -95,7 +95,7 @@ def _boxes_for(boxes, kpts=None):
     exercising the adapter instead of the loop.
     """
     def f(store, lo, hi):
-        return (boxes[:, lo:hi], None, None if kpts is None else kpts[:, lo:hi])
+        return (boxes[:, lo:hi], None)
     return f
 
 
@@ -168,198 +168,6 @@ def test_every_anchor_runs(scene, anchor):
     assert out['pred'].shape == (len(sess.labels('g000').animal_ids), 4, sess.n_keypoints, R)
     assert len(out['animal_ids']) == out['pred'].shape[0]
 
-
-
-def test_independent_windows_propagate_exact_owner_and_window_descriptors(multiwindow_scene):
-    model, sess, registry, name = multiwindow_scene
-    gid = 'g000'
-    C = len(sess.rig)
-    S = 1
-    calls = []
-
-    def boxes_for(store, lo, hi):
-        raise AssertionError('independent mode must request per-window associations')
-
-    def for_window(store, lo, hi, keep_from=None, ordinal=None):
-        calls.append((ordinal, lo, hi, keep_from))
-        b = np.zeros((S, hi - lo, C, 4), np.float32)
-        x = 8 + int(ordinal)
-        b[..., 0], b[..., 1], b[..., 2], b[..., 3] = x, 8, x + 24, 32
-        return b, np.ones((S, hi - lo, C), np.float32), None
-
-    boxes_for.for_window = for_window
-    cfg = _cfg(anchor='none', independent_windows=True, refine=False,
-               capture_window_predictions=True, vis_thresh=1e9)
-    from tailcyclenet.infer.window import merge_blocks, run_blocks
-    out = merge_blocks(run_blocks(model, sess, gid, registry, name, cfg,
-                                  boxes_for=boxes_for, n_rows=S))
-    assert [c[0] for c in calls] == list(range(len(calls)))
-    assert np.all(out['owner_window'] >= 0)
-    np.testing.assert_array_equal(out['window_ordinal'], np.arange(len(calls)))
-    np.testing.assert_array_equal(out['window_start'], [c[1] for c in calls])
-    np.testing.assert_array_equal(out['window_stop'], [c[2] for c in calls])
-    assert out['slot'].tolist() == [0]
-    assert out['det_box'].shape[:2] == (S, sess.groups[gid].n_frames)
-    assert out['triangulated'].shape == (S, sess.groups[gid].n_frames,
-                                         sess.n_keypoints, 3)
-    records = out['window_records']
-    assert sum(r['record_type'] == 'window' for r in records) == len(calls) * S * C
-    assert all({'group_id', 'frame', 'window', 'window_start', 'window_stop', 'slot',
-                'animal_id', 'camera', 'bodypart', 'record_type'} <= r.keys()
-               for r in records)
-    assert any(r['record_type'] == 'point2d' for r in records)
-    if sess.mode == '3d':
-        assert any(r['record_type'] == 'point3d' for r in records)
-    if sess.mode == '2d':
-        assert all(r['gated'] for r in records if r['record_type'] == 'point2d')
-    else:
-        assert not any(r['gated'] for r in records if r['record_type'] == 'point2d')
-    assert not np.isfinite(out['pred']).any(), 'primary values should be vis-threshold gated'
-    for frame, owner in enumerate(out['owner_window']):
-        assert int(owner) == max(i for i, (_, start, stop, _) in enumerate(calls)
-                                 if start <= frame < stop)
-
-
-def test_independent_detector_batches_raw_globally_but_associates_each_window_fresh(
-        multiwindow_scene, monkeypatch):
-    from types import SimpleNamespace
-
-    import tailcyclenet.detector as detector
-    from tailcyclenet.infer.driver import _DET_BATCH, _detector_boxes
-
-    _, sess, _, _ = multiwindow_scene
-    gid = 'g000'
-    C = len(sess.rig)
-    detect_calls, associate_calls = [], []
-
-    def detect_raw(_det, _wh, _sess, _gid, _top_k, **kw):
-        frames = np.asarray(kw['frames'], np.int32)
-        detect_calls.append(frames.copy())
-        boxes = np.zeros((1, len(frames), C, 4), np.float32)
-        boxes[0, :, :, 0] = frames[:, None]
-        scores = np.ones((1, len(frames), C), np.float32)
-        return boxes, scores, None
-
-    def associate_group(raw, _sess, _gid, n_want, **kw):
-        raw_frames = raw[0][0, :, 0, 0].copy()
-        associate_calls.append((raw_frames, kw['frame_base'], kw['state']))
-        n = len(raw_frames)
-        boxes = np.zeros((n_want, n, C, 4), np.float32)
-        boxes[..., 0] = kw['frame_base']
-        return boxes, np.ones((n_want, n, C), np.float32), None
-
-    monkeypatch.setattr(detector, 'detect_raw', detect_raw)
-    monkeypatch.setattr(detector, 'associate_group', associate_group)
-    args = SimpleNamespace(
-        frame_start=3, frame_stop=0, det_score=0.01, det_nms_iou=0.5,
-        det_nms_center_dist=0.3, det_trace=None, link_boxes=True, min_views=2,
-        track=True, max_move=1.0, max_age=8, pose_nms=None,
-        duplicate_radius=0.75, duplicate_persist=5)
-    store = object()
-    default_boxes = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False, None,
-                                    2, 1, independent=False)
-    default_boxes(store, 4, 8)
-    default_detection_batches = [call.copy() for call in detect_calls]
-    detect_calls.clear()
-    associate_calls.clear()
-
-    boxes_for = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False, None,
-                                2, 1, independent=True)
-    first = boxes_for.for_window(store, 4, 8, 6, ordinal=0)
-    second = boxes_for.for_window(store, 6, 10, 8, ordinal=1)
-    third = boxes_for.for_window(store, 10, 14, 12, ordinal=2)
-
-    assert len(default_detection_batches) == len(detect_calls) == 1
-    np.testing.assert_array_equal(default_detection_batches[0], detect_calls[0])
-    assert detect_calls[0].tolist() == list(range(_DET_BATCH))
-    np.testing.assert_array_equal(associate_calls[0][0], [4, 5, 6, 7])
-    np.testing.assert_array_equal(associate_calls[1][0], [6, 7, 8, 9])
-    np.testing.assert_array_equal(associate_calls[2][0], [10, 11, 12, 13])
-    assert [c[1] for c in associate_calls] == [4, 6, 10]
-    assert len({id(c[2]) for c in associate_calls}) == 3
-    np.testing.assert_array_equal(first[0][0, :, 0, 0], np.full(4, 4, np.float32))
-    np.testing.assert_array_equal(second[0][0, :, 0, 0], np.full(4, 6, np.float32))
-    np.testing.assert_array_equal(third[0][0, :, 0, 0], np.full(4, 10, np.float32))
-
-
-def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, monkeypatch):
-    import tailcyclenet.detector as detector
-    from tailcyclenet.infer.driver import _detector_boxes
-
-    model, sess, registry, name = _range_scene(tmp_path)
-    gid = 'g000'
-    C = len(sess.rig)
-
-    def detect_raw(_det, _wh, _sess, _gid, _top_k, **kw):
-        frames = np.asarray(kw['frames'], np.int32)
-        boxes = np.zeros((1, len(frames), C, 4), np.float32)
-        boxes[0, :, :, 0] = frames[:, None]
-        return boxes, np.ones((1, len(frames), C), np.float32), None
-
-    def associate_group(raw, _sess, _gid, n_want, **kw):
-        raw_boxes = raw[0]
-        n = raw_boxes.shape[1]
-        boxes = np.zeros((n_want, n, C, 4), np.float32)
-        x0 = np.full(n, 8.0 + kw['frame_base'], np.float32)
-        boxes[0, :, :, 0] = x0[:, None]
-        boxes[0, :, :, 1] = 6.0
-        boxes[0, :, :, 2] = np.minimum(x0 + 32.0, 63.0)[:, None]
-        boxes[0, :, :, 3] = 42.0
-        return boxes, np.ones((n_want, n, C), np.float32), None
-
-    monkeypatch.setattr(detector, 'detect_raw', detect_raw)
-    monkeypatch.setattr(detector, 'associate_group', associate_group)
-
-    def run(start):
-        args = type('Args', (), {
-            'frame_start': start, 'frame_stop': 16, 'det_score': 0.01,
-            'det_nms_iou': 0.5, 'det_nms_center_dist': 0.3, 'det_trace': None,
-            'link_boxes': True, 'min_views': 2, 'track': True, 'max_move': 1.0,
-            'max_age': 8, 'pose_nms': None, 'duplicate_radius': 0.75,
-            'duplicate_persist': 5,
-        })()
-        boxes_for = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False,
-                                    None, 1, 1, independent=True)
-        cfg = _cfg(anchor='none', independent_windows=True, capture_window_predictions=True,
-                   refine=False, frame_start=start, frame_stop=16)
-        return run_group(model, sess, gid, registry, name, cfg, boxes_for=boxes_for, n_rows=1)
-
-    full = run(0)
-    start = int(full['window_start'][2])
-    ranged = run(start)
-    full_rows = [r for r in full['window_records']
-                 if r['record_type'] == 'point2d' and r['window'] == 2]
-    range_rows = [r for r in ranged['window_records']
-                  if r['record_type'] == 'point2d' and r['window'] == 0]
-    def key(record):
-        return record['frame'], record['camera'], record['bodypart']
-
-    full_rows, range_rows = sorted(full_rows, key=key), sorted(range_rows, key=key)
-    assert len(full_rows) == len(range_rows) > 0
-    for a, b in zip(full_rows, range_rows):
-        assert (a['frame'], a['camera'], a['bodypart'], a['window_start'], a['window_stop']) == (
-            b['frame'], b['camera'], b['bodypart'], b['window_start'], b['window_stop'])
-        for field in ('x', 'y', 'visibility_logit', 'confidence_logit'):
-            np.testing.assert_array_equal(a[field], b[field], err_msg=field)
-
-    # The primary block keeps the same seam owner for prediction, detector box, and identity.
-    for frame, owner in enumerate(full['owner_window']):
-        np.testing.assert_array_equal(full['det_box'][0, frame, 0, 0],
-                                      8 + full['window_start'][owner])
-    from tailcyclenet.infer.predictions import SessionWriter
-    out = tmp_path / 'owned-primary'
-    writer = SessionWriter(out, sess, registry, {
-        'n_frames': 4, 'independent_windows': True, 'source_session_id': sess.session_id,
-    }, [gid])
-    writer.write_block(gid, full, 0, 0)
-    writer.close(complete=True)
-    import pyarrow.parquet as pq
-    instance_rows = pq.read_table(out / 'instances.pq').to_pylist()
-    assert len(instance_rows) == sess.groups[gid].n_frames
-    for row in instance_rows:
-        owner = int(full['owner_window'][row['frame']])
-        assert row['animal_id'] == f'w{owner:06d}_s{row["slot"]:02d}'
-        assert row['x0'] == float(8 + full['window_start'][owner])
 
 
 def test_more_detector_rows_than_label_rows(scene):
@@ -444,7 +252,7 @@ def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
     it is bit-identical to what `load_image` produced when it did both at once.
     """
     from tailcyclenet.dataset import read_frames
-    from tailcyclenet.infer import _crop_views
+    from tailcyclenet.infer.window import _crop_views
 
     _, sess, _, _ = scene
     group, cam = sess.groups['g000'], sess.cam_names[0]
@@ -700,7 +508,7 @@ def test_inflate_box_widens_about_its_centre():
 def test_deploy_box_prompt_lands_inside_the_crop_2d():
     """`_deploy_box_prompt` maps an animal's source points into the crop frame and boxes them,
     2D single-camera -- the path this function has always covered, unchanged in result."""
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
     source = np.array([[[[110., 110.], [130., 150.]]]])            # (S=1,T=1,K=2,2) source px
     boxes = [torch.tensor([100, 100, 200, 200], dtype=torch.int32)]
     scales = [2.0]
@@ -719,7 +527,7 @@ def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
     own rig so the projection geometry is exactly what `run_group` builds.
     """
     from tailcyclenet import box_prompt as bpmod
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
 
     _, sess, _, _ = scene
     if sess.mode != '3d':
@@ -771,7 +579,7 @@ def test_box_prompt_detector_per_camera_degradation():
     """3D + 'detector': a camera with NO finite box that frame yields a NaN column, not an
     exception -- the `_sub_missing` no-box token substitutes it in the encoder, which is the
     regime `box_prompt_dropout` trains rather than a silent failure."""
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
 
     T = 3
     cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)) for _ in range(2)]
@@ -797,7 +605,7 @@ def test_box_prompt_column_order_matches_use():
     primitives (`box_corners` + `crop_box_for_points`) for that camera alone, rather than a hand-
     derived expected value."""
     from tailcyclenet import box_prompt as bpmod
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
 
     T = 2
     cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)),
@@ -966,10 +774,10 @@ def test_carried_prior_is_bounds_masked_and_dated():
     """The two defects in the deployed prompt, both of which were silent.
 
     `prompt_time = 0` is right for interior windows and wrong on the last window of a group, which
-    `_window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
+    `window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
     was handed in as a confident prior instead of as "I was not told".
     """
-    from tailcyclenet.infer import _build_prior
+    from tailcyclenet.infer.window import _build_prior
 
     K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -1017,7 +825,7 @@ def test_oracle_corrupt_near_picks_nearest_eligible_row():
     """`near` must pick the ELIGIBLE row closest to the target in the MODEL's own frame -- not
     the fixed `a + 1` row `other` uses -- and must be a NO-OP when nothing qualifies.
     """
-    from tailcyclenet.infer import _corrupt_prior
+    from tailcyclenet.infer.window import _corrupt_prior
 
     K, size = 2, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -1050,7 +858,7 @@ def test_oracle_corrupt_swap_transposes_keypoints():
     how many pairs -- and must never touch which row or frame the pose came from. The direct
     inference probe for `dataset.py`'s `prompt_swap_kpt_pairs`.
     """
-    from tailcyclenet.infer import _corrupt_prior
+    from tailcyclenet.infer.window import _corrupt_prior
 
     K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -1400,10 +1208,9 @@ def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
     import conftest as cf
     from tailcyclenet.detector.yolox import YOLOXNano
 
-    m = YOLOXNano(version='tiny')
+    m = YOLOXNano(version='hybrid')
     ckpt = cf._detector_checkpoint(
-        m, input_wh=(64, 48), n_keypoints=0, yolox_version='tiny', bottleneck_expansion=0.5,
-        p2=False, dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
+        m, input_wh=(64, 48), dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
     p = tmp_path / 'det.pth'
     torch.save(ckpt, p)
     return p
@@ -1487,18 +1294,9 @@ def test_cli_allow_detector_transfer_bypasses_the_family_refusal(cli, monkeypatc
     (['--oracle-corrupt', 'off'], 'needs an amount'),
     (['--oracle-corrupt', 'swap'], 'needs an amount'),
     (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
-    (['--independent-windows'], 'requires --detector'),
-    (['--independent-windows', '--detector', 'missing-detector'], '--anchor none'),
-    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
-      '--boxes', 'boxes.npz'], 'refuses --boxes'),
-    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
-      '--identity-bridge'], 'refuses --identity-bridge'),
-    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
-      '--fill-from', 'prior'], 'refuses --identity-bridge'),
-    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
-      '--overlap-trace', 'trace.npz'], 'refuses --overlap-trace'),
-    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
-      '--box-prompt', 'labels'], 'refuses --box-prompt labels'),
+    (['--independent-windows'], '--independent-windows is deleted'),
+    (['--fill-from', 'prior'], '--fill-from is deleted'),
+    (['--det-input-wh', '416', '416'], '--det-input-wh is deleted'),
 ])
 def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
                                                                         argv, expect):
@@ -1735,7 +1533,7 @@ def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
 
     That is the whole reason `forward` un-crops the per-camera pose with the SAME expression the
     2D path uses for `pred` (`p / scale + box[:2]`) rather than the more exact per-axis inverse in
-    `dataset._crop_affine`. The two differ by a sub-pixel amount that comes from `_resize_camera`
+    `dataset.crop_affine`. The two differ by a sub-pixel amount that comes from `resize_camera`
     rounding `cam['size']`; adopting the exact form would move every published 2D number, so the
     inexactness is kept deliberately and pinned here.
 
@@ -1900,53 +1698,6 @@ def test_quality_columns_are_optional_and_align_with_pose_rows(scene, tmp_path):
         for k, bodypart in enumerate(registry.names):
             assert got[(frame, bodypart)] == pytest.approx((quality[0, frame, k],
                                                              precision[0, frame, k]))
-
-
-def test_independent_primary_rows_keep_owner_window_identity(scene, tmp_path):
-    import pyarrow.parquet as pq
-
-    _, sess, registry, _ = scene
-    if sess.mode != '2d':
-        pytest.skip('the box/point rows in this contract test use one 2D camera')
-    from tailcyclenet.infer.predictions import SessionWriter
-
-    gid = next(iter(sess.groups))
-    S, T, C, K = 1, 4, len(sess.rig), sess.n_keypoints
-    pred = np.arange(S * T * K * 2, dtype=np.float32).reshape(S, T, K, 2) + 1
-    pred2d = pred[:, :, None]
-    det_box = np.zeros((S, T, C, 4), np.float32)
-    det_box[0, :, 0, 0] = [10, 10, 20, 20]
-    det_box[..., 2:] = 30
-    blk = {
-        'animal_ids': np.array(['det0'], object), 'pred': pred,
-        'conf': np.ones((S, T, K), np.float32), 'pred2d': pred2d,
-        'conf2d': np.ones((S, T, C, K), np.float32),
-        'model_conf2d': np.ones((S, T, C, K), np.float32),
-        'box_agree': np.zeros((S, T, C), np.float32), 'det_box': det_box,
-        'det_score': np.ones((S, T, C), np.float32),
-        'outcome': np.zeros((S, 2), np.int8),
-        'crop': np.zeros((S, 2, C, 4), np.float32), 'outcome_names': ['ok'],
-        'window_start': np.array([0, 2], np.int32),
-        'window_stop': np.array([4, 4], np.int32),
-        'owner_window': np.array([0, 0, 1, 1], np.int32),
-    }
-    out = tmp_path / 'independent-primary'
-    writer = SessionWriter(out, sess, registry, {
-        'n_frames': 4, 'independent_windows': True,
-        'source_session_id': sess.session_id,
-    }, [gid])
-    writer.write_block(gid, blk, 0, 0)
-    writer.close(complete=True)
-
-    points = pq.read_table(out / 'points2d.pq').to_pylist()
-    boxes = pq.read_table(out / 'instances.pq').to_pylist()
-    windows = pq.read_table(out / 'windows.pq').to_pylist()
-    assert {r['frame']: r['animal_id'] for r in points if r['bodypart'] == sess.names[0]} == {
-        0: 'w000000_s00', 1: 'w000000_s00', 2: 'w000001_s00', 3: 'w000001_s00'}
-    assert {r['frame']: r['animal_id'] for r in boxes} == {
-        0: 'w000000_s00', 1: 'w000000_s00', 2: 'w000001_s00', 3: 'w000001_s00'}
-    assert {(r['window'], r['animal_id']) for r in windows} == {
-        (0, 'w000000_s00'), (1, 'w000001_s00')}
 
 
 def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_path):
@@ -2138,7 +1889,7 @@ def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path
 # so every one of these runs on the existing session fixtures and needs no video at all.
 
 def _range_scene(tmp_path, T=16):
-    """A 2D session long enough for several windows -- `_window_starts(16, 4, 2)` is 7 starts."""
+    """A 2D session long enough for several windows -- `window_starts(16, 4, 2)` is 7 starts."""
     import conftest as cf
 
     cf._session_2d(tmp_path / 'rat' / 'test' / 's', T=T)
@@ -2155,7 +1906,7 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
     range equals the whole-clip slice wherever the two runs put the SAME window over the SAME
     frames.
 
-    **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `_window_starts`
+    **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `window_starts`
     pulls the LAST window back to end exactly on the last frame, so a range ending at `b` has a
     final window `[b - T, b)` -- not a whole-clip window unless `b` is the clip end. A frame
     belongs to the last window containing it, so the few frames after the range's final start were
@@ -2258,9 +2009,8 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
     do NOT round the user's `--start-frame`: the batch is an internal that no CLI value may be
     quantised by.
     """
-    import argparse
-
     from tailcyclenet.infer import driver
+    from tailcyclenet.infer.cli import build_parser
 
     model, sess, registry, name = _range_scene(tmp_path, T=64)
     seen = []
@@ -2270,19 +2020,19 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
         seen.append((int(fr[0]), int(fr[-1])))
         C, D = len(session.rig), max(1, top_k)
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32), None)
+                np.full((D, len(fr), C), np.nan, np.float32))
 
     def fake_associate(raw, session, gid, n, **kw):
-        b, s, _ = raw
-        return b[:n], s[:n], None
+        b, s = raw
+        return b[:n], s[:n]
 
     import tailcyclenet.detector as detmod
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw, detmod.associate_group = fake_detect_raw, fake_associate
     try:
-        args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
-                                  max_move=1.0, pose_nms=None, max_frames=0,
-                                  frame_start=37, frame_stop=64)
+        args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
+                                          '--max-move', '1.0'])
+        args.frame_start, args.frame_stop = 37, 64
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
 
@@ -2311,9 +2061,8 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
     aligned cursor happens to leave a full final batch. Parametrised over ragged and exact ends so
     neither case can pass alone.
     """
-    import argparse
-
     from tailcyclenet.infer import driver
+    from tailcyclenet.infer.cli import build_parser
 
     model, sess, registry, name = _range_scene(tmp_path, T=200)
     seen = []
@@ -2328,16 +2077,16 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
         seen.append((int(fr[0]), int(fr[-1])))
         C, D = len(session.rig), max(1, top_k)
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32), None)
+                np.full((D, len(fr), C), np.nan, np.float32))
 
     import tailcyclenet.detector as detmod
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw = fake_detect_raw
-    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n], None)
+    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
     try:
-        args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
-                                  max_move=1.0, pose_nms=None, max_frames=0,
-                                  frame_start=start, frame_stop=stop)
+        args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
+                                          '--max-move', '1.0'])
+        args.frame_start, args.frame_stop = start, stop
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
 

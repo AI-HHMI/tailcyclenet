@@ -51,7 +51,7 @@ class HybridBackbone(nn.Module):
     """
 
     def __init__(self, base_channels=64, n_transformer_blocks=(4, 2), n_heads=8, mlp_ratio=4.0,
-                p2=True, in_channels=3):
+                p2=True):
         """Build the hybrid backbone: CNN stages at strides 2/4/8, transformers at 16/32.
 
         Notes.
@@ -65,7 +65,7 @@ class HybridBackbone(nn.Module):
         self.p2 = bool(p2)
 
         self.stem = nn.Sequential(
-            conv_norm_act(in_channels, c, 3, 2),
+            conv_norm_act(3, c, 3, 2),
             conv_norm_act(c, c, 3, 1))
         self.stage2 = nn.Sequential(
             conv_norm_act(c, c * 2, 3, 2),

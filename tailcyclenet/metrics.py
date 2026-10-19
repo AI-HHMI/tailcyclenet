@@ -13,6 +13,25 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
+def label_extent(points, axis=None):
+    """The median diagonal of each instance-frame's keypoint bounding box -- the body size.
+
+    `points` is `(S, T, K, R)`. With `axis=None` the median runs over every instance-frame and a
+    float is returned; `axis=0` keeps time, giving a per-frame `(T,)` scale. Computed in the
+    input's own dtype, so a float32 label set gives the float32 median every score used. The diagonal, not a
+    per-axis span: a per-axis median runs tighter than the labelling noise. An instance-frame with
+    no finite keypoint contributes nothing; with none at all the result is NaN.
+    """
+    points = np.asarray(points)
+    with warnings.catch_warnings(), np.errstate(all='ignore'):
+        warnings.simplefilter('ignore', RuntimeWarning)
+        span = np.nanmax(points, axis=2) - np.nanmin(points, axis=2)
+        diag = np.linalg.norm(span, axis=-1)
+        if axis is None:
+            return float(np.nanmedian(diag)) if diag.size else float('nan')
+        return np.nanmedian(diag, axis=axis)
+
+
 def _dist(pred, true):
     """Per-point Euclidean distance, NaN where either side is missing."""
     d = np.linalg.norm(pred - true, axis=-1)
@@ -58,7 +77,7 @@ def _frame_stats(frame_means) -> dict:
             'frame_sum': float(fm[ok].sum()), 'frame_n': int(ok.sum())}
 
 
-def _per_frame_means(d):
+def per_frame_means(d):
     """Mean matched distance per frame. `d` is `(..., T, K)`; the frame axis is -2.
 
     A frame that matched nothing is an all-NaN slice, which `nanmean` answers with NaN and a
@@ -88,7 +107,7 @@ def error_and_coverage(pred, true) -> dict:
         'err': float(np.nanmean(d)) if matched.any() else float('nan'),
         'median': float(np.nanmedian(d)) if matched.any() else float('nan'),
         **_err_pcts(d),
-        **_frame_stats(_per_frame_means(d)),
+        **_frame_stats(per_frame_means(d)),
         'n_true': n_true,
         'n_matched': int(matched.sum()),
         'coverage': float(matched.sum() / n_true) if n_true else float('nan'),
@@ -219,17 +238,7 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
     out = []
     with np.errstate(invalid='ignore'):
         for t in range(T):
-            p, q = pred[:, t], true[:, t]
-            d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)
-            ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
-            n_ok = ok.sum(-1)
-            if penalise:
-                n_lab = np.broadcast_to(np.isfinite(q).all(-1).sum(-1)[None, :], n_ok.shape)
-                num = np.where(ok, d, 0.0).sum(-1) + max_dist * (n_lab - n_ok)
-                c = np.where(n_ok >= need, num / np.maximum(n_lab, 1), np.nan)
-            else:
-                c = np.where(n_ok >= need,
-                             np.where(ok, d, 0.0).sum(-1) / np.maximum(n_ok, 1), np.nan)
+            c = _pair_costs(pred[:, t], true[:, t], max_dist, need, penalise)
             admissible = np.isfinite(c) & (c <= max_dist)
             big = float(np.sum(c, where=admissible)) + 1.0 if admissible.any() else 1.0
             ri, ci = linear_sum_assignment(np.where(admissible, c, big))
@@ -330,7 +339,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
 
 
 def _pair_costs(p, q, max_dist, need, penalise):
-    """One frame's (Sp,St) instance costs, exactly as `match_instances` builds them."""
+    """One frame's (Sp,St) instance costs: the one cost `match_instances`, `mota` and `idf1` share."""
     d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)
     ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
     n_ok = ok.sum(-1)

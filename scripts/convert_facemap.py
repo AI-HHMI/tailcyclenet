@@ -122,10 +122,7 @@ def write_split(out: Path, split: str, grouped: dict[str, list[dict]], names: li
         if any((row['camera'], row['width'], row['height']) != (cam, *size) for row in rows):
             raise RuntimeError(f'{session_id}: camera or image size changes within session')
         dst = out / split / session_id
-        camera = fmt.nominal_camera(cam, size)
-        from aniposelib.cameras import CameraGroup
-        rig = fmt.Rig(cgroup=CameraGroup([camera]), offset={cam: (0.0, 0.0)},
-                      moving={cam: False}, calibrated={cam: False})
+        rig = fmt.nominal_rig(cam, size)
         groups = {}
         labels = {}
         for row in sorted(rows, key=lambda item: item['source_frame']):

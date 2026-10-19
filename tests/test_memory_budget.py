@@ -93,7 +93,7 @@ def det_scene(tmp_path_factory):
     _, sessions = sessions_for(root / 'ds', 'test')
     sess = sessions[0]
     sess.preload()
-    return YOLOXNano(n_keypoints=0).eval(), sess, next(iter(sess.groups))
+    return YOLOXNano(version='hybrid').eval(), sess, next(iter(sess.groups))
 
 
 def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
@@ -115,7 +115,7 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
         finally:
             memory.reset()
 
-    for name, a, b in zip(('boxes', 'scores', 'kpts'), run(4096), run(1e-6)):
+    for name, a, b in zip(('boxes', 'scores'), run(4096), run(1e-6)):
         if a is None:
             continue
         assert np.array_equal(a, b, equal_nan=True), f'{name} moved with the RAM budget'
@@ -134,9 +134,7 @@ def test_detection_is_batch_aligned_and_slice_independent(det_scene):
 
     parts = [detect_raw(det, (64, 64), sess, gid, 2, frames=np.arange(lo, hi), **kw)
              for lo, hi in ((0, 4), (4, 8))]
-    for i, name in enumerate(('boxes', 'scores', 'kpts')):
-        if whole[i] is None:
-            continue
+    for i, name in enumerate(('boxes', 'scores')):
         joined = np.concatenate([p[i] for p in parts], axis=1)
         assert np.array_equal(joined, whole[i], equal_nan=True), \
             f'{name} moved when the clip was detected in aligned slices'
@@ -253,15 +251,15 @@ def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees(
     cache = _ReaderCache(11)
     cache_open = []
 
-    import tailcyclenet.dataset as dsmod
-    real = dsmod._open_reader
-    dsmod._open_reader = lambda p: cache_open.append(p) or object()
+    import tailcyclenet.video as vmod
+    real = vmod.open_reader
+    vmod.open_reader = lambda p: cache_open.append(p) or object()
     try:
         for _ in range(60):                       # 60 passes over a 16-camera rig
             for c in range(16):
                 cache(f'cam{c}')
     finally:
-        dsmod._open_reader = real
+        vmod.open_reader = real
 
     rate = cache.hits / (cache.hits + cache.misses)
     assert rate > 0.3, (
@@ -281,7 +279,7 @@ def test_the_frame_cache_changes_no_pixel_at_any_budget(multiwindow_scene, budge
     Run at both ends rather than at the default, because the default on the test host is whatever
     that host happens to have free -- which is exactly the non-determinism being ruled out.
     """
-    from tailcyclenet.infer import InferConfig, run_group
+    from tailcyclenet.infer.window import InferConfig, run_group
 
     model, sess, registry, name = multiwindow_scene
     cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
@@ -322,7 +320,7 @@ def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, merge_blocks, run_blocks
+    from tailcyclenet.infer.window import InferConfig, merge_blocks, run_blocks
     from tailcyclenet.model import build_model
     from test_model import SMALL
 
@@ -339,7 +337,7 @@ def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
     boxes[..., 2], boxes[..., 3] = w, h
 
     def boxes_for(store, lo, hi):
-        return (boxes[:, lo:hi], None, None)
+        return (boxes[:, lo:hi], None)
 
     cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
                       anchor=anchor, refine=refine)
@@ -380,7 +378,7 @@ def test_a_window_that_does_not_fit_is_refused_not_re_decoded(tmp_path):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, run_group
+    from tailcyclenet.infer.window import InferConfig, run_group
     from tailcyclenet.model import build_model
     from test_model import SMALL
 
@@ -412,7 +410,7 @@ def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, merge_blocks, run_blocks
+    from tailcyclenet.infer.window import InferConfig, merge_blocks, run_blocks
     from tailcyclenet.model import build_model
     from test_model import SMALL
 
@@ -431,7 +429,7 @@ def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
 
     def boxes_for(store, lo, hi):
         seen.append((lo, hi))
-        return (boxes[:, lo:hi], None, None)
+        return (boxes[:, lo:hi], None)
 
     cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
                       anchor='carry')
@@ -476,8 +474,6 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
     process-wide -- so with the budget resolved BELOW the input branch the override was not in
     effect during the probe, and any consumer that asked would have got the HOST figure.
     """
-    import argparse
-
     from tailcyclenet import adopt, memory
     from tailcyclenet.infer import driver
 
@@ -498,15 +494,13 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError('the budget must be resolved before the checkpoint')))
 
-    args = argparse.Namespace(
-        run=tmp_path / 'run',
-        videos=[tmp_path / 'v.mp4'], calibration=tmp_path / 'c.toml', cam_regex=None,
-        session_id=None, group_id=None, units='mm', fps=None, assoc_res_max_px=30.0,
-        trim_to_shortest=False, dump_session=None, data=None, split=None,
-        anchor='none', oracle_corrupt=None, refine_px=None, refine=None,
-        max_frames=0, start_frame=0, end_frame=0, max_ram=17.0, dataset_name=None,
-        box_prompt='none', detector=None, boxes='b.npz', max_animals=1,
-        out=tmp_path / 'out')
+    from tailcyclenet.infer.cli import build_parser
+
+    args = build_parser().parse_args([
+        '--run', str(tmp_path / 'run'), '--videos', str(tmp_path / 'v.mp4'),
+        '--calibration', str(tmp_path / 'c.toml'), '--units', 'mm', '--anchor', 'none',
+        '--max-ram', '17.0', '--box-prompt', 'none', '--boxes', 'b.npz',
+        '--max-animals', '1', '--out', str(tmp_path / 'out')])
     try:
         with pytest.raises(SystemExit, match='the budget has been observed'):
             driver.run_dataset(args)
@@ -598,17 +592,17 @@ def test_plan_windows_refuses_when_one_window_does_not_fit():
 
 def test_plan_windows_returns_starts_blocks_cam_decode_when_it_fits():
     """The non-refusal path: a budget generous enough for the whole clip in one block, and the
-    window starts match `_window_starts` exactly (this is its own pure prefix, not a re-derivation
+    window starts match `window_starts` exactly (this is its own pure prefix, not a re-derivation
     that could drift from it).
     """
-    from tailcyclenet.infer.window import _plan_windows, _window_starts
+    from tailcyclenet.infer.window import _plan_windows, window_starts
     from tailcyclenet.memory import Budget
 
     roomy = Budget(limit_gb=64.0, available_gb=64.0, budget_gb=64.0, source='test', stated=True)
     starts, blocks, cam_decode, pipeline_det = _plan_windows(
         'sess', 'g000', [(64, 64)], n_frames=12, overlap=4, T_total=100, frame_start=0,
         budget=roomy)
-    assert starts == _window_starts(100, 12, 4, start=0)
+    assert starts == window_starts(100, 12, 4, start=0)
     assert blocks and blocks[0][0] == 0 and blocks[-1][1] == len(starts)
     assert cam_decode >= 1
     assert isinstance(pipeline_det, bool)
@@ -621,7 +615,7 @@ def test_plan_windows_matches_run_blocks_on_a_real_group(tmp_path):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, run_blocks
+    from tailcyclenet.infer.window import InferConfig, run_blocks
     from tailcyclenet.infer.window import _plan_windows
     from tailcyclenet.model import build_model
     from test_model import SMALL
@@ -643,3 +637,65 @@ def test_plan_windows_matches_run_blocks_on_a_real_group(tmp_path):
     starts, blocks, cam_decode, pipeline_det = _plan_windows(
         sess.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, group.n_frames, 0)
     assert starts and blocks
+
+
+def test_a_stated_budget_above_the_cap_gets_the_fraction_of_the_cap(monkeypatch):
+    """Asking for MORE than the machine has must not hand buffers more than asking for exactly
+    the cap: both clamp the PROCESS ceiling to the cap and give buffers the same fraction of it.
+    """
+    gb = memory.GB
+    monkeypatch.setattr(memory, '_meminfo', lambda: {'MemTotal': 512 * gb, 'MemAvailable': 400 * gb})
+    monkeypatch.setattr(memory, '_cgroup', lambda: (64 * gb, 0.0))
+    monkeypatch.setattr(memory, '_lsf_limit', lambda: None)
+    exact = memory.host_budget(64.0)
+    over = memory.host_budget(100.0)
+    assert over.budget_gb == pytest.approx(exact.budget_gb)
+    assert over.budget_gb == pytest.approx(64.0 * memory.DEFAULT_FRACTION)
+    assert over.ceiling == pytest.approx(64.0) and 'clamped' in over.source
+    memory.reset()
+
+
+def test_the_peak_check_measures_against_the_stated_figure_after_rebudget(monkeypatch):
+    """`rebudget` subtracts the process floor from the buffers, not from the user's ceiling, so
+    a peak below `--max-ram` must stay quiet and one above it must warn.
+    """
+    import warnings as _w
+
+    gb = memory.GB
+    monkeypatch.setattr(memory, '_meminfo', lambda: {'MemTotal': 512 * gb, 'MemAvailable': 400 * gb})
+    monkeypatch.setattr(memory, '_cgroup', lambda: (None, 0.0))
+    monkeypatch.setattr(memory, '_lsf_limit', lambda: None)
+    monkeypatch.setattr(memory, 'rss_gb', lambda: 5.0)
+    b = memory.rebudget(24.0)
+    assert b.ceiling == pytest.approx(24.0)
+    for peak, n_warn in ((23.0, 0), (25.0, 1)):
+        memory._peak_warned = False
+        monkeypatch.setattr(memory, 'peak_gb', lambda peak=peak: peak)
+        with _w.catch_warnings(record=True) as got:
+            _w.simplefilter('always')
+            memory.check_peak('a phase', b)
+        assert len(got) == n_warn, peak
+    memory._peak_warned = False
+    memory.reset()
+
+
+def test_cgroup_v1_limit_is_read_from_the_memory_hierarchy(tmp_path):
+    """On cgroup v1 the memory controller is mounted at `/sys/fs/cgroup/memory/<rel>` and its
+    line is usually not the last one in `/proc/self/cgroup`.
+    """
+    proc = tmp_path / 'cgroup'
+    proc.write_text('12:pids:/job\n4:memory:/lsf/job7\n1:name=systemd:/job\n')
+    leaf = tmp_path / 'sys' / 'memory' / 'lsf' / 'job7'
+    leaf.mkdir(parents=True)
+    (leaf / 'memory.limit_in_bytes').write_text(str(8 << 30))
+    (leaf / 'memory.usage_in_bytes').write_text(str(1 << 30))
+    (tmp_path / 'sys' / 'memory' / 'memory.limit_in_bytes').write_text(str(1 << 63))
+    assert memory._cgroup(proc, tmp_path / 'sys') == (float(8 << 30), float(1 << 30))
+
+    proc.write_text('0::/user.slice/s.scope\n')
+    v2 = tmp_path / 'sys' / 'user.slice'
+    (v2 / 's.scope').mkdir(parents=True)
+    (v2 / 'memory.max').write_text(str(4 << 30))
+    (v2 / 's.scope' / 'memory.max').write_text('max')
+    (v2 / 's.scope' / 'memory.current').write_text('7')
+    assert memory._cgroup(proc, tmp_path / 'sys') == (float(4 << 30), 7.0)

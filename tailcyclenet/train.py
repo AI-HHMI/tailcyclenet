@@ -22,7 +22,7 @@ import torch
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
 from tailcyclenet.config import BASE_CONFIG, check_image_size, load_config
-from tailcyclenet.dataset import (LoaderConfig, PoseDataset, SpawnHandoff, StepSampler,
+from tailcyclenet.dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
                                   pose_collate, worker_init)
 from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
@@ -255,7 +255,7 @@ def evaluate(model, batches, optimizer, device, fabric=None):
     """
     from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
 
-    from tailcyclenet.infer import self_prompt
+    from tailcyclenet.model import self_prompt
     from tailcyclenet.model import share_scene
 
     model.eval()
@@ -388,15 +388,7 @@ def main(argv: list[str] | None = None):
     torch.manual_seed(int(train_cfg.get('seed', 23)))
     np.random.seed(int(train_cfg.get('seed', 23)))
 
-    known = set(LoaderConfig.__dataclass_fields__) | {'path', 'num_workers'}
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(
-            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
-            f'train at the defaults and report as the arm it is not. Known keys: '
-            f'{sorted(known)}')
-    lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
-                         if k in LoaderConfig.__dataclass_fields__})
+    lc = loader_config_from(data_cfg)
     lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'))
     plan = plan_start(run, train_cfg.get('checkpoint_path'),
                       revision=train_cfg.get('checkpoint_revision'), no_resume=args.no_resume,

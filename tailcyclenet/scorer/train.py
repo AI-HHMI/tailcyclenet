@@ -8,7 +8,7 @@ family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose ch
 `scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and
 `optim.build_optimizer` (so Muon routing and the fresh-parameter rule are one implementation).
 
-    pixi run python scripts/train_scorer.py --config configs/scorer-3dpop.toml --data <root> \
+    pixi run python scripts/train_scorer.py --config configs/scorer.toml --data <root> \
         --out <results>/scorers/scorer-3dpop --checkpoint <pose run folder>
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from .contract import (SCORER_OUTPUT_GRANULARITIES, require_scorer_contract,
                        scorer_contract_mismatches, scorer_output_granularity)
 from .losses import build_scorer_loss
 from ..config import SCORER_CONFIG, load_config
-from ..dataset import LoaderConfig, PoseDataset, StepSampler
+from ..dataset import SCORER_PLUMBING, LoaderConfig, PoseDataset, StepSampler, loader_config_from
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
 from ..optim import build_optimizer, check_resume
@@ -41,6 +41,7 @@ from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer, flatten_sequence_triplet
+from .qc import refuse_deleted_data_keys
 from .triplet import SEGMENT_TYPES, seed_worker
 
 SCORER_HEAD_KEYS = ('pool_num_heads', 'score_hidden', 'use_precision', 'output_granularity')
@@ -77,15 +78,17 @@ def resolve_selection_metric(config: dict, output_granularity: str) -> str:
     return configured
 
 
-def resolve_output_granularity(config: dict) -> str:
-    """Resolve and validate the scorer output mode for a merged/new config.
-
-    New scorer configs inherit an explicit ``frame`` from the family base.  A config read directly
-    from an old run folder is handled by :func:`scorer.contract.scorer_output_granularity`, where an
-    absent key means the legacy sequence path.  This small wrapper is kept in the trainer so unit
-    tests and callers do not need to know which compatibility helper owns the default.
-    """
-    return scorer_output_granularity(config)
+_ALIAS = 'a duplicate spelling no config or run folder ever used; set '
+DELETED_CORRUPTION_KEYS = {
+    'sequence_far_gate': (False, 'no run folder ever enabled it; frame mode is the gated scorer, '
+                                 'and sequence mode keeps its ungated legacy loss'),
+    'reference_margin_px': (0.0, 'it only parameterised the deleted reference_gate = '
+                                 '"independent_far"'),
+    'n_segments': (1, _ALIAS + 'segment_count'),
+    'segment_length_frames': ([1, 1], _ALIAS + 'segment_len_frames'),
+    'segment_full_window_share': (0.0, _ALIAS + 'full_window_share'),
+    'segment_full_window_prob': (0.0, _ALIAS + 'full_window_share'),
+}
 
 
 def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
@@ -109,14 +112,11 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
     if mode not in SCORER_OUTPUT_GRANULARITIES:
         raise SystemExit(f'[scorer].output_granularity must be one of '
                          f'{SCORER_OUTPUT_GRANULARITIES}, got {mode!r}')
-    data_cfg = config.get('data', {})
-    model_cfg = config.get('model', {})
-    if 'n_frames' in data_cfg and 'stride_length' in model_cfg:
-        if int(data_cfg['n_frames']) != int(model_cfg['stride_length']):
-            raise SystemExit(
-                '[data].n_frames must equal [model].stride_length for scorer windows, got '
-                f'{data_cfg["n_frames"]} and {model_cfg["stride_length"]}')
     corr = dict(scorer.get('corruption', {}))
+    for key, (inert, why) in DELETED_CORRUPTION_KEYS.items():
+        if key in corr and corr.pop(key) != inert:
+            raise SystemExit(f'[scorer.corruption].{key} is deleted: {why}; only its inert '
+                             f'value {inert!r} is still accepted')
     if 'output_granularity' in corr and str(corr['output_granularity']).lower() != mode:
         raise SystemExit(
             '[scorer.corruption].output_granularity must match '
@@ -139,10 +139,6 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
                 f'[scorer]: frame-only setting(s) {bad} require '
                 'output_granularity = "frame"; sequence mode keeps the legacy loss.')
     else:
-        if bool(corr.get('sequence_far_gate', False)):
-            raise SystemExit(
-                '[scorer.corruption].sequence_far_gate cannot be enabled in frame mode: '
-                'frame mode always gates active rows per (frame, keypoint) slot')
         if pointwise > 0 and float(scorer.get('score_reg_weight', 0.0)) != 0.0:
             raise SystemExit(
                 '[scorer]: score_reg_weight must be 0 when pointwise_weight > 0; the signed '
@@ -159,22 +155,10 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         'const_offset_prob', 'frame_noise_prob', 'gradual_drift_prob', 'sinusoid_prob',
         'point_drop_prob', 'point_drop_max_frac', 'point_drop_bernoulli_rate',
         'mag_3d', 'mag_2d', 'min_corrupt_px', 'max_clean_px', 'reference_gate',
-        'reference_margin_px', 'sequence_far_gate', 'segment_prob', 'segment_count',
-        'n_segments', 'segment_len_frames', 'segment_length_frames', 'full_window_share',
-        'segment_full_window_share', 'segment_full_window_prob', 'segment_types',
-        'no_active_slot_policy',
+        'segment_prob', 'segment_count', 'segment_len_frames', 'full_window_share',
+        'segment_types', 'no_active_slot_policy',
         'out_of_view_policy', 'output_granularity', 'source_frame_duplicate_policy',
     }
-    alias_pairs = (
-        ('n_segments', 'segment_count'),
-        ('segment_full_window_share', 'full_window_share'),
-        ('segment_full_window_share', 'segment_full_window_prob'),
-        ('segment_len_frames', 'segment_length_frames'),
-    )
-    for first, second in alias_pairs:
-        if first in corr and second in corr and corr[first] != corr[second]:
-            raise SystemExit(
-                f'[scorer.corruption]: {first} and {second} disagree; set only one alias')
     if 'min_valid_frames' in corr:
         raise SystemExit(
             '[scorer.corruption].min_valid_frames is not read; set [scorer].min_valid_frames, '
@@ -187,19 +171,17 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
     segment_prob = float(corr.get('segment_prob', 0.0))
     if not 0.0 <= segment_prob <= 1.0:
         raise SystemExit('[scorer.corruption].segment_prob must be in [0, 1]')
-    full_share = float(corr.get('segment_full_window_share',
-                                 corr.get('full_window_share',
-                                          corr.get('segment_full_window_prob', 0.0))))
+    full_share = float(corr.get('full_window_share', 0.0))
     if not 0.0 <= full_share <= 1.0:
         raise SystemExit('[scorer.corruption] segment full-window share must be in [0, 1]')
-    count_value = corr.get('n_segments', corr.get('segment_count', 1))
+    count_value = corr.get('segment_count', 1)
     count_values = list(count_value) if isinstance(count_value, (list, tuple)) else [count_value]
     if len(count_values) not in (1, 2):
         raise SystemExit('[scorer.corruption] segment count must be an integer or [lo, hi]')
     count_values = [int(value) for value in count_values]
     if count_values[0] < 1 or (len(count_values) == 2 and count_values[1] < count_values[0]):
         raise SystemExit('[scorer.corruption] segment count must satisfy 1 <= lo <= hi')
-    length_value = corr.get('segment_len_frames', corr.get('segment_length_frames', [1, 1]))
+    length_value = corr.get('segment_len_frames', [1, 1])
     length_values = list(length_value) if isinstance(length_value, (list, tuple)) else [length_value]
     if len(length_values) not in (1, 2):
         raise SystemExit('[scorer.corruption] segment length must be an integer or [lo, hi]')
@@ -224,9 +206,6 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
             '[scorer.corruption] requires 0 <= max_clean_px < min_corrupt_px when a far '
             f'threshold is configured, or both zero for moved-mask fallback; '
             f'got min={min_corrupt}, max={max_clean}')
-    reference_margin = float(corr.get('reference_margin_px', 0.0))
-    if reference_margin < 0:
-        raise SystemExit('[scorer.corruption].reference_margin_px must be non-negative')
     duplicate_policy = str(scorer.get('source_frame_duplicate_policy', 'inverse_multiplicity'))
     if duplicate_policy != 'inverse_multiplicity':
         raise SystemExit(
@@ -243,15 +222,15 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         raise SystemExit(
             '[scorer.corruption].no_active_slot_policy must be "retry"; the dataset retry '
             'chain is the only implemented policy')
-    if reference_gate not in {'none', 'source_far', 'independent_far'}:
-        raise SystemExit(
-            f'[scorer.corruption].reference_gate = {reference_gate!r} is not one of '
-            '"none" | "source_far" | "independent_far"')
     if reference_gate == 'independent_far':
         raise SystemExit(
-            '[scorer.corruption].reference_gate = "independent_far" requires an explicit aligned '
-            'reference-coordinate provider; the standard scorer dataset has none. Use '
-            '"source_far" or add the provider before enabling this mode.')
+            '[scorer.corruption].reference_gate = "independent_far" is deleted: no scorer '
+            'dataset ever had the independent reference coordinates it needs, so every config '
+            'refused it. Use "source_far" (or "none").')
+    if reference_gate not in {'none', 'source_far'}:
+        raise SystemExit(
+            f'[scorer.corruption].reference_gate = {reference_gate!r} is not one of '
+            '"none" | "source_far"')
     return mode
 
 
@@ -283,15 +262,9 @@ def loader_config(data_cfg: dict, model_cfg: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming the unknown keys.
     """
-    known = set(LoaderConfig.__dataclass_fields__) | {
-        'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(
-            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
-            f'train at the defaults and report as the arm it is not. Known keys: {sorted(known)}')
-    lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
-                         if k in LoaderConfig.__dataclass_fields__})
+    data_cfg = dict(data_cfg)
+    refuse_deleted_data_keys(data_cfg)
+    lc = loader_config_from(data_cfg, extra=SCORER_PLUMBING)
     return replace(lc, box_prompt=model_cfg.get('box_prompt', 'none'))
 
 
@@ -421,38 +394,6 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
 
 
 
-def _frame_loss_kwargs(loss_fn, trip: dict) -> dict:
-    """Select metadata accepted by the local frame loss from a triplet dictionary.
-
-    ``FrameTripletScorerLoss`` is intentionally a normal PyTorch module rather than a change to
-    tracktail's installed loss.  Filtering by its signature lets the trainer work with the initial
-    mask-only implementation and with later versions that add a diagnostic mask without silently
-    dropping the masks both versions understand.
-    """
-    import inspect
-    values = {
-        'active_mask': trip.get('active_mask'),
-        'observed_mask': trip.get('observed_mask'),
-        'in_view_mask': trip.get('in_view_mask'),
-        'anchor_observed_mask': trip.get('anchor_observed_mask'),
-        'near_mask': trip.get('near_mask'),
-        'ambiguous_mask': trip.get('ambiguous_mask'),
-        'far_mask': trip.get('far_mask'),
-        'fired': trip.get('corruption_type_mask', trip.get('fired_frame')),
-        'corruption_type_mask': trip.get('corruption_type_mask', trip.get('fired_frame')),
-        'source_frame_weight': trip.get('source_frame_weight'),
-        'corrupted_keypoint': trip.get('corrupted_keypoint'),
-        'triplet': trip,
-        'metadata': trip,
-    }
-    try:
-        params = inspect.signature(loss_fn.forward).parameters
-    except (TypeError, ValueError):
-        params = {}
-    accepts_any = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-    if accepts_any:
-        return {k: v for k, v in values.items() if v is not None}
-    return {k: v for k, v in values.items() if v is not None and k in params}
 
 
 def scorer_loss(loss_fn, scores, precision, labels, trip=None, output_granularity='sequence'):
@@ -464,20 +405,11 @@ def scorer_loss(loss_fn, scores, precision, labels, trip=None, output_granularit
     """
     if output_granularity == 'sequence':
         if scores.ndim == 3:
-            if trip is not None and bool(trip.get('sequence_far_gate', False)):
-                far = trip.get('far_mask')
-                if far is None:
-                    raise ValueError("sequence_far_gate requires trip['far_mask'] metadata")
-                keypoint_mask = far.any(dim=1)
-                scores = scores[keypoint_mask]
-                precision = precision[keypoint_mask]
-                labels = labels[keypoint_mask]
-            else:
-                scores, precision, labels = flatten_sequence_triplet(scores, precision, labels)
+            scores, precision, labels = flatten_sequence_triplet(scores, precision, labels)
         return loss_fn(scores, precision, labels)
     if trip is None:
         raise ValueError('framewise scorer loss requires the triplet masks')
-    return loss_fn(scores, precision, labels, **_frame_loss_kwargs(loss_fn, trip))
+    return loss_fn(scores, precision, labels, triplet=trip)
 
 
 def _per_type_accuracy(scores: torch.Tensor, fired: torch.Tensor,
@@ -493,8 +425,6 @@ def _per_type_accuracy(scores: torch.Tensor, fired: torch.Tensor,
         if active_mask is not None:
             type_mask = type_mask & active_mask.reshape(-1, 1).to(type_mask.device)
     else:
-        if scores.ndim == 4:
-            scores = scores[..., :]
         correct = scores[..., 0] > scores[..., 1]
         type_mask = fired.bool()
         if active_mask is not None:
@@ -532,15 +462,10 @@ def _frame_pointwise_arrays(scores: torch.Tensor, labels: torch.Tensor,
     near = mask('near_mask', False)
     ambiguous = mask('ambiguous_mask', False)
     rejected = mask('reference_rejected_mask', False)
-    good_ref = trip.get('good_reference_distance_px')
-    if good_ref is not None:
-        good_ref = good_ref.to(device=device)
     targets, target_mask = signed_pointwise_targets(
         labels, observed, in_view, anchor, far, near,
         anchor_label=trip.get('anchor_label'), ambiguous_mask=ambiguous,
-        reference_rejected_mask=rejected, reference_gate=trip.get('reference_gate', 'source_far'),
-        good_reference_distance_px=good_ref,
-        max_clean_px=float(trip.get('max_clean_px', 0.0)))
+        reference_rejected_mask=rejected)
     if type_index is not None:
         type_mask = trip.get('corruption_type_mask', trip.get('fired_frame'))
         if type_mask is None:
@@ -621,42 +546,12 @@ def _frame_localization_counts(scores: torch.Tensor, trip: dict):
     return good, bad
 
 
-def _frame_direct_metrics(scores: torch.Tensor, trip: dict) -> dict:
-    """Count-based active metrics for one framewise triplet (not a window average)."""
-    active = trip.get('active_mask')
-    if active is None:
-        active = torch.ones(scores.shape[:-1], dtype=torch.bool, device=scores.device)
-    active = active.bool()
-    if active.ndim == scores.ndim - 1 and active.shape != scores.shape[:-1]:
-        active = active.reshape(scores.shape[:-1])
-    correct = scores[..., 0] > scores[..., 1]
-    gap = scores[..., 0] - scores[..., 1]
-    n = int(active.sum())
-    out = {
-        'val/n_active_rows': float(n),
-        'val/active_fraction': float(active.float().mean()),
-    }
-    if n:
-        out['val/active_triplet_acc'] = float(correct[active].float().mean())
-        out['val/active_score_gap'] = float(gap[active].mean())
-    return out
-
-
-def _move_triplet_metadata(trip: dict, device) -> dict:
-    """Move framewise masks/weights that are not part of the three model members."""
-    for key, value in list(trip.items()):
-        if torch.is_tensor(value):
-            trip[key] = value.to(device)
-    return trip
-
-
 def evaluate(model, loader, loss_fn, device, max_batches: int,
              optimizer=None, output_granularity: str = 'sequence') -> dict:
     """The held-out synthetic pass, with count-based frame metrics in frame mode."""
     model.eval()
     averaged = optimizer is not None and hasattr(optimizer, 'eval')
     per_type: dict[str, list] = {}
-    direct: dict[str, list] = {}
     type_totals: dict[str, list[float]] = {}
     pointwise_chunks = []
     pointwise_type_chunks: dict[str, list] = {}
@@ -676,7 +571,6 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
                     continue
                 rejection_draws += int(trip.get('rejected_draws', 0))
                 trip = triplet_to_device(trip, device)
-                trip = _move_triplet_metadata(trip, device)
                 scores, precision, labels = model.score_triplet(trip)
                 scorer_loss(loss_fn, scores, precision, labels, trip, output_granularity)
                 if output_granularity == 'frame':
@@ -727,19 +621,9 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
                             'base_far_mask', trip.get('far_mask', torch.zeros_like(active))).bool().sum())
                 else:
                     fired = trip['fired']
-                    sequence_active = None
-                    if bool(trip.get('sequence_far_gate', False)):
-                        far = trip.get('far_mask')
-                        if far is None:
-                            raise ValueError('sequence_far_gate requires trip[far_mask] metadata')
-                        sequence_active = far.any(dim=1)
                     if scores.ndim == 2:
                         fired = fired[0]
-                        if sequence_active is not None:
-                            sequence_active = sequence_active[0]
-                    type_metrics = (_per_type_accuracy(scores, fired) if sequence_active is None
-                                    else _per_type_accuracy(scores, fired, sequence_active))
-                    for k, v in type_metrics.items():
+                    for k, v in _per_type_accuracy(scores, fired).items():
                         per_type.setdefault(k, []).append(v)
                 seen += 1
                 if seen >= max_batches:
@@ -789,8 +673,6 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
         if view_counts['base_far']:
             out['val/reference_rejected_fraction'] = (
                 view_counts['reference_rejected'] / view_counts['base_far'])
-    else:
-        out.update({k: float(np.mean(v)) for k, v in direct.items()})
     out['val/n_scored'] = float(seen)
     out['val/n_rejected_draws'] = float(rejection_draws)
     out['val/rejection_rate'] = float(rejection_draws / (rejection_draws + seen)
@@ -1118,7 +1000,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 step += 1
                 continue
             trip = triplet_to_device(trip, device)
-            trip = _move_triplet_metadata(trip, device)
             if wrap:
                 scores, precision, labels = model(trip)
             else:

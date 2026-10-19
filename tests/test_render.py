@@ -387,10 +387,21 @@ def _two_group_session(path):
         cf._write_frames(path / 'groups' / gid, 'cam0', T, (W, H))
 
 
+def _as_marked_prediction(path):
+    """Turn `_two_group_session`'s tables into a marked prediction session's."""
+    import toml
+
+    doc = toml.loads((path / 'session.toml').read_text())
+    doc.update(prediction_session=True, complete=True)
+    (path / 'session.toml').write_text(toml.dumps(doc))
+    (path / 'keypoints.pq').rename(path / 'points2d.pq')
+
+
 def test_load_predictions_groups_filter_matches_the_unfiltered_read(tmp_path):
     from tailcyclenet.infer.predictions import load_predictions
 
     _two_group_session(tmp_path / 'sess')
+    _as_marked_prediction(tmp_path / 'sess')
 
     full, _ = load_predictions(tmp_path / 'sess')
     assert sorted(full) == ['sess/g000', 'sess/g001']
@@ -398,32 +409,32 @@ def test_load_predictions_groups_filter_matches_the_unfiltered_read(tmp_path):
     filtered, _ = load_predictions(tmp_path / 'sess', groups=['g000'])
     assert list(filtered) == ['sess/g000']
     np.testing.assert_array_equal(filtered['sess/g000']['pred'], full['sess/g000']['pred'])
+    assert np.isfinite(full['sess/g000']['pred']).any()
 
 
-def test_independent_window_render_scatter_uses_slots_not_window_ids(tmp_path):
-    import conftest as cf
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+def test_a_pre_marker_prediction_session_is_refused_by_name(tmp_path):
+    """Its reader was deleted; reading it must name why rather than misread the tables."""
+    from tailcyclenet.infer.predictions import load_predictions
 
-    from tailcyclenet.format import load_dataset
-    from tailcyclenet.render import _read_prediction_2d
+    _two_group_session(tmp_path / 'sess')
+    with pytest.raises(ValueError, match='pre-marker prediction session'):
+        load_predictions(tmp_path / 'sess')
 
-    root = tmp_path / 'data'
-    cf._session_2d(root / 'test' / 's', T=4)
-    sess = load_dataset(root).sessions['test'][0]
-    pred_path = tmp_path / 'pred'
-    pred_path.mkdir()
-    pq.write_table(pa.table({
-        'group_id': ['g000'], 'frame': [0], 'animal_id': ['w000001_s01'],
-        'camera': ['cam0'], 'bodypart': ['nose'], 'x': [12.5], 'y': [23.5], 'slot': [1],
-    }), pred_path / 'points2d.pq')
-    preds = {'s/g000': {'mode': '2d', 'animal_ids': np.array(['slot_00', 'slot_01'], object),
-                        'independent_windows': True,
-                        'pred': np.full((2, 4, len(sess.names), 2), np.nan, np.float32)}}
 
-    _read_prediction_2d(pred_path, preds, sess)
+def test_an_independent_windows_session_is_refused_by_name(tmp_path):
+    """`--independent-windows` output carries window-local ids; its reader was deleted."""
+    import toml
 
-    np.testing.assert_array_equal(preds['s/g000']['pred2d'][1, 0, 0, 0], [12.5, 23.5])
+    from tailcyclenet.infer.predictions import load_predictions
+
+    path = tmp_path / 'sess'
+    _two_group_session(path)
+    _as_marked_prediction(path)
+    doc = toml.loads((path / 'session.toml').read_text())
+    doc['provenance']['independent_windows'] = True
+    (path / 'session.toml').write_text(toml.dumps(doc))
+    with pytest.raises(ValueError, match='--independent-windows'):
+        load_predictions(path)
 
 
 def test_load_predictions_refuses_ambiguous_marker_free_session(tmp_path):

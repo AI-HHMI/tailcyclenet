@@ -60,11 +60,8 @@ def _frame_windows(blk: dict, f0: int, w0: int, T: int, group_frames: int,
     return owner.astype(np.int32), start_for_frame, stop_for_frame
 
 
-def _row_ids(ids, slots, windows, independent: bool):
-    """Resolve row IDs from fixed linked IDs or independent window/slot IDs."""
-    if independent:
-        return np.asarray([f'w{int(w):06d}_s{int(s):02d}' for s, w in zip(slots, windows)],
-                          dtype=object)
+def _row_ids(ids, slots):
+    """Each row's animal id: the linked id of its slot."""
     return np.asarray([ids[int(s)] for s in slots], dtype=object)
 
 
@@ -79,7 +76,7 @@ class _WindowPredictionWriter:
     FLOAT_FIELDS = (
         'x', 'y', 'z', 'triangulated_x', 'triangulated_y', 'triangulated_z', 'score',
         'score_logit', 'visibility_logit', 'visibility_probability', 'confidence_logit',
-        'confidence_probability', 'det_score', 'box_agree', 'x0', 'y0', 'x1', 'y1',
+        'confidence_probability', 'box_agree', 'x0', 'y0', 'x1', 'y1',
         'crop_x0', 'crop_y0', 'crop_x1', 'crop_y1', 'refined_x0', 'refined_y0',
         'refined_x1', 'refined_y1')
     QUALITY_FIELDS = ('quality_score', 'quality_precision')
@@ -111,15 +108,6 @@ class _WindowPredictionWriter:
         normalized = []
         for record in records:
             row = dict(record)
-            if 'record_type' not in row and 'type' in row:
-                row['record_type'] = row.pop('type')
-            if 'box' in row and row['box'] is not None:
-                row.update(zip(('x0', 'y0', 'x1', 'y1'), row.pop('box')))
-            if 'crop' in row and row['crop'] is not None:
-                row.update(zip(('crop_x0', 'crop_y0', 'crop_x1', 'crop_y1'), row.pop('crop')))
-            if 'crop_refined' in row and row['crop_refined'] is not None:
-                row.update(zip(('refined_x0', 'refined_y0', 'refined_x1', 'refined_y1'),
-                               row.pop('crop_refined')))
             for axis in ('x0', 'y0', 'x1', 'y1'):
                 key = f'crop_refined_{axis}'
                 if key in row:
@@ -176,7 +164,6 @@ class SessionWriter:
         """
         self.out = Path(out)
         self.src = source
-        self.names = list(registry.names) if hasattr(registry, 'names') else list(source.names)
         self.out.mkdir(parents=True, exist_ok=True)
         self._w = {t: TableWriter(self.out / f'{t}.pq', DICT_COLS) for t in _TABLES}
 
@@ -190,7 +177,6 @@ class SessionWriter:
                 seen[k] = v
             provenance = seen
         self.provenance = dict(provenance)
-        self.independent_windows = bool(self.provenance.get('independent_windows', False))
         self.window_predictions = bool(self.provenance.get('window_predictions', False))
         self.quality_enabled = bool(quality_enabled)
         self.window_length = int(self.provenance.get('n_frames', 0) or 0)
@@ -269,8 +255,7 @@ class SessionWriter:
                 self._w['points3d'].write({
                     'group_id': np.array([gid] * int(keep.sum()), dtype=object),
                     'frame': (t_ix[keep] + f0).astype(np.int32),
-                    'animal_id': _row_ids(ids, a_ix[keep], owner[t_ix[keep]],
-                                          self.independent_windows),
+                    'animal_id': _row_ids(ids, a_ix[keep]),
                     'bodypart': np.array([kpts[i] for i in k_ix[keep]], dtype=object),
                     'status': np.where(conf.ravel()[keep] > 0, 'visible', 'missing'),
                     'x': pred[..., 0].ravel()[keep].astype(np.float32),
@@ -307,8 +292,7 @@ class SessionWriter:
             self._w['points2d'].write({
                 'group_id': np.array([gid] * n, dtype=object),
                 'frame': (t2[keep2] + f0).astype(np.int32),
-                'animal_id': _row_ids(ids, a2[keep2], owner[t2[keep2]],
-                                      self.independent_windows),
+                'animal_id': _row_ids(ids, a2[keep2]),
                 'camera': np.array([cams[i] for i in c2i[keep2]], dtype=object),
                 'bodypart': np.array([kpts[i] for i in k2[keep2]], dtype=object),
                 'x': p2[..., 0].ravel()[keep2].astype(np.float32),
@@ -339,8 +323,7 @@ class SessionWriter:
             n = int(have.sum())
             rows = {'group_id': np.array([gid] * n, dtype=object),
                     'frame': (ti[have] + f0).astype(np.int32),
-                    'animal_id': _row_ids(ids, ai[have], owner[ti[have]],
-                                          self.independent_windows),
+                    'animal_id': _row_ids(ids, ai[have]),
                     'camera': np.array([cams[i] for i in ci[have]], dtype=object),
                     'status': np.array(['labeled'] * n, dtype=object),
                     'box_agree': ba.ravel()[have].astype(np.float32),
@@ -366,7 +349,7 @@ class SessionWriter:
         win_stop = np.asarray(blk.get('window_stop', win_start + self.window_length),
                                dtype=np.int32)
         rows = {'group_id': np.array([gid] * len(aw), dtype=object),
-                'animal_id': _row_ids(ids, aw, win_ids, self.independent_windows),
+                'animal_id': _row_ids(ids, aw),
                 'camera': np.array([cams[i] for i in cw], dtype=object),
                 'slot': aw.astype(np.int32),
                 'window': win_ids,
@@ -482,7 +465,7 @@ def _load_npz(path, groups=None):
 
 
 def _load_session(path, groups=None):
-    """Read marked prediction sessions or provenance-identified pre-marker outputs."""
+    """Read a marked prediction session; a pre-marker or window-local one is refused by name."""
     path = Path(path)
     sess = Session.load(path)
     with (path / 'session.toml').open('rb') as f:
@@ -494,20 +477,24 @@ def _load_session(path, groups=None):
         return _load_prediction_session(path, sess, cfg, groups)
     provenance = cfg.get('provenance', {})
     if provenance.get('run') and provenance.get('checkpoint'):
-        return _load_legacy_session(path, groups)
+        raise ValueError(
+            f'{path}: a pre-marker prediction session (no `prediction_session = true`). Its '
+            'reader was deleted on 2026-10-19; the last release that reads it is v0.3.4.')
     raise ValueError(f'{path}: not a marked prediction session; refusing ambiguous annotation data')
 
 
 def _load_prediction_session(path, sess, cfg, groups=None):
-    """Read primary prediction rows, slot-dense only when IDs are window-local."""
+    """Read primary prediction rows into dense per-animal arrays."""
     import pyarrow.compute as pc
 
     provenance = cfg.get('provenance', {})
-    independent = bool(provenance.get('independent_windows', False))
+    if provenance.get('independent_windows', False):
+        raise ValueError(
+            f'{path}: written by --independent-windows (window-local animal ids), which was '
+            'deleted on 2026-10-19; the last release that reads it is v0.3.4.')
     p3_all = _table(path, 'points3d')
     p2_all = _table(path, 'points2d')
     inst_all = _table(path, 'instances')
-    windows_all = _table(path, 'windows')
     wanted = set(groups) if groups is not None else None
     output = {}
     for gid, group in sess.groups.items():
@@ -517,25 +504,15 @@ def _load_prediction_session(path, sess, cfg, groups=None):
         p3 = _filter_group(p3_all, gid, pc)
         p2 = _filter_group(p2_all, gid, pc)
         inst = _filter_group(inst_all, gid, pc)
-        win = _filter_group(windows_all, gid, pc)
-        if independent:
-            slot_values = []
-            for table in (p3, p2, inst, win):
-                if table is not None and 'slot' in table.column_names and len(table):
-                    slot_values.extend(_nullable_ints(table, 'slot').tolist())
-            slot_values = [v for v in slot_values if v >= 0]
-            S = max(slot_values, default=-1) + 1
-            animal_ids = [f'slot_{i:02d}' for i in range(S)]
-        else:
-            lab = sess.labels(gid)
-            animal_ids = list(lab.animal_ids)
-            if not animal_ids:
-                values = []
-                for table in (p3, p2, inst):
-                    if table is not None and len(table) and 'animal_id' in table.column_names:
-                        values.extend(table.column('animal_id').to_pylist())
-                animal_ids = sorted({str(v) for v in values if v is not None})
-            S = len(animal_ids)
+        lab = sess.labels(gid)
+        animal_ids = list(lab.animal_ids)
+        if not animal_ids:
+            values = []
+            for table in (p3, p2, inst):
+                if table is not None and len(table) and 'animal_id' in table.column_names:
+                    values.extend(table.column('animal_id').to_pylist())
+            animal_ids = sorted({str(v) for v in values if v is not None})
+        S = len(animal_ids)
         id_index = {str(v): i for i, v in enumerate(animal_ids)}
         pred3 = np.full((S, T, K, 3), np.nan, np.float32)
         pred2 = np.full((S, T, C, K, 2), np.nan, np.float32)
@@ -543,20 +520,19 @@ def _load_prediction_session(path, sess, cfg, groups=None):
         conf2 = np.full((S, T, K), np.nan, np.float32)
         boxes = np.full((S, T, C, 4), np.nan, np.float32)
         box_agree = np.full((S, T, C), np.nan, np.float32)
-        _scatter_prediction(p3, pred3, sess, gid, id_index, independent, ('x', 'y', 'z'))
-        _scatter_prediction(p2, pred2, sess, gid, id_index, independent, ('x', 'y'),
+        _scatter_prediction(p3, pred3, sess, gid, id_index, ('x', 'y', 'z'))
+        _scatter_prediction(p2, pred2, sess, gid, id_index, ('x', 'y'),
                              camera_axis=True)
-        _scatter_prediction(p3, conf3, sess, gid, id_index, independent, ('score_logit',))
-        _scatter_prediction(p2, conf2, sess, gid, id_index, independent,
+        _scatter_prediction(p3, conf3, sess, gid, id_index, ('score_logit',))
+        _scatter_prediction(p2, conf2, sess, gid, id_index,
                              ('visibility_logit',), camera_axis=True, camera_only=0)
-        _scatter_prediction(inst, boxes, sess, gid, id_index, independent,
+        _scatter_prediction(inst, boxes, sess, gid, id_index,
                              ('x0', 'y0', 'x1', 'y1'), camera_axis=True)
-        _scatter_prediction(inst, box_agree, sess, gid, id_index, independent,
+        _scatter_prediction(inst, box_agree, sess, gid, id_index,
                              ('box_agree',), camera_axis=True)
         d = {'mode': sess.mode, 'group_id': gid, 'session':
              provenance.get('source_session_id', sess.session_id),
-             'animal_ids': np.asarray(animal_ids, object),
-             'independent_windows': independent}
+             'animal_ids': np.asarray(animal_ids, object)}
         if sess.mode == '3d':
             d['pred'] = pred3
             if p2 is not None:
@@ -575,7 +551,7 @@ def _load_prediction_session(path, sess, cfg, groups=None):
             'anchor': str(provenance.get('anchor', '')),
             'boxes': str(provenance.get('boxes', '')),
             'box_source': str(provenance.get('box_source', '')),
-            'prediction_session': True, 'independent_windows': independent,
+            'prediction_session': True,
             'frame_start': int(provenance.get('frame_start', 0) or 0),
             'frame_stop': int(provenance.get('frame_stop', 0)
                               or provenance.get('max_frames', 0) or 0)}
@@ -595,7 +571,7 @@ def _nullable_ints(table, col):
                       dtype=np.int64)
 
 
-def _scatter_prediction(table, out, sess, gid, id_index, independent, fields,
+def _scatter_prediction(table, out, sess, gid, id_index, fields,
                         camera_axis=False, camera_only=None):
     """Scatter one prediction table by animal id or explicit slot; coordinates keep NaNs."""
     if table is None or not len(table):
@@ -606,11 +582,8 @@ def _scatter_prediction(table, out, sess, gid, id_index, independent, fields,
         raise ValueError(f'unsupported prediction fields {fields!r}')
     S, T, K = out.shape[0], out.shape[1], len(sess.names)
     frame = _nullable_ints(table, 'frame')
-    if independent:
-        animal = _nullable_ints(table, 'slot')
-    else:
-        animal = np.asarray([id_index.get(str(v), -1)
-                             for v in table.column('animal_id').to_pylist()], np.int64)
+    animal = np.asarray([id_index.get(str(v), -1)
+                         for v in table.column('animal_id').to_pylist()], np.int64)
     body = (np.asarray([sess.names.index(str(v)) if str(v) in sess.names else -1
                         for v in table.column('bodypart').to_pylist()], np.int64)
             if 'bodypart' in table.column_names else np.zeros(len(table), np.int64))
@@ -651,112 +624,11 @@ def _nullable_floats(table, col):
                        for v in table.column(col).to_pylist()], dtype=np.float32)
 
 
-def _load_legacy_session(path, groups=None):
-    """Densify a provenance-identified pre-marker prediction session.
-
-    The scatter is `format.Session`'s own (the spec defines how long tables become dense arrays);
-    this renames fields and adds the two non-spec tables. No `preload()` -- `Session.labels`
-    caches per group, so scattering is already lazy.
-
-    In 2D the prediction IS the per-camera pose at camera 0 (`coords_pred` is `2d_pred[0]`),
-    which is what `keypoints.pq` holds; `pred2d` is transposed `(S,T,K,C,2) -> (S,T,C,K,2)`.
-    `conf` is the LOGIT, from the additive `score_logit` column -- `sigmoid` cannot be inverted
-    in float32 once it saturates, which it does at the medians this repo measures.
-    """
-    import tomllib
-
-    sess = Session.load(Path(path))
-    with open(Path(path) / 'session.toml', 'rb') as f:
-        prov = tomllib.load(f).get('provenance', {})
-    src_id = prov.get('source_session_id') or sess.session_id
-
-    want = set(groups) if groups is not None else None
-    out = {}
-    for gid in sess.groups:
-        if want is not None and gid not in want:
-            continue
-        lab = sess.labels(gid)
-        d = {'mode': sess.mode, 'group_id': gid, 'session': src_id,
-             'animal_ids': np.asarray(list(lab.animal_ids), object)}
-        if sess.mode == '3d':
-            d['pred'] = (lab.points3d if lab.points3d is not None
-                         else np.full((len(lab.animal_ids), sess.groups[gid].n_frames,
-                                       len(sess.names), 3), np.nan, np.float32))
-        else:
-            d['pred'] = (lab.points2d[..., 0, :] if lab.points2d is not None
-                         else np.full((len(lab.animal_ids), sess.groups[gid].n_frames,
-                                       len(sess.names), 2), np.nan, np.float32))
-        if lab.points2d is not None:
-            d['pred2d'] = np.moveaxis(lab.points2d, 3, 2)
-        if lab.boxes is not None:
-            d['boxes'] = lab.boxes
-        d['conf'] = _score_logit(Path(path), gid, sess, lab, 'points3d' if sess.mode == '3d'
-                                 else 'keypoints')
-        ba = _instances_col(Path(path), gid, sess, lab, 'box_agree')
-        if ba is not None:
-            d['box_agree'] = ba
-        out[f'{src_id}/{gid}'] = d
-    meta = {'run': str(prov.get('run', '')), 'anchor': str(prov.get('anchor', '')),
-            'boxes': str(prov.get('boxes', '')), 'box_source': str(prov.get('box_source', ''))}
-    return out, meta
-
-
 def _table(path: Path, stem: str):
     """`path/{stem}.pq` as a pyarrow table, or None if the file does not exist."""
     import pyarrow.parquet as pq
     f = path / f'{stem}.pq'
     return pq.read_table(f) if f.exists() else None
-
-
-def _score_logit(path, gid, sess, lab, stem):
-    """`(S,T,K)` of the visibility logit, scattered from the additive `score_logit` column.
-
-    For the keypoints table there is one row per camera but `conf` is per keypoint, so only
-    camera 0 is kept -- camera 0 is the 2D prediction's own head.
-    """
-    t = _table(path, stem)
-    S, T, K = len(lab.animal_ids), sess.groups[gid].n_frames, len(sess.names)
-    out = np.full((S, T, K), np.nan, np.float32)
-    if t is None or 'score_logit' not in t.column_names or not len(t):
-        return out
-    import pyarrow.compute as pc
-    t = t.filter(pc.equal(t.column('group_id'), gid))
-    if not len(t):
-        return out
-    a = {v: i for i, v in enumerate(lab.animal_ids)}
-    k = {v: i for i, v in enumerate(sess.names)}
-    ai = np.array([a.get(str(v), -1) for v in t.column('animal_id').to_pylist()])
-    ki = np.array([k.get(str(v), -1) for v in t.column('bodypart').to_pylist()])
-    ti = np.asarray(t.column('frame').to_pylist(), int)
-    sl = np.asarray(t.column('score_logit').to_pylist(), np.float32)
-    ok = (ai >= 0) & (ki >= 0) & (ti < T)
-    if stem == 'keypoints':
-        c0 = str(sess.cam_names[0])
-        ok &= np.array([str(v) == c0 for v in t.column('camera').to_pylist()])
-    out[ai[ok], ti[ok], ki[ok]] = sl[ok]
-    return out
-
-
-def _instances_col(path, gid, sess, lab, col):
-    """`(S,T,C)` of one additive `instances.pq` column, or None if it is not there."""
-    t = _table(path, 'instances')
-    if t is None or col not in t.column_names or not len(t):
-        return None
-    import pyarrow.compute as pc
-    t = t.filter(pc.equal(t.column('group_id'), gid))
-    S, T, C = len(lab.animal_ids), sess.groups[gid].n_frames, len(sess.rig)
-    out = np.full((S, T, C), np.nan, np.float32)
-    if not len(t):
-        return out
-    a = {v: i for i, v in enumerate(lab.animal_ids)}
-    c = {v: i for i, v in enumerate(sess.cam_names)}
-    ai = np.array([a.get(str(v), -1) for v in t.column('animal_id').to_pylist()])
-    ci = np.array([c.get(str(v), -1) for v in t.column('camera').to_pylist()])
-    ti = np.asarray(t.column('frame').to_pylist(), int)
-    vv = np.asarray(t.column(col).to_pylist(), np.float32)
-    ok = (ai >= 0) & (ci >= 0) & (ti < T)
-    out[ai[ok], ti[ok], ci[ok]] = vv[ok]
-    return out
 
 
 def refuse_multi_session(data, split):

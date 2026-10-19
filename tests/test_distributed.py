@@ -240,10 +240,10 @@ def test_a_retry_does_not_desynchronise_the_shape(tiny_root):
     """
     ds = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
     calls = []
-    real_shape = ds._shape
-    ds._shape = lambda rng: (calls.append(1), real_shape(rng))[1]
+    real_shape = ds.shape
+    ds.shape = lambda rng: (calls.append(1), real_shape(rng))[1]
     ds[(7, 0)]
-    assert len(calls) == 1, f'_shape drawn {len(calls)} times for one item'
+    assert len(calls) == 1, f'shape drawn {len(calls)} times for one item'
 
 
 def test_camera_count_distribution_is_unchanged(tiny_root):
@@ -251,7 +251,7 @@ def test_camera_count_distribution_is_unchanged(tiny_root):
     means by `cams_to_sample`, and it has to survive, or this is a training change wearing a
     performance fix's clothes."""
     ds = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
-    counts = [ds._shape(np.random.default_rng((23, 0x5AFE, k)))['n_cams'] for k in range(3000)]
+    counts = [ds.shape(np.random.default_rng((23, 0x5AFE, k)))['n_cams'] for k in range(3000)]
     share = {c: counts.count(c) / len(counts) for c in (1, 2, 3)}
     assert all(abs(v - 1 / 3) < 0.03 for v in share.values()), share
 

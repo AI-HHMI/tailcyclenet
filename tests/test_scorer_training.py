@@ -106,14 +106,14 @@ def test_val_retry_picks_the_same_window_every_time(scorer_root, monkeypatch):
     def chain():
         """The base indices tried while building window 0, with window 0 forced to fail."""
         base = PoseDataset(scorer_root, 'val', cfg)
-        real = base._select
+        real = base.select
         tried: list[int] = []
 
         def select(idx, rng, shape=None):
             tried.append(idx)
             return None if idx == 0 else real(idx, rng, shape)
 
-        monkeypatch.setattr(base, '_select', select)
+        monkeypatch.setattr(base, 'select', select)
         ds = ScorerDataset(base, corr)
         assert ds[0] is not None
         return tried
@@ -517,12 +517,12 @@ def test_val_retries_never_use_an_entropy_seeded_rng(scorer_root, monkeypatch):
 
     def build(split: str):
         base = PoseDataset(scorer_root, split, cfg, train=(split == 'train'))
-        original = base._select
+        original = base.select
 
         def select(idx, rng, shape=None):
             return None if idx == 0 else original(idx, rng, shape)
 
-        monkeypatch.setattr(base, '_select', select)
+        monkeypatch.setattr(base, 'select', select)
         return ScorerDataset(base, corr)
 
     val = build('val')

@@ -42,10 +42,10 @@ import pyarrow.parquet as pq
 
 from tailcyclenet import format as fmt
 
-# Import the family convention from v1.  The v1 module is deliberately used only for the
-# condition names and split rule; v3 has its own HDF5 and pixel path handling.
+# The condition names and family split rule are shared conventions; v3 has its own HDF5 and
+# pixel path handling.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from convert_deepfly3d_v1 import SOURCE_CONDITIONS, family_id, split_map  # noqa: E402
+from deepfly3d_common import SOURCE_CONDITIONS, family_id, split_map  # noqa: E402
 
 N_CAMERAS = 7
 N_KEYPOINTS = 38
@@ -912,9 +912,7 @@ def _same_policy(root: Path, policy: dict) -> bool:
             if fmt.validate_session(loaded, check_images=False):
                 return False
         return True
-    except Exception:
-
-
+    except (OSError, ValueError, fmt.FormatError):
         return False
 
 
@@ -970,7 +968,7 @@ def convert_command(args) -> int:
         _atomic_json(root / 'split_manifest.json', {
             'dataset': 'deepfly3d-v3',
             'policy': 'family grouped; condition + acquisition date + FlyN stays in one split',
-            'source_family_split': 'convert_deepfly3d_v1.split_map (v2 family policy)',
+            'source_family_split': 'deepfly3d_common.split_map (v2 family policy)',
             'assignment': splits,
         })
         inventory = []
@@ -979,10 +977,8 @@ def convert_command(args) -> int:
             try:
                 inventory.append(convert_record(record, split, root, force=False,
                                                  max_reprojection_px=args.max_reprojection_px))
-            except (AssertionError, OSError, ValueError, RuntimeError, KeyError, TypeError,
-                    EOFError, OverflowError) as exc:
-
-
+            except (AssertionError, OSError, ValueError, RuntimeError, EOFError,
+                    OverflowError) as exc:
                 inventory.append({'condition': record.condition, 'archive': record.archive,
                                   'split': split, 'status': 'quarantined',
                                   'reason': 'conversion_failed:' + str(exc),
@@ -1016,6 +1012,10 @@ def convert_command(args) -> int:
           f'quarantined {manifest["quarantined_source_sessions"]}')
     print('WARNING: units are scaled provisional mm; calibration remains provisional_unvalidated',
           file=sys.stderr)
+    if records and not manifest['converted_sessions']:
+        print(f'ERROR: every one of {len(records)} trials was quarantined; see '
+              f'{root / "conversion_manifest.json"}', file=sys.stderr)
+        return 1
     return 0
 
 

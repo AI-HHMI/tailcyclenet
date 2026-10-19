@@ -11,7 +11,6 @@ what the arm was trained on; score 3dpop on `test` (its val is one session).
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -21,10 +20,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import BOX_SOURCES
-from tailcyclenet.detector import BoxDataset, load_detector
-from tailcyclenet.detector.evaluate import deployment_score, score_dataset, score_fixed_views
+from tailcyclenet.detector import NMS_CENTER_DIST_DEPLOY, BoxDataset, load_detector
+from tailcyclenet.detector.evaluate import deployment_score, score_dataset
 from tailcyclenet.format import load_datasets
-from tailcyclenet.infer.driver import _detector_box_source
+from tailcyclenet.infer.driver import detector_box_source
 from tailcyclenet.metrics import paired_bootstrap
 
 
@@ -54,17 +53,6 @@ class FixedSplitDataset:
         self._augment = value
         for ds in self.parts:
             ds.augment = value
-
-    @property
-    def tt_transform(self):
-        """Return the shared test-time image transform."""
-        return self.parts[0].tt_transform
-
-    @tt_transform.setter
-    def tt_transform(self, value):
-        """Set the test-time transform on every split dataset."""
-        for ds in self.parts:
-            ds.tt_transform = value
 
     def _locate(self, index):
         """Map a combined item index to its child dataset and local index."""
@@ -106,52 +94,32 @@ def _tiled(run, tile_scale):
 
 
 def _eval_dataset(args, model, wh, mcd, red):
-    """Build the scored dataset and the `--evalset` subset (None without one) for one run.
+    """Build the scored dataset for one run.
 
     Both `--run` and `--compare` go through here, so a paired delta compares the same views:
-    the index depends only on the data, the split(s) and the evalset, never on the checkpoint.
+    the index depends only on the data and the split(s), never on the checkpoint.
     """
-    eval_spec = json.loads(args.evalset.read_text()) if args.evalset else None
-    split_names = sorted({item.get('split', args.split) for item in eval_spec['frames']}) if eval_spec else args.split.split(',')
     parts = [BoxDataset(args.data, split, input_wh=wh, box_source=args.boxes,
                         min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                         max_frames_per_group=args.frames_per_group,
                         box_target=getattr(model, 'box_target', 'crop'),
                         antialias=getattr(model, 'antialias', False),
-                        input_norm=getattr(model, 'input_norm', 'none')) for split in split_names]
-    if eval_spec:
-        for split in split_names:
-            part = parts[split_names.index(split)]
-            present = {(sess.session_id, gid, frame, ci) for sess, gid, frame, ci in part.index}
-            for entry in eval_spec['frames']:
-                if entry.get('split', args.split) != split:
-                    continue
-                sess = next((sess for root in part.datasets for sess in root.all_sessions()
-                             if sess.session_id == entry['session']), None)
-                if sess is None:
-                    raise SystemExit(f"{entry['session']}: session not found in split {split}")
-                for ci in range(len(sess.cam_names)):
-                    key = (sess.session_id, entry['group'], int(entry['frame']), ci)
-                    if key not in present:
-                        part.index.append((sess, entry['group'], int(entry['frame']), ci))
-                        part.origins.append(None)
-                        part.root_ids.append(0)
-                        present.add(key)
-    ds = parts[0] if len(parts) == 1 else FixedSplitDataset(parts)
-    index_splits = [split for split, part in zip(split_names, parts) for _ in part.index]
-    fixed = None
-    if args.evalset:
-        spec = eval_spec
-        fixed = set()
-        for item in spec['frames']:
-            for i, (sess, gid, frame, ci) in enumerate(ds.index):
-                if (sess.session_id == item['session'] and gid == item['group']
-                        and frame == int(item['frame'])
-                        and index_splits[i] == item.get('split', split_names[0])):
-                    fixed.add(i)
-        if not fixed:
-            raise SystemExit(f'{args.evalset}: no matching views in {args.data}/{args.split}')
-    return ds, fixed
+                        input_norm=getattr(model, 'input_norm', 'none'))
+             for split in args.split.split(',')]
+    return parts[0] if len(parts) == 1 else FixedSplitDataset(parts)
+
+
+REMOVED_FLAGS = ('--evalset', '--out', '--tt-gain', '--tt-gamma')
+
+
+class _RemovedFlag(argparse.Action):
+    """A deleted flag: passing it exits naming the flag and why, never silently ignored."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        """Refuse the flag by name."""
+        raise SystemExit(f'{option_string} is deleted: it belonged to the finished report-73 '
+                         'detector transfer sweep, moved to dev/detector_transfer/ (v0.3.4 is '
+                         'the last release that has it).')
 
 
 def main():
@@ -165,11 +133,6 @@ def main():
             --det-max-frames.
     Side effects: prints the per-group table and bootstrapped aggregates.
 
-    A temporal-input checkpoint's BoxDataset must supply the same stacked-frame shape it was
-    trained on; `model.in_channels` (part of the weights) is the source of truth, not a CLI
-    flag. A fixed `--evalset` is scored IN-PROCESS throughout (`num_workers` forced to 0):
-    `score_fixed_views` decodes in the parent, and a later forked loader worker would inherit a
-    decoder mid-state and deadlock on a video root (gotcha 10; qdmouse hung for hours at 0% CPU).
     `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED,
     and on a single-view root it is close to `1 - r@.5` restated, not an independent quantity;
     `fp_dup`/`fp_none` come from `box_mota`'s own uncapped pass. Two runs at different
@@ -181,11 +144,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path, help='detector run folder or .pth')
     ap.add_argument('--checkpoint', default='latest', help='checkpoint file within run folder')
-    ap.add_argument('--evalset', type=Path)
-    ap.add_argument('--out', type=Path)
-    ap.add_argument('--tt-gain', type=float, nargs='+', default=[1.0])
-    ap.add_argument('--tt-gamma', type=float, nargs='+', default=[1.0])
-    ap.add_argument('--det-input-wh', type=int, nargs=2)
+    for flag in REMOVED_FLAGS:
+        ap.add_argument(flag, action=_RemovedFlag, nargs='*', help=argparse.SUPPRESS)
+    ap.add_argument('--det-input-wh', nargs='*', default=None, help=argparse.SUPPRESS)
     ap.add_argument('--compare', type=Path, default=None,
                     help='a second run, scored on the SAME groups, reported as `--run` minus this '
                          'one under a PAIRED bootstrap.')
@@ -201,7 +162,7 @@ def main():
     ap.add_argument('--max-animals', type=int, default=None,
                     help='top_k for decode; default is the session\'s own animal count, which is '
                          'what scripts/infer.py supplies')
-    ap.add_argument('--score-thresh', type=float, nargs='+', default=[0.05],
+    ap.add_argument('--score-thresh', type=float, default=0.05,
                     help='0.05: score_dataset\'s own long-standing "as-trained" convention '
                          '(unrelated to deployment tuning -- this is what the model candidate-'
                          'decoded, not what a deployment run would keep). ALSO used as --det-score '
@@ -213,7 +174,7 @@ def main():
                     help="decode's box-NMS IoU threshold; 0.5 was hardcoded and unreachable "
                          'before detector_v2 plan A1. Sweep upward (RTMDet 0.65, DLC/SLEAP '
                          'instance-level 0.8), not around 0.5.')
-    ap.add_argument('--nms-center-dist', type=float, default=0.3,
+    ap.add_argument('--nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
                     help='centre-distance NMS threshold in units of box side (scale-free); a '
                          'candidate is also dropped if its centre sits within this many box '
                          'sides of an already-kept box, regardless of IoU. 0.3 is the deployment '
@@ -241,60 +202,26 @@ def main():
     ap.add_argument('--det-max-frames', type=int, default=0,
                     help='deploy mode only: 0 = the whole group; matches infer.py --max-frames')
     args = ap.parse_args()
+    if args.det_input_wh is not None:
+        from tailcyclenet.infer.cli import REMOVED_FLAGS as INFER_REMOVED
+        raise SystemExit(f"--det-input-wh is deleted: {INFER_REMOVED['--det-input-wh']}.")
 
     device = args.device if torch.cuda.is_available() else 'cpu'
     if args.deploy:
         return main_deploy(args, device)
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
-    if args.det_input_wh:
-        wh = tuple(args.det_input_wh)
-    score_thresh = args.score_thresh[0]
+    ld = load_detector(args.run, device=device, checkpoint=args.checkpoint)
+    model, wh, mcd, red, trained_on, tile_scale = (ld.model, ld.input_wh, ld.min_crop_dim,
+                                                   ld.reduce, ld.box_source, ld.tile_scale)
+    score_thresh = args.score_thresh
     _tiled(args.run, tile_scale)
     if trained_on != args.boxes:
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy.')
-    from tailcyclenet.detector.data import tt_photometric_transform
-    ds, fixed = _eval_dataset(args, model, wh, mcd, red)
-    workers = 0 if fixed is not None else args.num_workers
-    result_blocks = []
-    for gain in args.tt_gain:
-        for gamma in args.tt_gamma:
-            ds.tt_transform = lambda img, g=gain, ga=gamma: tt_photometric_transform(img, g, ga)
-            blocks = []
-            for threshold in args.score_thresh:
-                scores_for_threshold = []
-                rows = score_dataset(model, ds, device, batch_size=args.batch_size,
-                                     batches=max(args.batches, (len(fixed) + args.batch_size - 1)//args.batch_size) if fixed else args.batches,
-                                     seed=args.seed, score_thresh=threshold,
-                                     num_workers=workers, max_animals=args.max_animals,
-                                     iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
-                                     subset_indices=fixed, out_scores=scores_for_threshold)
-                from tailcyclenet.detector.evaluate import overall
-                summary = overall(rows)
-                values = np.concatenate(scores_for_threshold) if scores_for_threshold else np.zeros(0)
-                summary['objectness_quantiles'] = ({f'q{int(q * 100):02d}': float(np.quantile(values, q))
-                                                    for q in (0.01, 0.1, 0.5, 0.9)}
-                                                   if values.size else {})
-                view_rows = (score_fixed_views(model, ds, fixed, device, score_thresh=threshold,
-                                               batch_size=args.batch_size, max_animals=args.max_animals,
-                                               iou_thresh=args.nms_iou,
-                                               center_dist_thresh=args.nms_center_dist)
-                             if fixed is not None else [])
-                blocks.append({'score_thresh': threshold, 'aggregate': summary,
-                               'per_view': view_rows})
-            result_blocks.append({'tt_gain': gain, 'tt_gamma': gamma,
-                                  'input_wh': list(wh), 'thresholds': blocks})
-    ds.tt_transform = None
+    ds = _eval_dataset(args, model, wh, mcd, red)
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=score_thresh,
-                         num_workers=workers, max_animals=args.max_animals,
-                         iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
-                         subset_indices=fixed)
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {'evalset': str(args.evalset) if args.evalset else None,
-                   'blocks': result_blocks}
-        args.out.write_text(json.dumps(payload, indent=2, default=float) + '\n')
+                         num_workers=args.num_workers, max_animals=args.max_animals,
+                         iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={args.boxes}  '
           f'min_crop_dim={ds.min_crop_dim}  max_animals={args.max_animals or "(GT count)"}\n')
@@ -316,8 +243,9 @@ def main():
     print(f'fp_ignored (raw count, quote beside MOTA on any 3D root -- CLAUDE.md): {fp_ig}')
 
     if args.compare:
-        m2, wh2, _, mcd2, red2, trained_on2, tile2, _ = load_detector(
-            args.compare, device=device, checkpoint=args.checkpoint)
+        ld2 = load_detector(args.compare, device=device, checkpoint=args.checkpoint)
+        m2, wh2, mcd2, red2, trained_on2, tile2 = (ld2.model, ld2.input_wh, ld2.min_crop_dim,
+                                                   ld2.reduce, ld2.box_source, ld2.tile_scale)
         _tiled(args.compare, tile2)
         if trained_on2 != trained_on:
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
@@ -331,12 +259,11 @@ def main():
                   f'{args.compare} {getattr(m2, "box_target", "crop")!r} ones; each is scored '
                   'against its own target, so IoU/r@.75 compare different boxes. Use --deploy '
                   '(crop-rule boxes for both) for a like-for-like comparison.')
-        ds2, fixed2 = _eval_dataset(args, m2, wh2, mcd2, red2)
+        ds2 = _eval_dataset(args, m2, wh2, mcd2, red2)
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
                               seed=args.seed, score_thresh=score_thresh,
-                              num_workers=workers, max_animals=args.max_animals,
-                              iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
-                              subset_indices=fixed2)
+                              num_workers=args.num_workers, max_animals=args.max_animals,
+                              iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
         keys = sorted(set(rows) & set(other))
         print(f'\nPAIRED: {args.run} minus {args.compare}, over {len(keys)} shared group(s)')
         for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
@@ -367,15 +294,15 @@ def main_deploy(args, device):
     per group (each group is already a quantile of many windows/points), so a mean-of-medians is
     reported rather than bootstrapped a second time.
     """
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
-    if args.det_input_wh:
-        wh = tuple(args.det_input_wh)
-    score_thresh = args.score_thresh[0]
+    ld = load_detector(args.run, device=device, checkpoint=args.checkpoint)
+    model, wh, mcd, red, trained_on, tile_scale = (ld.model, ld.input_wh, ld.min_crop_dim,
+                                                   ld.reduce, ld.box_source, ld.tile_scale)
+    score_thresh = args.score_thresh
     ds = load_datasets(args.data)[0]
     sessions = ds.sessions.get(args.split, [])
     if not sessions:
         raise SystemExit(f'{args.data}: no {args.split!r} split')
-    trained_on = _detector_box_source(model, ds.name, trained_on)
+    trained_on = detector_box_source(model, ds.name, trained_on)
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={trained_on}  '
           f'track={args.deploy_track} link={args.link_boxes}  det_score={args.score_thresh}\n')

@@ -551,7 +551,7 @@ class PoseScorer(PoseTrackerEncoder):
 
         Inputs: trip -- the dict from `tailcyclenet.scorer.triplet.make_triplet`, carrying
                 `good`/`bad`/`anchor` as `(views, coords, cgroup)`, `kpt_ids`, `anchor_label`,
-                optional `occlusion`, and `reuse_scene_for_anchor`.
+                and optional `occlusion`.
         Outputs: sequence mode returns structured tensors with shape ``[B,K,3]``;
             frame mode returns structured tensors with shape ``[B,T,K,3]``.  The
             final axis is always ``(good, bad, anchor)``.  Use
@@ -568,11 +568,8 @@ class PoseScorer(PoseTrackerEncoder):
         sf = self.encode_scene(gvn)
         good_s, good_p = self.score(gvn, sf, gc, gcg, kpt_ids, occlusion=occ)
         bad_s, bad_p = self.score(gvn, sf, bc, bcg, kpt_ids, occlusion=occ)
-        if trip.get('reuse_scene_for_anchor'):
-            avn, asf = gvn, sf
-        else:
-            avn = self._normalize_views(av)
-            asf = self.encode_scene(avn)
+        avn = self._normalize_views(av)
+        asf = self.encode_scene(avn)
         anc_s, anc_p = self.score(avn, asf, ac, acg, kpt_ids, occlusion=occ)
 
         scores = torch.stack([good_s, bad_s, anc_s], dim=-1)

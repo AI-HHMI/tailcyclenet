@@ -3,8 +3,7 @@
 
     pixi run python scripts/eval.py pred.npz --data <dataset> --split test
 
-The program itself is `tailcyclenet.eval`; this file is the documented invocation, so the half
-of the program that used to live here can be imported and tested.
+The program itself is `tailcyclenet.eval`; this file is the documented invocation.
 """
 import sys
 from pathlib import Path

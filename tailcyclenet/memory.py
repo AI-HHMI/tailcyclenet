@@ -49,6 +49,16 @@ class Budget:
     # What the process already holds that no buffer share can touch -- torch, CUDA, the weights.
     # 0.0 until `rebudget` MEASURES it (it depends on the workload, not a constant).
     floor_gb: float = 0.0
+    # The figure the PROCESS may reach (`--max-ram`, clamped to the cap). None = not stated, or a
+    # hand-built Budget; `ceiling` then falls back to `budget_gb / DEFAULT_FRACTION`.
+    ceiling_gb: float | None = None
+
+    @property
+    def ceiling(self) -> float:
+        """The process ceiling in GB that `rebudget` and `check_peak` both measure against."""
+        if self.ceiling_gb is not None:
+            return self.ceiling_gb
+        return self.budget_gb / DEFAULT_FRACTION
 
     def share(self, fraction: float) -> float:
         """Bytes for one consumer's slice of the budget."""
@@ -78,16 +88,37 @@ def _meminfo() -> dict[str, float]:
     return out
 
 
-def _cgroup() -> tuple[float | None, float]:
+def _cgroup_dirs(text: str, root: Path) -> tuple[Path, list[str]]:
+    """(base, relative parts) of THIS process's memory cgroup, from `/proc/self/cgroup` text.
+
+    A v1 line names its controllers (`4:memory:/x`) and the memory hierarchy is mounted at
+    `<root>/memory`; the v2 line is `0::/x` under `<root>` itself. A v1 `memory` line wins: on a
+    hybrid host the v2 tree carries no memory controller.
+    """
+    v2: str | None = None
+    for line in text.strip().splitlines():
+        fields = line.split(':', 2)
+        if len(fields) != 3:
+            continue
+        hid, controllers, rel = fields
+        if 'memory' in controllers.split(','):
+            return root / 'memory', [p for p in rel.split('/') if p]
+        if hid == '0' and controllers == '':
+            v2 = rel
+    if v2 is None:
+        raise IndexError('no memory cgroup line')
+    return root, [p for p in v2.split('/') if p]
+
+
+def _cgroup(proc_cgroup: Path = Path('/proc/self/cgroup'),
+            root: Path = Path('/sys/fs/cgroup')) -> tuple[float | None, float]:
     """(limit_bytes or None, current_bytes) -- the limit MINIMISED OVER EVERY ANCESTOR, because
     an LSF job may sit in a scope that declares no limit while the slice above it caps the job.
     """
     try:
-        rel = Path('/proc/self/cgroup').read_text().strip().splitlines()[-1].split(':')[-1]
+        base, parts = _cgroup_dirs(proc_cgroup.read_text(), root)
     except (OSError, IndexError):
         return None, 0.0
-    base = Path('/sys/fs/cgroup')
-    parts = [p for p in rel.split('/') if p]
     limit: float | None = None
     current = 0.0
     for i in range(len(parts) + 1):
@@ -169,26 +200,26 @@ def host_budget(override_gb: float | None = None,
         avail = min(avail, max(0.0, cg_limit - cg_current))
     avail = min(avail, limit)
 
-    stated = False
+    stated_bytes: float | None = None
     if override_gb is not None and override_gb > 0:
-        budget = fraction * float(override_gb) * GB
+        stated_bytes = float(override_gb) * GB
         source = f'--max-ram {override_gb:g}'
-        stated = True
     elif os.environ.get(ENV_MAX_RAM):
         try:
-            budget = fraction * float(os.environ[ENV_MAX_RAM]) * GB
+            stated_bytes = float(os.environ[ENV_MAX_RAM]) * GB
             source = f'{ENV_MAX_RAM}={os.environ[ENV_MAX_RAM]}'
-            stated = True
         except ValueError:
-            budget = fraction * min(limit, avail)
-    else:
-        budget = fraction * min(limit, avail)
+            stated_bytes = None
 
-    if budget > limit:
+    if stated_bytes is None:
+        return Budget(limit_gb=limit / GB, available_gb=avail / GB,
+                      budget_gb=max(fraction * min(limit, avail), 0.0) / GB, source=source)
+    if stated_bytes > limit:
         source += f' (clamped to the {limit / GB:.1f} GB cap)'
-        budget = limit
+        stated_bytes = limit
     return Budget(limit_gb=limit / GB, available_gb=avail / GB,
-                  budget_gb=max(budget, 0.0) / GB, source=source, stated=stated)
+                  budget_gb=max(fraction * stated_bytes, 0.0) / GB, source=source, stated=True,
+                  ceiling_gb=stated_bytes / GB)
 
 
 _cached: Budget | None = None
@@ -220,7 +251,7 @@ def rebudget(override_gb: float | None = None,
     RSS rather than assumed, since it depends on the workload. The budget is then the smaller of
     the fraction and `limit - floor`. An INFERRED budget is already "what was lying around" and
     already contains the floor, so it is returned unchanged; for a STATED budget the figure the
-    caller actually named is `budget_gb / fraction`, which bounds the result.
+    caller actually named is `Budget.ceiling` (clamped to the cap), which bounds the result.
     """
     global _cached
     base = host_budget(override_gb, fraction)
@@ -228,7 +259,7 @@ def rebudget(override_gb: float | None = None,
     if not (floor == floor) or not base.stated:
         _cached = base
         return base
-    ceiling = base.budget_gb / fraction
+    ceiling = base.ceiling
     _cached = replace(base, budget_gb=max(0.0, min(base.budget_gb, ceiling - floor)),
                       floor_gb=floor,
                       source=f'{base.source} minus a {floor:.1f} GB process floor')
@@ -306,7 +337,7 @@ def check_peak(phase: str, budget: 'Budget | None' = None) -> float:
     peak = peak_gb()
     if _peak_warned or not b.stated or not (peak == peak):
         return peak
-    ceiling = b.budget_gb / DEFAULT_FRACTION
+    ceiling = b.ceiling
     if peak > ceiling:
         _peak_warned = True
         warnings.warn(

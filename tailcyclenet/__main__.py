@@ -15,7 +15,7 @@ COMMANDS = {
     'train': ('tailcyclenet.train', 'finetune a pose model'),
     'train-detector': ('tailcyclenet.train_detector', 'train a box detector'),
     'train-scorer': ('tailcyclenet.scorer.train', 'train a track-quality scorer'),
-    'infer': ('tailcyclenet.infer', 'run a trained model'),
+    'infer': ('tailcyclenet.infer.cli', 'run a trained model'),
     'score': ('tailcyclenet.scorer.score', "score a dataset root's tracks with a scorer"),
     'eval': ('tailcyclenet.eval', 'score predictions against labels'),
     'render': ('tailcyclenet.render', 'draw a prediction over its own pixels'),

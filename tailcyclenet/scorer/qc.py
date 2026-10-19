@@ -30,6 +30,27 @@ if TYPE_CHECKING:
     from ..dataset import LoaderConfig
 
 
+DELETED_DATA_KEYS = {
+    'val_offset': (0, 'the scorer window-offset lever is deleted: report 60 measured that offsetting '
+                  'the window lattice does not make the scorer catch more errors'),
+}
+
+
+def refuse_deleted_data_keys(data_cfg: dict) -> None:
+    """Refuse a deleted `[data]` key by name, with the reason it was deleted.
+
+    Its inert value is accepted and removed, so an old run folder's config still loads.
+
+    Inputs: data_cfg -- a `[data]` block, edited in place.
+    Outputs: None.
+    Side effects: pops inert deleted keys; raises SystemExit naming a deleted key set otherwise.
+    """
+    for key, (inert, why) in DELETED_DATA_KEYS.items():
+        if key in data_cfg and data_cfg.pop(key) != inert:
+            raise SystemExit(f'[data].{key} is deleted: {why}; only {key} = {inert!r} is still '
+                             f'accepted')
+
+
 def _loader_config(config: dict) -> LoaderConfig:
     """The run's `[data]` block as a `LoaderConfig`, with the box forced off.
 
@@ -37,16 +58,11 @@ def _loader_config(config: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming unknown keys.
     """
-    from ..dataset import LoaderConfig
+    from ..dataset import SCORER_PLUMBING, loader_config_from
 
     data_cfg = dict(config.get('data', {}))
-    known = set(LoaderConfig.__dataclass_fields__) | {
-        'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(f'[data]: unknown key(s) {sorted(unknown)}')
-    return LoaderConfig(**{k: v for k, v in data_cfg.items()
-                           if k in LoaderConfig.__dataclass_fields__})
+    refuse_deleted_data_keys(data_cfg)
+    return loader_config_from(data_cfg, extra=SCORER_PLUMBING)
 
 
 def _check_names(registry, target_registry, data) -> None:
@@ -123,8 +139,7 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
 
 
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
-               window_offset: int | None = None, val_stride: int | None = None,
-               spans: dict | None = None, coverage: list[dict] | None = None, *,
+               val_stride: int | None = None, spans: dict | None = None, coverage: list[dict] | None = None, *,
                checkpoint_info: dict | None = None, checkpoint: str | None = None,
                session: str | None = None, start: int | None = None,
                stop: int | None = None) -> tuple:
@@ -133,8 +148,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
             device -- where to run the model; limit -- stop after this many windows (a long clip
             is thousands of them, and a first look must not need the whole split);
-            window_offset -- shift the window lattice by this many frames, so the scorer judges a
-            track under a framing other than the one that produced it; val_stride -- window
+            val_stride -- window
             spacing, defaulting to the run's `n_frames` (non-overlapping); session -- score only
             the exact session id; start/stop -- zero-based half-open positions in the resulting
             window index (after session and span filtering); spans -- restrict
@@ -156,8 +170,6 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
         checkpoint_data = torch.load(ckpt, map_location='cpu', weights_only=False, mmap=True)
         checkpoint_info['checkpoint_iteration'] = checkpoint_data.get('iteration')
     lc = _loader_config(config)
-    if window_offset is not None:
-        lc = replace(lc, val_offset=int(window_offset))
     if val_stride is not None:
         lc = replace(lc, val_stride=int(val_stride))
     dataset_cls = PoseDataset
@@ -180,7 +192,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             raise SystemExit(
                 'no window starts inside the given spans, so there is nothing to score: check '
                 'the session/group/animal keys, and that span_start is a WINDOW start (a multiple '
-                'of the run n_frames, plus --window-offset)')
+                'of the run n_frames)')
         where = [i for i in where if i in span_where]
         print(f'{len(where)} windows remain inside the requested spans')
     if start is not None or stop is not None:
@@ -301,7 +313,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     return table, registry, config
 
 
-def _non_missing(table: pl.DataFrame, name: str) -> pl.Expr:
+def non_missing(table: pl.DataFrame, name: str) -> pl.Expr:
     """Match the table backend's default missing-value policy for a grouping/aggregate column."""
     expr = pl.col(name).is_not_null()
     if table.schema[name] in (pl.Float32, pl.Float64):
@@ -356,7 +368,7 @@ def _rank_frame(table: pl.DataFrame, top: int = 10) -> str:
         valid = pl.col('observed').fill_null(False)
     else:
         valid = pl.lit(True)
-    valid = valid & _non_missing(aggregate, 'score')
+    valid = valid & non_missing(aggregate, 'score')
     usable = aggregate.filter(valid)
     if usable.is_empty():
         return 'no observed frame/keypoint rows were scored'
@@ -410,9 +422,9 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
     group_keys = ['dataset', 'session', 'group', 'animal']
     keypoint_keys = ['dataset', 'session', 'group', 'keypoint']
     aggregate = _aggregate_input(table)
-    group_input = aggregate.filter(pl.all_horizontal([_non_missing(aggregate, k)
+    group_input = aggregate.filter(pl.all_horizontal([non_missing(aggregate, k)
                                                        for k in group_keys]))
-    kpt_input = aggregate.filter(pl.all_horizontal([_non_missing(aggregate, k)
+    kpt_input = aggregate.filter(pl.all_horizontal([non_missing(aggregate, k)
                                                      for k in keypoint_keys]))
     per_group = (group_input.group_by(group_keys, maintain_order=True)
                  .agg(pl.col('score').min().alias('worst'),
@@ -425,7 +437,7 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
                     pl.col('n_observed_frames').median().alias('obs'))
                .sort(['median', *keypoint_keys], nulls_last=True, maintain_order=True))
 
-    n_groups = table.filter(_non_missing(table, 'group')).get_column('group').n_unique()
+    n_groups = table.filter(non_missing(table, 'group')).get_column('group').n_unique()
     lines = [f'scored {table.height} (window, keypoint) rows over '
              f'{n_groups} group(s)',
              '',
@@ -458,8 +470,7 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
                   checkpoint_iteration: int | None = None,
                   output_granularity: str | None = None,
                   session: str | None = None, start: int | None = None,
-                  stop: int | None = None, window_offset: int | None = None,
-                  val_stride: int | None = None) -> None:
+                  stop: int | None = None, val_stride: int | None = None) -> None:
     """Write mode-aware QC tables, report, provenance, and optional coverage.
 
     Framewise ``table`` is the raw contextual window table returned by :func:`score_root`.  It is
@@ -493,7 +504,7 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         for key in ('loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy'):
             if key in scorer_cfg:
                 output_provenance[key] = scorer_cfg[key]
-        for key in ('segment_prob', 'segment_count', 'n_segments', 'segment_len_frames',
+        for key in ('segment_prob', 'segment_count', 'segment_len_frames',
                     'full_window_share', 'segment_types', 'min_corrupt_px', 'max_clean_px',
                     'reference_gate', 'out_of_view_policy'):
             if key in corr_cfg:
@@ -517,8 +528,6 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         output_provenance['window_start_index'] = int(start)
     if stop is not None:
         output_provenance['window_stop_index'] = int(stop)
-    if window_offset is not None:
-        output_provenance['window_offset'] = int(window_offset)
     if val_stride is not None:
         output_provenance['val_stride'] = int(val_stride)
     (out / 'provenance.toml').write_text(toml.dumps(output_provenance))

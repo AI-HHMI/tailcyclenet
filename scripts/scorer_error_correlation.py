@@ -17,7 +17,7 @@ are assigned to the LAST window containing them (CLAUDE.md eval rule 11) -- a pe
 must use the seam rule's own frame->window assignment.
 
     pixi run python scripts/scorer_error_correlation.py --scores qc/scores.pq \\
-        --pred-root scratch/gated/predroot --ref-root <3dpop root> --config configs/scorer-3dpop.toml
+        --pred-root scratch/gated/predroot --ref-root <3dpop root> --config <scorers>/scorer-3dpop/config.toml
 """
 
 from __future__ import annotations
@@ -33,22 +33,9 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
+from tailcyclenet.scorer.qc import non_missing  # noqa: E402
 from tailcyclenet.config import load_config, SCORER_CONFIG  # noqa: E402
-
-
-def _frame_to_window(starts, n_frames, T):
-    """Map every source frame to the LAST window containing it.
-
-    Inputs: starts -- sorted window start frames; n_frames -- the group's length; T -- window
-            length.
-    Outputs: {frame: start}.
-    Side effects: none.
-    """
-    assign = {}
-    for s in sorted(starts):
-        for f in range(int(s), min(int(s) + T, n_frames)):
-            assign[f] = int(s)
-    return assign
+from tailcyclenet.infer.window import last_window_start  # noqa: E402
 
 
 def _animal_index(lab, animal_id):
@@ -93,10 +80,11 @@ def _per_window_error(pred_sess, ref_sess, group_id, animal_id, starts, T, keypo
     r = rlab.points3d[ra, :, rnames.index(keypoint), :]
     n = min(p.shape[0], r.shape[0], n_frames)
     d = np.linalg.norm(p[:n] - r[:n], axis=-1)
-    assign = _frame_to_window(starts, n, T)
+    starts = sorted(starts)
     buckets: dict[int, list] = {}
-    for f, s in assign.items():
-        if np.isfinite(d[f]):
+    for f in range(n):
+        s = last_window_start(starts, T, f)
+        if s is not None and np.isfinite(d[f]):
             buckets.setdefault(s, []).append(float(d[f]))
     return {s: float(np.mean(v)) for s, v in buckets.items() if v}
 
@@ -118,14 +106,6 @@ def _per_frame_error(pred_sess, ref_sess, group_id, animal_id, keypoint):
     r = rlab.points3d[ra, :n, rnames.index(keypoint), :]
     d = np.linalg.norm(p - r, axis=-1)
     return {f: float(value) for f, value in enumerate(d) if np.isfinite(value)}
-
-
-def _non_missing(table, column):
-    """Expression excluding null and float NaN group keys."""
-    expr = pl.col(column).is_not_null()
-    if table.schema[column].is_float():
-        expr = expr & ~pl.col(column).is_nan()
-    return expr
 
 
 def _float_array(series):
@@ -155,13 +135,13 @@ def main(argv=None) -> int:
     T = int(config['data']['n_frames'])
     table = pl.read_parquet(args.scores)
     frame_mode = {'frame', 'local_t'}.issubset(table.columns)
-    n_sessions = table.filter(_non_missing(table, 'session')).get_column('session').n_unique()
+    n_sessions = table.filter(non_missing(table, 'session')).get_column('session').n_unique()
     print(f'{len(table)} scored rows over {n_sessions} session(s), T={T}')
 
     rows = []
     group_cols = ['session', 'group', 'animal']
     grouped = (
-        table.filter(pl.all_horizontal(_non_missing(table, c) for c in group_cols))
+        table.filter(pl.all_horizontal(non_missing(table, c) for c in group_cols))
         .sort(group_cols, nulls_last=True, maintain_order=True)
         .group_by(group_cols, maintain_order=True)
     )
@@ -176,8 +156,8 @@ def main(argv=None) -> int:
         if group not in pred_sess.groups or group not in ref_sess.groups:
             continue
         if frame_mode:
-            valid = (_non_missing(sub, 'keypoint') & _non_missing(sub, 'frame')
-                     & _non_missing(sub, 'score'))
+            valid = (non_missing(sub, 'keypoint') & non_missing(sub, 'frame')
+                     & non_missing(sub, 'score'))
             if 'observed' in sub.columns:
                 valid = valid & pl.col('observed').fill_null(False)
             kpt_groups = (sub.filter(valid)
@@ -196,7 +176,7 @@ def main(argv=None) -> int:
         else:
             starts = sorted(sub.get_column('start').unique().to_list())
             kpt_groups = (
-                sub.filter(_non_missing(sub, 'keypoint'))
+                sub.filter(non_missing(sub, 'keypoint'))
                 .sort('keypoint', nulls_last=True, maintain_order=True)
                 .group_by('keypoint', maintain_order=True)
             )

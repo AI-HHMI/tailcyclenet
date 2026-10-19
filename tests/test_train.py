@@ -456,7 +456,7 @@ def test_det_score_has_one_default():
     import inspect
 
     from tailcyclenet.detector import detect_raw
-    from tailcyclenet.infer import build_parser
+    from tailcyclenet.infer.cli import build_parser
 
     sig = inspect.signature(detect_raw).parameters['score_thresh'].default
     cli = build_parser().get_default('det_score')

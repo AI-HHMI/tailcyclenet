@@ -153,4 +153,6 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 markers = ["slow: over ~30 s alone; run by `pixi run test-all`, skipped by `pixi run test`"]

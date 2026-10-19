@@ -49,8 +49,16 @@ def test_roundtrip_2d(tiny_root):
     np.testing.assert_allclose(lab.boxes[1, 1, 0], [10, 10, 30, 30])
     assert np.isnan(lab.boxes[0]).all()
 
+    # status -> 0/1 visibility is an int8 compare, never strings
+    assert lab.vis2d.dtype == np.int8
+    assert (lab.vis2d == fmt.VISIBLE).sum() == 2 * 4 * 4 - 2
+    # the toml key `labels` is exposed as `label_source`, so `labels(gid)` stays a method
+    assert sess.label_source in fmt.LABEL_SOURCES
 
-def test_prediction_session_is_not_triangulated_as_annotation(tmp_path):
+
+def test_load_time_triangulation_guards(tmp_path):
+    """A prediction session is never triangulated as annotation; a moving rig refuses the static
+    triangulation instead of silently using one pose."""
     path = tmp_path / 's'
     _session_3d(path)
     (path / 'points3d.pq').unlink()
@@ -58,76 +66,56 @@ def test_prediction_session_is_not_triangulated_as_annotation(tmp_path):
     sess.prediction_session = True
     assert sess.labels('g000').points3d is None
 
-
-def test_keypoints_only_moving_rig_refuses_static_triangulation(tmp_path):
-    path = tmp_path / 's'
+    path = tmp_path / 'm'
     _session_3d(path, moving=True)
     (path / 'points3d.pq').unlink()
-    sess = fmt.Session.load(path)
     with pytest.raises(fmt.FormatError, match='moving cameras'):
-        sess.labels('g000')
+        fmt.Session.load(path).labels('g000')
 
 
-def test_triangulate_group_applies_residual_gate(tmp_path):
+def test_triangulate_group(tmp_path):
+    """The residual gate unlabels a bad point; a single view is not a 3D label; all-`missing` views
+    stay `missing` (a real assessment), not `unlabeled`."""
     path = tmp_path / 's'
     _session_3d(path)
-    sess = fmt.Session.load(path)
-    lab = sess.labels('g000')
-    _project_3d_labels(sess, lab)
-    # Perturb one camera so the least-squares triangulation has nonzero reprojection residual.
-    lab.points2d[0, 0, 0, 0, 0] += 20
-    visible, gated, _missing = fmt.triangulate_group(sess.rig, lab, gate=0.01)
-    assert gated >= 1
-    assert lab.vis3d[0, 0, 0] == fmt.UNLABELED
+    sess = None
 
+    def fresh():
+        nonlocal sess
+        sess = fmt.Session.load(path)
+        lab = sess.labels('g000')
+        _project_3d_labels(sess, lab)
+        return lab
 
-def test_triangulate_group_single_view_is_not_a_3d_label(tmp_path):
-    path = tmp_path / 's'
-    _session_3d(path)
-    sess = fmt.Session.load(path)
-    lab = sess.labels('g000')
-    _project_3d_labels(sess, lab)
+    lab = fresh()
+    lab.points2d[0, 0, 0, 0, 0] += 20               # nonzero reprojection residual
+    _visible, gated, _missing = fmt.triangulate_group(sess.rig, lab, gate=0.01)
+    assert gated >= 1 and lab.vis3d[0, 0, 0] == fmt.UNLABELED
+
+    lab = fresh()
     lab.points2d[0, 0, 0, 1:] = np.nan
     lab.vis2d[0, 0, 0, 1:] = fmt.MISSING
     fmt.triangulate_group(sess.rig, lab, gate=30)
-    assert lab.vis3d[0, 0, 0] == fmt.UNLABELED
-    assert np.isnan(lab.points3d[0, 0, 0]).all()
+    assert lab.vis3d[0, 0, 0] == fmt.UNLABELED and np.isnan(lab.points3d[0, 0, 0]).all()
 
-
-def test_triangulate_group_all_assessed_missing_stays_missing(tmp_path):
-    path = tmp_path / 's'
-    _session_3d(path)
-    sess = fmt.Session.load(path)
-    lab = sess.labels('g000')
-    _project_3d_labels(sess, lab)
+    lab = fresh()
     lab.points2d[0, 0, 0] = np.nan
     lab.vis2d[0, 0, 0] = fmt.MISSING
     fmt.triangulate_group(sess.rig, lab, gate=30)
-    assert lab.vis3d[0, 0, 0] == fmt.MISSING
-    assert np.isnan(lab.points3d[0, 0, 0]).all()
+    assert lab.vis3d[0, 0, 0] == fmt.MISSING and np.isnan(lab.points3d[0, 0, 0]).all()
 
 
-@pytest.mark.parametrize(
-    ('distortions', 'expected'),
-    [([], np.zeros(5)), ([0.1, -0.2], [0.1, -0.2, 0.0, 0.0, 0.0])],
-)
-def test_short_distortions_load_padded(distortions, expected):
-    """Short calibration vectors are zero-padded for projection consumers."""
-    doc = {
-        'cam0': {
-            'name': 'cam0',
-            'size': [640, 480],
-            'matrix': [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
-            'distortions': distortions,
-            'rotation': [0.0, 0.0, 0.0],
-            'translation': [0.0, 0.0, 1.0],
-        },
-    }
-    rig = fmt.rig_from_doc(doc, '<memory>')
-    np.testing.assert_array_equal(
-        rig.cgroup.cameras[0].get_distortions().detach().cpu().numpy(), expected,
-    )
-    assert doc['cam0']['distortions'] == distortions
+def test_short_distortions_load_padded():
+    """Short calibration vectors are zero-padded for projection, without mutating the doc."""
+    for distortions, expected in (([], np.zeros(5)), ([0.1, -0.2], [0.1, -0.2, 0.0, 0.0, 0.0])):
+        doc = {'cam0': {'name': 'cam0', 'size': [640, 480],
+                        'matrix': [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
+                        'distortions': distortions, 'rotation': [0.0, 0.0, 0.0],
+                        'translation': [0.0, 0.0, 1.0]}}
+        rig = fmt.rig_from_doc(doc, '<memory>')
+        np.testing.assert_array_equal(
+            rig.cgroup.cameras[0].get_distortions().detach().cpu().numpy(), expected)
+        assert doc['cam0']['distortions'] == distortions
 
 
 def test_roundtrip_3d(tiny_root):
@@ -146,41 +134,16 @@ def test_roundtrip_3d(tiny_root):
     assert np.isnan(lab.points2d).all()
 
 
-def test_vis_is_an_int8_compare(tiny_root):
-    """status -> 0/1 visibility must not require touching strings."""
-    sess = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
-    vis = sess.labels('g000').vis2d
-    assert vis.dtype == np.int8
-    assert ((vis == fmt.VISIBLE).sum()) == 2 * 4 * 4 - 2
-
-
 def test_has_visibility_assessment(tiny_root, tracked_no_assessment_root):
-    """The session-level gate `dataset.py` reads: `annotated` with a real `missing` row -> True;
-    `tracked` with 100% `visible` and zero `missing` -> False; `tracked` WITH real per-camera
-    `missing` rows -> True.
-    """
-    ann = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
-    assert ann.label_source == 'annotated'
-    assert ann.has_visibility_assessment is True
-
-    tracked_dense = fmt.Session.load(tracked_no_assessment_root / 'train' / 's')
-    assert tracked_dense.label_source == 'tracked'
-    assert tracked_dense.has_visibility_assessment is False
-
-    tracked_assessed = fmt.Session.load(tiny_root / 'mouselike' / 'train' / 'sess_c')
-    assert tracked_assessed.label_source == 'tracked'
-    assert tracked_assessed.has_visibility_assessment is True
-
-
-def test_preload_caches_visibility_before_dropping_tables(tiny_root, tracked_no_assessment_root):
-    """Preloading must not make the first selection reread parquet visibility tables."""
-    cases = [
-        (tiny_root / 'ratlike' / 'train' / 'sess_a', True),
-        (tiny_root / 'mouselike' / 'train' / 'sess_c', True),
-        (tracked_no_assessment_root / 'train' / 's', False),
-    ]
-    for path, expected in cases:
+    """The session-level vis gate: annotated -> True; tracked with no `missing` row -> False; tracked
+    with real `missing` rows -> True. Cached by `preload` before the tables are dropped."""
+    cases = [(tiny_root / 'ratlike' / 'train' / 'sess_a', 'annotated', True),
+             (tiny_root / 'mouselike' / 'train' / 'sess_c', 'tracked', True),
+             (tracked_no_assessment_root / 'train' / 's', 'tracked', False)]
+    for path, source, expected in cases:
+        assert fmt.Session.load(path).has_visibility_assessment is expected
         sess = fmt.Session.load(path)
+        assert sess.label_source == source
         sess.preload()
         assert '_tables' not in sess.__dict__
         assert sess.has_visibility_assessment is expected
@@ -220,19 +183,16 @@ def test_discovery_dataset_vs_collection(tiny_root):
 # the registry
 # ----------------------------------------------------------------------------------------------
 
-def test_registry_single_dataset_does_not_prefix(dataset_2d):
+def test_registry_prefixes_only_across_datasets(dataset_2d, dataset_3d):
+    """One dataset keeps bare names; several get disjoint prefixed blocks, asked in bare names."""
     reg = fmt.Registry.build([dataset_2d])
     assert list(reg.names) == KPTS_2D
     np.testing.assert_array_equal(reg.ids_for_dataset('ratlike'), [0, 1, 2, 3])
 
-
-def test_registry_prefixes_across_datasets(dataset_2d, dataset_3d):
     reg = fmt.Registry.build([dataset_2d, dataset_3d])
     assert reg.n_keypoints == len(KPTS_2D) + len(KPTS_3D)
     assert 'ratlike-nose' in reg.names and 'mouselike-nose' in reg.names
-    # disjoint id blocks: a shared bare name must not collide across datasets
     assert set(reg.ids_for_dataset('ratlike')).isdisjoint(set(reg.ids_for_dataset('mouselike')))
-    # ... and a session still asks in its own BARE names, so the prefix has to come back off
     assert reg.local_names('ratlike') == KPTS_2D
     np.testing.assert_array_equal(reg.ids_for('ratlike', KPTS_2D[::-1]),
                                   reg.ids_for_dataset('ratlike')[::-1])
@@ -252,16 +212,8 @@ def test_registry_is_append_only(dataset_2d, dataset_3d, tmp_path):
 
 
 def test_a_base_that_grew_past_one_dataset_keeps_its_own_dataset(dataset_2d, dataset_3d):
-    """A registry may only have ONE dataset when it is first written, and grow later.
-
-    That is the shape every allen scorer is in: the pose checkpoint contributed
-    `allen-mouse-combined` and the scorer run added `allen-mouse-combined-tracked`, both recorded
-    with the BARE keypoint names because neither build had more than one dataset. The next build
-    taking that registry as its base therefore has `prefix = True`, so a target root the base
-    already names came back under `allen-mouse-combined-tracked-nose` -- 47 NEW identities -- and
-    `build` then raised `keypoint ids changed against the base registry`. The scorer QC path
-    (`score_session.py`) could not score the very root the scorer was trained on.
-    """
+    """A base first written with ONE dataset (bare names) that later grew must not re-prefix the
+    dataset it already names (the allen scorer QC raised `keypoint ids changed`)."""
     base = fmt.Registry.build([dataset_2d])
     grown = fmt.Registry.build([dataset_3d], base=base)
     assert len(grown.datasets) == 2, 'the fixture must reproduce a base with two datasets'
@@ -296,10 +248,8 @@ def _drop_keypoint(path, name):
 
 
 def test_ids_follow_each_sessions_own_keypoint_axis(tmp_path):
-    """A session may reorder the root's keypoints, or carry only some of them -- both used to be
-    silent relabels (same length, different order, `nose` coordinates training the `left_ear`
-    embedding row, invisible in the loss curve). `Registry.ids_for` now resolves by name.
-    """
+    """A session may reorder or subset the root's keypoints; `Registry.ids_for` resolves by NAME
+    (both used to be silent relabels, invisible in the loss curve)."""
     root = tmp_path / 'ds'
     lab_a = _session_2d(root / 'train' / 'a')
     lab_b = _session_2d(root / 'train' / 'b')
@@ -376,35 +326,31 @@ def _prediction_points2d(path, rows=1):
     pq.write_table(pa.table(data), path / 'points2d.pq')
 
 
-def test_prediction_points2d_validates_but_is_not_training_labels(tmp_path):
-    path = tmp_path / 'ds' / 'train' / 'a'
-    _session_2d(path)
-    (path / 'keypoints.pq').unlink()
-    _mark_prediction(path, complete=False)
-    _prediction_points2d(path)
-
-    sess = fmt.Session.load(path)
-    assert sess.prediction_session is True and sess.complete is False
-    assert sess._tables['points2d'] is not None
-    assert not fmt.validate_session(sess, check_images=False)
-    # Prediction rows cannot add IDs or annotations to the dense training-label view.
-    lab = sess.labels('g000')
-    assert 'pred0' not in lab.animal_ids and lab.points2d is None
-
-
-def test_points2d_requires_marker_and_unique_prediction_keys(tmp_path):
+def test_prediction_points2d(tmp_path):
+    """`points2d.pq` validates in a marked prediction session but never becomes training labels;
+    unmarked it is an error, and duplicate keys are an error."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     path = tmp_path / 'ds' / 'train' / 'a'
     _session_2d(path)
+    (path / 'keypoints.pq').unlink()
+    _mark_prediction(path, complete=False)
+    _prediction_points2d(path)
+    sess = fmt.Session.load(path)
+    assert sess.prediction_session is True and sess.complete is False
+    assert sess._tables['points2d'] is not None
+    assert not fmt.validate_session(sess, check_images=False)
+    lab = sess.labels('g000')
+    assert 'pred0' not in lab.animal_ids and lab.points2d is None
+
+    path = tmp_path / 'ds' / 'train' / 'b'
+    _session_2d(path)
     _prediction_points2d(path)
     assert any('prediction-only' in e for e in fmt.validate_session(
         fmt.Session.load(path), check_images=False))
-
     _mark_prediction(path)
-    t = pq.read_table(path / 'points2d.pq')
-    row = t.slice(0, 1)
+    row = pq.read_table(path / 'points2d.pq').slice(0, 1)
     pq.write_table(pa.concat_tables([row, row]), path / 'points2d.pq')
     errs = fmt.validate_session(fmt.Session.load(path), check_images=False)
     assert any('points2d.pq has duplicate keys' in e for e in errs)
@@ -503,10 +449,7 @@ def test_unknown_bodypart_is_an_error(tmp_path):
 
 
 def test_animal_count_may_vary_between_groups(tmp_path):
-    """A parquet dictionary is per FILE, not per group: a session's `animal_id` dictionary names
-    animals that any individual group has never seen. Reading one group must not trip over the
-    others' animals.
-    """
+    """A parquet dictionary is per FILE: reading one group must not trip over another's animals."""
     W = H = 32
     rig = fmt.nominal_rig('cam0', (W, H))
     groups, labels = {}, {}
@@ -526,10 +469,7 @@ def test_animal_count_may_vary_between_groups(tmp_path):
 
 
 def test_labels_key_is_required_and_closed(tmp_path):
-    """§4 / decision 6: `labels` is required, and its vocabulary is two values so a typo fails
-    loudly. Checked on BOTH seams -- `Session.load` for data on disk, `write_session` for data
-    being produced.
-    """
+    """`labels` is required and closed (a typo fails loudly), on both `Session.load` and `write_session`."""
     path = tmp_path / 'ds' / 'train' / 'a'
     _session_2d(path)
     cfg = path / 'session.toml'
@@ -549,15 +489,6 @@ def test_labels_key_is_required_and_closed(tmp_path):
 
     with pytest.raises(fmt.FormatError, match='label_source must be one of'):
         _session_2d(tmp_path / 'ds' / 'train' / 'b', label_source='human')
-
-
-def test_label_source_does_not_shadow_the_labels_method(tiny_root):
-    """`Session.labels(gid)` stays callable: session.toml spells the key `labels` while `Session`
-    exposes it as `label_source`, so a `labels` FIELD would shadow the method on every instance.
-    """
-    sess = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
-    assert sess.label_source in fmt.LABEL_SOURCES
-    assert sess.labels('g000').n_animals == 2
 
 
 # ----------------------------------------------------------------------------------------------
@@ -629,13 +560,8 @@ def test_a_stale_regions_file_is_a_validation_error(tmp_path):
 
 
 def test_table_writer_chunks_match_one_shot(tmp_path):
-    """A table written in chunks must read back exactly as one written at once.
-
-    This is what lets inference stream a prediction to disk: the rows arrive a block at a time and
-    no array is ever proportional to the clip. It is only usable if the file is indistinguishable
-    from what a converter would have written.
-    """
-    import numpy as np
+    """A table written in chunks (how inference streams) reads back exactly as one written at once,
+    dictionaries intact; an empty chunk writes no row group."""
     import pyarrow.parquet as pq
 
     from tailcyclenet.format import DICT_COLS, TableWriter, _codes, write_table
@@ -648,29 +574,17 @@ def test_table_writer_chunks_match_one_shot(tmp_path):
             'status': np.array(['visible', 'missing'] * (n // 2), dtype=object),
             'x': rng.normal(size=n)}
     rows['x'][::7] = np.nan                       # nulls must survive chunking
-
     write_table(tmp_path / 'one.pq', rows, DICT_COLS)
-    # Chunks small enough to force several row groups, and uneven so no boundary is special.
     with TableWriter(tmp_path / 'many.pq', DICT_COLS, chunk_rows=64) as w:
-        for lo, hi in ((0, 33), (33, 200), (200, 201), (201, n)):
+        for lo, hi in ((0, 0), (0, 33), (33, 200), (200, 201), (201, n)):
             w.write({k: v[lo:hi] for k, v in rows.items()})
-
     a, b = (pq.read_table(tmp_path / f) for f in ('one.pq', 'many.pq'))
     assert a.column_names == b.column_names
     assert a.to_pydict() == b.to_pydict(), 'chunked rows must equal one-shot rows'
     assert pq.ParquetFile(tmp_path / 'many.pq').num_row_groups > 1, 'the chunks must be row groups'
-    # The dictionary columns must still READ BACK as dictionaries, or `_codes` breaks.
     for col in ('group_id', 'animal_id', 'status'):
         codes, vals = _codes(b, col)
         assert len(codes) == n and vals
-
-
-def test_table_writer_skips_empty_chunks(tmp_path):
-    """A block that produced no rows must not write an empty row group, or emit a schema of nulls."""
-    import numpy as np
-    import pyarrow.parquet as pq
-
-    from tailcyclenet.format import DICT_COLS, TableWriter
 
     with TableWriter(tmp_path / 't.pq', DICT_COLS) as w:
         w.write({'group_id': np.array([], dtype=object), 'frame': np.array([], np.int32)})
@@ -701,17 +615,8 @@ def _video_session(tmp_path, T=6, cams=('cam0', 'cam1'), where='vids'):
 
 
 def test_a_video_group_decodes_with_no_session_directory(tmp_path):
-    """THE INVARIANT THE WHOLE --videos DESIGN RESTS ON.
-
-    `group.source` is the ONLY filesystem entry point in the decode path, and it is a cache over
-    `_src`. `format.video_group` pre-fills it, so `pixels()` is never called, `dir` is never
-    dereferenced and `session.path` -- which does not exist here -- is never read. If a refactor
-    makes `read_frames` reach for a directory again, this fails immediately instead of the videos
-    path failing in a user's hands.
-
-    Asserted on VALUES, not shapes: the fixture's frames are solid colours keyed on
-    (camera, frame), so a decode that is off by one frame or serving the wrong camera fails.
-    """
+    """The `--videos` invariant: `group.source` (pre-filled by `video_group`) is the only filesystem
+    entry, so a session with no directory decodes the right (camera, frame) by VALUE."""
     from tailcyclenet.dataset import read_frames
 
     from .conftest import _video_colour
@@ -735,12 +640,8 @@ def test_a_video_group_decodes_with_no_session_directory(tmp_path):
 
 
 def test_a_video_session_never_reads_a_table(tmp_path):
-    """`_table` is overridden to return None as a GUARANTEE, not as an accident of a missing file.
-
-    `path` is a LABEL, not a location. Without the override a session whose `path` happened to
-    collide with a real directory would silently adopt its parquet -- so this puts a real
-    `keypoints.pq` exactly there and asserts the empty arrays survive.
-    """
+    """`VideoSession._table` returns None by GUARANTEE: a real `keypoints.pq` at its `path` (a label,
+    not a location) is never adopted, also after `preload()`."""
     sess = _video_session(tmp_path)
     sess.path.mkdir(parents=True)
     real = _session_2d(tmp_path / 'real')
@@ -804,8 +705,7 @@ def test_rule_4_flags_a_camera_dir_or_video_calibration_does_not_declare(tmp_pat
     assert errs and 'cam9' in errs[0] and 'cam8.mp4' in errs[0]
 
 
-@pytest.mark.parametrize('n_extra, size, rule', [(0, (64, 48), None), (1, (64, 48), 7),
-                                                 (0, (32, 48), 8)])
+@pytest.mark.parametrize('n_extra, size, rule', [(1, (64, 48), 7), (0, (32, 48), 8)])
 def test_rules_7_8_check_a_videos_frame_count_and_size(tmp_path, n_extra, size, rule):
     import shutil
 

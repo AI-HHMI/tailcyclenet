@@ -5,16 +5,17 @@
         --scores <qc dir or scores.pq> --data <session dir> \
         --group <gid> --start 88000 --end 89000 --out <dir>
 
-`scripts/score_session.py` scores WINDOWS (per keypoint) and writes `scores.pq`; this draws those
-scores back onto the pixels. The colour is the score of the window the frame belongs to, so the
-mapping from frame to window is the scorer's own FRAMING, not a guess: a frame belongs to the last
-window that contains it (the same seam rule the eval code uses -- a window's first frame is shared
-with the previous window, and letting the EARLIER window win would leave the seam frames scored by
-a window the lattice did not place there).
+`scripts/score_session.py` writes `scores.pq`; this draws those scores back onto the pixels. A
+frame-mode scorer scores every (frame, keypoint), and each frame is coloured by its own score. A
+sequence-mode scorer scores WINDOWS, and a frame is coloured by the score of the window it belongs
+to, so the mapping from frame to window is the scorer's own FRAMING, not a guess: a frame belongs
+to the last window that contains it (the same seam rule the eval code uses -- a window's first
+frame is shared with the previous window, and letting the EARLIER window win would leave the seam
+frames scored by a window the lattice did not place there).
 
-Scores are RELATIVE (`qc.py`'s own contract): the colour map is normalised over the rendered
-range, a legend is burned in, and absolute numbers are printed rather than implied. Nothing here
-writes to the dataset -- output is one mp4 per camera under `--out`.
+Scores are RELATIVE (`qc.py`'s own contract): the colour map is the fixed `SCORE_RANGE` (or
+`--score-range`), a legend is burned in, and absolute numbers are printed rather than implied.
+Nothing here writes to the dataset -- output is one mp4 per camera under `--out`.
 
 The window LENGTH is not in `scores.pq`; it is read from the scorer run named in the `qc` folder's
 `provenance.toml` (or passed with `--n-frames`), because getting it wrong would silently mis-assign
@@ -78,9 +79,9 @@ def load_scores(path: Path, session: str, group: str, animal: str) -> dict:
         & (pl.col('group') == group)
         & (pl.col('animal').cast(pl.String) == animal)
     )
+    have = df.get_column('session').unique().to_list() if df.height else []
     df = df.filter(want)
     if df.is_empty():
-        have = df.get_column('session').unique().to_list() if df.height else []
         raise SystemExit(f'{pq}: no rows for {session}/{group}/{animal}. '
                          f'Sessions present: {list(have)[:3]}')
     framewise = {'frame', 'local_t'}.issubset(df.columns)
@@ -278,6 +279,7 @@ def main() -> int:
     labels = session.labels(args.group)
     animal = animal_index(labels, args.animal)
     frames = list(range(args.start, args.end, args.stride))
+    scored_frames = {frame for frame, _ in scores} if table['framewise'] else set()
     for cam in cameras:
         ci = session.cam_names.index(cam)
         path = args.out / f'{session.session_id}_{args.group}_{cam}_{args.start}_{args.end}.mp4'
@@ -288,7 +290,7 @@ def main() -> int:
                 if im is None:
                     continue
                 if table['framewise']:
-                    score_key = t if any(frame == t for frame, _ in scores) else None
+                    score_key = t if t in scored_frames else None
                     note = (f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  '
                             f'framewise score {"available" if score_key is not None else "missing"}')
                 else:

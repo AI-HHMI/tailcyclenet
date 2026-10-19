@@ -90,3 +90,15 @@ def test_the_selected_animal_is_drawn_not_animal_zero():
     assert out[100, 100].any(), 'animal 1 owns the only finite point; it must be drawn'
     blank = mod.draw_scored(im, lab, 0, 0, 0, ['nose'], [], {(0, 'nose'): 1.0}, 0, 0.0, 1.0, '', legend)
     assert not blank[100, 100].any()
+
+
+def test_a_scores_miss_names_the_sessions_that_are_present(tmp_path):
+    """The hint must be read before the filter empties the table."""
+    import polars as pl
+    import pytest
+
+    pl.DataFrame({'session': ['other'], 'group': ['g'], 'animal': ['det00'], 'start': [0],
+                  'keypoint': ['nose'], 'score': [1.0], 'precision': [1.0]}).write_parquet(
+        tmp_path / 'scores.pq')
+    with pytest.raises(SystemExit, match="Sessions present: \\['other'\\]"):
+        _mod().load_scores(tmp_path, 'sess', 'g', 'det00')

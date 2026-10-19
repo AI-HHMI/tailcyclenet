@@ -146,16 +146,14 @@ def unletterbox_boxes(boxes, scale, pad, src_wh=None):
     return out
 
 
-def _photometric(img, rng, gain=None):
+def _photometric(img, rng):
     """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
 
     DLC's extended form (additive brightness + per-channel gaussian noise) was built, measured
     and REFUTED here: it costs accuracy in-domain, and neither shipped split tests the
-    out-of-domain gain it buys. `gain=None` draws its own; `gain=<value>` applies a PRE-DRAWN one
-    so a stacked (t-1, t) pair sees the same appearance shift, not an independent one.
+    out-of-domain gain it buys.
     """
-    g = rng.uniform(0.7, 1.3) if gain is None else gain
-    out = img * g
+    out = img * rng.uniform(0.7, 1.3)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 

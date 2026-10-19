@@ -101,8 +101,7 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
     return count
 
 
-def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
-             corroborate=True):
+def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0):
     """Group boxes across cameras into 3D instances.
 
     Inputs:
@@ -113,10 +112,8 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             algorithm, not a parameter (every group starts from a cross-camera PAIR); `1`
             emits each leftover box as its own single-view instance with no triangulated point.
         max_instances -- cap on returned groups (0 = uncapped).
-        corroborate -- plan E1a/E3: rank candidates by all-camera support count first, pair
-            residual as tie-break, instead of the old seeding-pair-only epipolar residual
-            (which a phantom can always satisfy). True (default); False restores the pre-E1a
-            ordering for a same-checkpoint control arm.
+    Candidates rank by all-camera support count first, pair residual as tie-break (plan
+    E1a/E3), never by the seeding pair's residual alone (which a phantom can always satisfy).
     Outputs:
         List of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float,
         'members': {cam_ix: det_ix}}. A single-view instance has `point` all-NaN and
@@ -147,8 +144,7 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
                 if not torch.isfinite(p3d).all():
                     continue
                 res = _residual(cgroup, (ca, cb), pts, p3d)
-                support = (_support_count(cgroup, (ca, cb), centres, used, p3d, max_res_px)
-                          if corroborate else 0)
+                support = _support_count(cgroup, (ca, cb), centres, used, p3d, max_res_px)
                 cands.append((support, res, (ca, ia), (cb, ib), p3d))
     cands.sort(key=lambda c: (-c[0], c[1]))
     out = []

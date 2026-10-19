@@ -1943,13 +1943,76 @@ def test_unletterbox_clamps_a_runaway_box_into_the_frame():
     assert unletterbox_boxes(b, 1.0, (0, 0))[0, 2].item() == 20000.0
 
 
-def test_the_cross_view_tracker_holds_identity_where_the_two_old_passes_could_not():
-    """`track.demo()` as a test: one target set with one affinity cannot disagree with itself.
-    `associate` was memoryless and `link_rows` matched per camera, so a row could be re-grouped
-    in one pass and re-permuted in the other.
+def _tracker_demo():
+    """Two synthetic animals on a three-camera rig: the properties that must hold.
+
+    The animals CROSS: A walks right, B walks left, and the SCORE ORDER swaps every frame the
+    way `decode` reorders them -- a row that follows one animal must be immune to that. The
+    checks, in order: (1) both slots stay filled in every frame (births on frame 0, matches
+    after); (2) each row's own box moves smoothly -- a swapped row would jump the full
+    separation; (3) a frame with no detections at all ages the targets and returns nothing
+    without dropping them -- a one-frame detector miss must not end a track; (4) they resume in
+    the SAME slots afterwards.
     """
-    from tailcyclenet.detector.track import demo
-    demo()
+    from aniposelib.cameras import Camera, CameraGroup
+
+    from tailcyclenet.detector.track import CrossViewTracker, _project
+    from tailcyclenet.format import Rig
+
+    cams = []
+    for i, ang in enumerate((-0.5, 0.0, 0.5)):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
+                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+             moving=dict.fromkeys(names, False),
+             calibrated=dict.fromkeys(names, True)).tracktail()
+
+    def boxes_at(worlds, side=40.0):
+        """Project `worlds` into every camera as fixed-size square boxes.
+
+        Outputs: (per_cam, scores): per_cam is a list of (n,4) xyxy tensors and scores
+        a list of (n,) ones.
+        """
+        per_cam, scores = [], []
+        for cam in cg:
+            uv = _project(cam, np.asarray(worlds, np.float32))
+            per_cam.append(torch.stack([uv[:, 0] - side / 2, uv[:, 1] - side / 2,
+                                        uv[:, 0] + side / 2, uv[:, 1] + side / 2], -1))
+            scores.append(torch.ones(len(worlds)))
+        return per_cam, scores
+
+    a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
+    tr = CrossViewTracker(2, max_res_px=30.0)
+    rows = []
+    for t in range(12):
+        w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
+        per_cam, scores = boxes_at(w if t % 2 == 0 else w[::-1])
+        rows.append(tr.step(cg, per_cam, scores)[0])
+
+    assert all(np.isfinite(r).all(-1).any(-1).sum() == 2 for r in rows), 'an animal was lost'
+    for s in (0, 1):
+        cx = np.array([r[s, 0, [0, 2]].mean() for r in rows])
+        assert np.abs(np.diff(cx)).max() < 30.0, f'row {s} jumped: {np.diff(cx)}'
+    empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
+    out, _, _ = tr.step(cg, *empty)
+    assert not np.isfinite(out).any() and len(tr.targets) == 2
+    w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
+    resumed, _, _ = tr.step(cg, *boxes_at(w))
+    assert np.isfinite(resumed).all(-1).any(-1).sum() == 2
+    for s in (0, 1):
+        assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0
+
+
+def test_the_cross_view_tracker_holds_identity_where_the_two_old_passes_could_not():
+    """One target set with one affinity cannot disagree with itself. `associate` was memoryless
+    and `link_rows` matched per camera, so a row could be re-grouped in one pass and re-permuted
+    in the other.
+    """
+    _tracker_demo()
 
 
 def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
@@ -2520,41 +2583,6 @@ def test_support_count_counts_independently_corroborating_cameras():
     # Camera 2's detection is still at the true point, but already `used` by an earlier group --
     # an already-claimed detection must not corroborate a second candidate.
     assert _support_count(cg, (0, 1), centres_all, {(2, 0)}, p3d, max_res_px=5.0) == 0
-
-
-def test_associate_corroborate_flag_is_a_noop_on_the_unambiguous_case():
-    """`corroborate=False` restores the pre-E1a residual-only ordering; on a scene with no
-    genuine ambiguity (one real animal, or a real pair plus one leftover box no pair can explain)
-    there is nothing for support-counting to change the ranking OF, so the two arms must agree.
-    """
-    from aniposelib.cameras import Camera, CameraGroup
-
-    from tailcyclenet.detector.associate import associate
-    from tailcyclenet.detector.track import _project
-    from tailcyclenet.format import Rig
-
-    cams = []
-    for i, ang in enumerate((-0.5, 0.0, 0.5)):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
-                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-             moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).tracktail()
-
-    world = np.array([[0.0, 0.0, 0.0]], np.float32)
-    per_cam = []
-    for cam in cg:
-        uv = _project(cam, world)
-        per_cam.append(torch.stack([uv[:, 0] - 20, uv[:, 1] - 20, uv[:, 0] + 20, uv[:, 1] + 20],
-                                   -1))
-    with_supp = associate(cg, per_cam, max_res_px=20.0, corroborate=True)
-    without = associate(cg, per_cam, max_res_px=20.0, corroborate=False)
-    assert len(with_supp) == len(without) == 1
-    torch.testing.assert_close(with_supp[0]['point'], without[0]['point'])
 
 
 def test_a_nan_box_is_skipped_by_both_cross_view_paths():
@@ -3464,42 +3492,16 @@ eval_batches = 1
 # photometric augmentation
 # ----------------------------------------------------------------------------------------------
 
-def test_photometric_gain_none_is_byte_identical_to_before():
-    """`_photometric(img, rng)` must draw and consume the rng stream EXACTLY as it did before the
-    `gain=` parameter existed -- the T4.2 refactor's whole byte-identity claim rests on this."""
+def test_photometric_is_one_gain_draw():
+    """`_photometric(img, rng)` consumes exactly ONE `uniform(0.7, 1.3)` and applies it as a
+    clipped gain -- the augmentation stream's draw order rests on this."""
     img = (np.arange(4 * 4 * 3, dtype=np.float64).reshape(4, 4, 3) % 200).astype(np.uint8)
     rng1 = np.random.default_rng(7)
     rng2 = np.random.default_rng(7)
     out1 = _photometric(img, rng1)
-    gain = rng2.uniform(0.7, 1.3)          # the same single draw `_photometric` makes internally
-    out2 = _photometric(img, rng2, gain=gain)
-    np.testing.assert_array_equal(out1, out2)
-    # And the rng streams must have advanced identically -- the next draw from each must agree,
-    # or a caller downstream of `_photometric` (the strong-suite ops) would silently diverge.
+    gain = rng2.uniform(0.7, 1.3)
+    np.testing.assert_array_equal(out1, np.clip(img * gain, 0, 255).astype(np.uint8))
     assert rng1.uniform() == rng2.uniform()
-
-
-def test_photometric_explicit_gain_does_not_redraw():
-    """A caller supplying `gain=` must consume NOTHING from `rng` -- that is the whole point: the
-    t-1 frame reuses frame t's own gain rather than drawing a second, different one."""
-    img = np.full((4, 4, 3), 100, np.uint8)
-    rng = np.random.default_rng(3)
-    before = rng.bit_generator.state
-    _photometric(img, rng, gain=1.1)
-    after = rng.bit_generator.state
-    assert before == after
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_detector_run_directory_defaults_to_latest_checkpoint(tmp_path):
@@ -4027,7 +4029,7 @@ def _lever_rig(specs):
     """A NON-DEGENERATE synthetic rig for the tracker levers: every camera at its own tilt and
     height, so two rays through different animals are genuinely SKEW.
 
-    The rig in `track.demo` (and in every older tracker test here) puts all three cameras in one
+    The rig in `_tracker_demo` (and in every older tracker test here) puts all three cameras in one
     plane with their optical axes through the world origin, and that is a trap for anything that
     reads a reprojection residual: coplanar rays always intersect, so a cross-view-inconsistent
     pair triangulates to residual ~0 and no residual gate can ever fire on it. specs entries are
@@ -4108,7 +4110,7 @@ def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path()
     """A mode that fixes the crowded case by breaking the easy one is not a lever. `joint`
     replaces the matching phase only, so the state machine around it -- births into free slots on
     frame 0, a one-frame detector miss that ages targets without dropping them, and the SAME
-    slots resuming afterwards -- must behave exactly as `track.demo` asserts for the default
+    slots resuming afterwards -- must behave exactly as `_tracker_demo` asserts for the default
     path, including through the score-order swap that reorders detections every frame.
     """
     from tailcyclenet.detector.track import CrossViewTracker

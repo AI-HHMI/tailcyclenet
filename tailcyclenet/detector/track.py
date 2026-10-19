@@ -206,24 +206,6 @@ class CrossViewTracker:
         self.events = []
         self._t = -1
 
-    def _predict(self, s):
-        """Where slot `s` is expected to be THIS frame.
-
-        Inputs: s -- slot id, present in `self.targets`.
-        Outputs: a (3,) tensor: the remembered point.
-        Side effects: none.
-        """
-        return self.targets[s]['point']
-
-    def _advance(self, s, new):
-        """Accept a fresh triangulation for slot `s`.
-
-        Inputs: s -- slot id; new -- (3,) finite world point.
-        Outputs: None.
-        Side effects: sets `targets[s]['point']`.
-        """
-        self.targets[s]['point'] = new
-
     def step(self, cgroup, boxes_per_cam, scores_per_cam):
         """Match, update, birth, retire. -> (boxes (S,C,4), scores (S,C), claimed (S,C)) numpy.
 
@@ -263,7 +245,7 @@ class CrossViewTracker:
         for s, t in self.targets.items():
             if s not in slots:
                 t['age'] += 1
-        pts = (torch.stack([self._predict(s) for s in slots]) if slots else None)
+        pts = (torch.stack([self.targets[s]['point'] for s in slots]) if slots else None)
         self._joint(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
                    out, sc, claimed_ix)
         self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
@@ -442,12 +424,12 @@ class CrossViewTracker:
             for k in [k for k in self._dup_contact if loser in k or winner in k]:
                 del self._dup_contact[k]
 
-    def _birth(self, s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam, remap):
+    def _birth(self, s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam):
         """Seat one `associate` group in free slot `s`.
 
         Inputs: s -- a slot with no target; g -- an `associate` group; the three output arrays;
-            the frame's boxes and scores; remap -- (camera, group-local index) -> raw detection
-            index (`_joint` passes the identity: `associate` saw the whole pool).
+            the frame's boxes and scores (`associate` saw the whole pool, so a group's member
+            index IS the raw detection index).
         Outputs: None.
         Side effects: writes slot `s`'s row; creates `self.targets[s]` when `g` has a point.
 
@@ -459,10 +441,9 @@ class CrossViewTracker:
         """
         if not bool(torch.isfinite(g['point']).all()):
             for c, j in g['members'].items():
-                det = remap(c, j)
-                out[s, c] = boxes_per_cam[c][det].numpy()
-                sc[s, c] = float(scores_per_cam[c][det])
-                claimed_ix[s, c] = det
+                out[s, c] = boxes_per_cam[c][j].numpy()
+                sc[s, c] = float(scores_per_cam[c][j])
+                claimed_ix[s, c] = j
             return
         self.targets[s] = {'point': g['point'], 'age': 0}
         self._residuals[s] = float(g.get('residual', float('inf')))
@@ -470,10 +451,9 @@ class CrossViewTracker:
                             'detail': {'cameras': sorted(g['members']),
                                        'residual': float(g.get('residual', float('inf')))}})
         for c, j in g['members'].items():
-            det = remap(c, j)
-            out[s, c] = boxes_per_cam[c][det].numpy()
-            sc[s, c] = float(scores_per_cam[c][det])
-            claimed_ix[s, c] = det
+            out[s, c] = boxes_per_cam[c][j].numpy()
+            sc[s, c] = float(scores_per_cam[c][j])
+            claimed_ix[s, c] = j
 
     def _group_affinity(self, proj, centres, sides, i, g):
         """Lever 2's cost: how well slot `i`'s prediction explains candidate group `g`.
@@ -511,7 +491,7 @@ class CrossViewTracker:
 
         Inputs: as `step`, plus per-camera detection `centres`/`sides`, the finite-point `slots`
             and their stacked `pts` (None when empty), and the output arrays to write in place.
-        Outputs: the set of slots whose point was re-triangulated this frame.
+        Outputs: None.
         Side effects: mutates `self.targets` and the output arrays.
 
         `associate` runs first, over the WHOLE detection pool: every group it returns has already
@@ -552,7 +532,7 @@ class CrossViewTracker:
         if aff.any():
             aff = np.where(aff > 0,
                           aff * 16.0 + np.array([[_age_term(ages[s]) for s in slots]]).T, 0.0)
-        updated, taken, matched = set(), set(), {}
+        taken, matched = set(), {}
         if aff.size and aff.any():
             ri, ci = linear_sum_assignment(-aff)
             for i, k in zip(ri, ci):
@@ -566,9 +546,8 @@ class CrossViewTracker:
                 continue
             g = groups[matched[s]]
             if bool(torch.isfinite(g['point']).all()):
-                self._advance(s, g['point'])
+                self.targets[s]['point'] = g['point']
                 self._residuals[s] = float(g.get('residual', float('inf')))
-                updated.add(s)
             for c, j in g['members'].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
@@ -588,78 +567,5 @@ class CrossViewTracker:
                                         'event': 'birth_refused',
                                         'detail': {'cameras': sorted(g.get('members', {}))}})
                     continue
-                self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
-                            lambda c, j: j)
+                self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam)
                 break
-        return updated
-
-
-def demo():
-    """Two synthetic animals on a three-camera rig: the properties that must hold.
-
-    `assert`-based and dependency-free so this file can be checked without the test suite:
-        pixi run python -m tailcyclenet.detector.track
-
-    The animals CROSS: A walks right, B walks left, and the SCORE ORDER swaps every frame the
-    way `decode` reorders them -- a row that follows one animal must be immune to that. The
-    checks, in order: (1) both slots stay filled in every frame (births on frame 0, matches
-    after); (2) each row's own box moves smoothly -- a swapped row would jump the full
-    separation; (3) a frame with no detections at all ages the targets and returns nothing
-    without dropping them -- a one-frame detector miss must not end a track; (4) they resume in
-    the SAME slots afterwards.
-    """
-    from aniposelib.cameras import Camera, CameraGroup
-
-    from ..format import Rig
-
-    cams = []
-    for i, ang in enumerate((-0.5, 0.0, 0.5)):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
-                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-             moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).tracktail()
-
-    def boxes_at(worlds, side=40.0):
-        """Project `worlds` into every camera as fixed-size square boxes.
-
-        Outputs: (per_cam, scores): per_cam is a list of (n,4) xyxy tensors and scores
-        a list of (n,) ones.
-        """
-        per_cam, scores = [], []
-        for cam in cg:
-            uv = _project(cam, np.asarray(worlds, np.float32))
-            per_cam.append(torch.stack([uv[:, 0] - side / 2, uv[:, 1] - side / 2,
-                                        uv[:, 0] + side / 2, uv[:, 1] + side / 2], -1))
-            scores.append(torch.ones(len(worlds)))
-        return per_cam, scores
-
-    a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
-    tr = CrossViewTracker(2, max_res_px=30.0)
-    rows = []
-    for t in range(12):
-        w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
-        per_cam, scores = boxes_at(w if t % 2 == 0 else w[::-1])
-        rows.append(tr.step(cg, per_cam, scores)[0])
-
-    assert all(np.isfinite(r).all(-1).any(-1).sum() == 2 for r in rows), 'an animal was lost'
-    for s in (0, 1):
-        cx = np.array([r[s, 0, [0, 2]].mean() for r in rows])
-        assert np.abs(np.diff(cx)).max() < 30.0, f'row {s} jumped: {np.diff(cx)}'
-    empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
-    out, _, _ = tr.step(cg, *empty)
-    assert not np.isfinite(out).any() and len(tr.targets) == 2
-    w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
-    resumed, _, _ = tr.step(cg, *boxes_at(w))
-    assert np.isfinite(resumed).all(-1).any(-1).sum() == 2
-    for s in (0, 1):
-        assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0
-    print('track.demo: ok')
-
-
-if __name__ == '__main__':
-    demo()

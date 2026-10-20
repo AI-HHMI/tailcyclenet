@@ -23,8 +23,8 @@ from ..data.camera import resize_camera
 from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
-from .crops import (boxes_from_points, camera_consensus, crop_views, fill_box_agreement,
-                    overlaps, refine_every_camera, to_device)
+from .crops import (adaptive_inflation, boxes_from_points, camera_consensus, crop_views,
+                    fill_box_agreement, overlaps, refine_every_camera, to_device, union_box)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
@@ -139,6 +139,12 @@ class InferConfig:
     refine_consensus: bool = False
     refine_consensus_res: float = 0.5
     refine_consensus_vis: float = 0.0
+    # R3 (2D and 3D): the pass-1 inflation per (animal, window, camera) is the largest factor in
+    # [1, crop_inflate_max] whose inflated box touches no OTHER animal's box in that camera this
+    # window; `crop_inflate` where no other animal has one. Needs detector/instances boxes (the
+    # labels path has no neighbours' boxes and keeps `crop_inflate`). False is the shipped rule.
+    crop_inflate_adaptive: bool = False
+    crop_inflate_max: float = 2.0
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -370,6 +376,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
     f0, w0 = 0, 0
     pred = conf = box_agree = outcome = crop = crop_refined = box_cams = refine_outlier = None
+    inflate_used = None
     pred2d = conf2d = None
     boxes_stc = None
     _boxes_from = ('detector' if boxes_for is not None else
@@ -418,6 +425,13 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if box_specs:
                 win_boxes = corrupt_boxes(win_boxes, box_specs, gid, int(frames[0]))
                 corrupted[wi] = win_boxes
+        unions = []
+        if cfg.crop_inflate_adaptive:
+            src_b = (win_boxes if win_boxes is not None else
+                     (inst_boxes[:, frames] if inst_boxes is not None else None))
+            unions = ([] if src_b is None else
+                      [[union_box(src_b[o][:, i]) for i in range(src_b.shape[2])]
+                       for o in range(min(S, len(src_b)))])
         for a in range(S):
             bb = None
             if boxes_stc is not None:
@@ -465,7 +479,17 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 if cgroup is None:
                     outcome[a, wl] = OUTCOMES.index('crop failed')
                     continue
-            if cfg.crop_inflate != 1.0:
+            if cfg.crop_inflate_adaptive:
+                fs = [adaptive_inflation(b, window_cams[ci]['size'],
+                                         [u[ci] for o, u in enumerate(unions) if o != a],
+                                         cfg.crop_inflate_max, cfg.crop_inflate)
+                      for ci, b in zip(use, boxes)]
+                boxes = [cropmod.inflate_box(b, window_cams[ci]['size'], f)
+                         for ci, b, f in zip(use, boxes, fs)]
+                cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
+                for ci, f in zip(use, fs):
+                    inflate_used[a, wl, ci] = f
+            elif cfg.crop_inflate != 1.0:
                 boxes = [cropmod.inflate_box(b, window_cams[ci]['size'], cfg.crop_inflate)
                          for ci, b in zip(use, boxes)]
                 cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
@@ -999,6 +1023,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             outcome = np.full((S, n_win), OUTCOMES.index('no box'), np.int8)
             crop = np.full((S, n_win, len(session.rig), 4), np.nan, np.float32)
             crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
+            inflate_used = (np.full((S, n_win, len(session.rig)), np.nan, np.float32)
+                            if cfg.crop_inflate_adaptive else None)
             refine_outlier = (np.full((S, n_win, len(session.rig)), -1, np.int8)
                               if cfg.refine and cfg.refine_consensus and mode == '3d' else None)
             box_cams = (np.full((S, n_win), -1, np.int8) if cfg.box_prompt != 'none' else None)
@@ -1061,6 +1087,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
                    **({} if crop_refined is None else {'crop_refined': crop_refined}),
                    **({} if refine_outlier is None else {'refine_outlier': refine_outlier}),
+                   **({} if inflate_used is None else {'crop_inflate_used': inflate_used}),
                    **({} if box_cams is None else {'box_prompt_cams': box_cams}),
                    'boxes_from': _boxes_from}
     finally:

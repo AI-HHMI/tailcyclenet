@@ -704,3 +704,31 @@ def test_refine_consensus_composes_with_refine_all_cams(mv, monkeypatch):
     assert not np.isfinite(r1['crop_refined'][..., 2, :]).any(), 'R1 alone never adds a camera'
     assert np.isfinite(r2['crop_refined'][..., 2, :]).all(-1).any(), \
         'R2 adds the box-less camera from the consensus pose'
+
+
+def test_crop_inflate_adaptive_follows_the_neighbours_in_2d(rat):
+    """R3 on the 2D path: a lone row keeps --crop-inflate exactly; two rows side by side get a
+    factor whose crop does not reach the other's box, recorded per (animal, window, camera)."""
+    from tailcyclenet.infer.crops import overlaps
+    model, sess, registry, name = rat
+    one = np.zeros((1, 4, 1, 4), np.float32)
+    one[..., :] = [10, 10, 30, 30]
+    torch.manual_seed(0)
+    a = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='none', crop_inflate=1.5),
+                  boxes_for=_boxes_for(one), n_rows=1)
+    torch.manual_seed(0)
+    b = run_group(model, sess, 'g000', registry, name,
+                  _infer_cfg(anchor='none', crop_inflate=1.5, crop_inflate_adaptive=True),
+                  boxes_for=_boxes_for(one), n_rows=1)
+    assert (b.pop('crop_inflate_used') == 1.5).all()
+    _assert_same(a, b, ' (R3, one animal)')
+    two = np.zeros((2, 4, 1, 4), np.float32)
+    two[0, ..., :] = [10, 10, 30, 30]
+    two[1, ..., :] = [34, 10, 54, 30]
+    c = run_group(model, sess, 'g000', registry, name,
+                  _infer_cfg(anchor='none', crop_inflate=1.5, crop_inflate_adaptive=True),
+                  boxes_for=_boxes_for(two), n_rows=2)
+    f = c['crop_inflate_used'][:, 0, 0]
+    assert (f >= 1.0).all() and (f < 1.5).all()
+    assert not overlaps(c['crop'][0, 0, 0], two[1, 0, 0])
+    assert not overlaps(c['crop'][1, 0, 0], two[0, 0, 0])

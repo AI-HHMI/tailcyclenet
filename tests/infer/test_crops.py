@@ -77,3 +77,21 @@ def test_refine_every_camera_recrops_an_outlier_whose_box_was_elsewhere():
     assert use == [0]
     use, b, _ = refine_every_camera(pts, [0, 1], [shipped[0], far], [0, 1], cg, 16, outliers={1})
     assert use == [0, 1] and torch.equal(b[1], shipped[1])
+
+
+def test_adaptive_inflation_widens_until_a_neighbour_and_falls_back_alone():
+    """R3: alone -> the shipped factor; a far neighbour -> the ceiling; a near one -> the largest
+    factor that does not touch it; already touching -> 1.0."""
+    from tailcyclenet.data import crop as cropmod
+    from tailcyclenet.infer.crops import adaptive_inflation, overlaps
+    box, size = torch.tensor([100, 100, 140, 140], dtype=torch.int32), (1000, 1000)
+    nan = np.full(4, np.nan)
+    assert adaptive_inflation(box, size, [], 2.0, 1.5) == 1.5
+    assert adaptive_inflation(box, size, [nan], 2.0, 1.5) == 1.5
+    assert adaptive_inflation(box, size, [np.array([800, 800, 840, 840])], 2.0, 1.5) == 2.0
+    near = np.array([146, 100, 186, 140])                          # 6 px to the right
+    f = adaptive_inflation(box, size, [near], 2.0, 1.5)
+    assert 1.0 < f < 1.5
+    assert not overlaps(cropmod.inflate_box(box, size, f), near)
+    assert overlaps(cropmod.inflate_box(box, size, f + 0.05), near)
+    assert adaptive_inflation(box, size, [np.array([130, 100, 170, 140])], 2.0, 1.5) == 1.0

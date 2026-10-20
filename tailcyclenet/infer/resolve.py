@@ -245,7 +245,12 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         box_corrupt=getattr(args, 'box_corrupt', None) or None,
         refine_consensus=bool(getattr(args, 'refine_consensus', False)),
         refine_consensus_res=float(getattr(args, 'refine_consensus_res', 0.5)),
-        refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', 0.0)))
+        refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', 0.0)),
+        crop_inflate_adaptive=bool(getattr(args, 'crop_inflate_adaptive', False)),
+        crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)))
+    if cfg.crop_inflate_adaptive and cfg.crop_inflate_max < 1.0:
+        raise SystemExit(f'--crop-inflate-max {cfg.crop_inflate_max} is below 1.0; R3 never '
+                         'shrinks a crop below its box.')
     if cfg.refine_consensus and not (cfg.refine and sess.mode == '3d'):
         raise SystemExit('--refine-consensus tests pass 1\'s cameras against each other, so it '
                          'needs 3D and --refine; this run is '

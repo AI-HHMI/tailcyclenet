@@ -172,6 +172,14 @@ def build_parser() -> argparse.ArgumentParser:
     win.add_argument('--crop-inflate', type=float, default=None,
                      help='inflate every crop about its centre. Default 1.5 with the box on, '
                           'else 1.0.')
+    win.add_argument('--crop-inflate-adaptive', action=argparse.BooleanOptionalAction,
+                     default=False,
+                     help='R3: per (animal, window, camera), inflate the pass-1 crop by the largest '
+                          'factor in [1, --crop-inflate-max] that touches no OTHER animal\'s box '
+                          'in that camera this window; --crop-inflate where none has one. Needs '
+                          '--detector boxes to see neighbours. Default: off.')
+    win.add_argument('--crop-inflate-max', type=float, default=2.0,
+                     help='R3 ceiling on the adaptive inflation (default 2.0).')
     win.add_argument('--vis-thresh', type=float, default=None,
                      help='PER-CAMERA gate: withhold an (animal, frame, camera) 2D row whose median '
                           'per-camera visibility logit (`vis_pred_2d`) is below this; the 3D row is '

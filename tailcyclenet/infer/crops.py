@@ -98,6 +98,38 @@ def prior_to_model_frame(p, mode, boxes, scales):
     return p
 
 
+def union_box(v):
+    """The xyxy union of a (T,4) per-frame box stack over its finite rows; NaN when none is."""
+    v = np.asarray(v, np.float64)
+    v = v[np.isfinite(v).all(-1)]
+    if not len(v):
+        return np.full(4, np.nan)
+    return np.array([v[:, 0].min(), v[:, 1].min(), v[:, 2].max(), v[:, 3].max()])
+
+
+def adaptive_inflation(box, size, others, f_max, fallback, step=0.05):
+    """R3: the pass-1 inflation for one (animal, window, camera) -> a factor.
+
+    The largest factor on a `step` grid in [1.0, f_max] whose `inflate_box` does not share area
+    with any of `others` (the OTHER animals' boxes in this camera this window); `fallback` (the
+    shipped `crop_inflate`) when no other animal has a box here. Inflation about a fixed centre
+    only grows the box, so the first factor that touches a neighbour ends the search; a box that
+    already touches one gets 1.0. The discriminator this spends is crop side vs distance to the
+    nearest other animal: wide where the animal is alone, tight where it is crowded.
+    """
+    others = [o for o in others if np.isfinite(np.asarray(o, np.float64)).all()]
+    if not others:
+        return float(fallback)
+    best = 1.0
+    for n in range(int(round((float(f_max) - 1.0) / step)) + 1):
+        f = min(float(f_max), round(1.0 + n * step, 6))
+        b = cropmod.inflate_box(box, size, f)
+        if any(overlaps(b, o) for o in others):
+            break
+        best = f
+    return best
+
+
 def in_frame(points, cam, min_inside=0.5):
     """Does a 3D pose reproject into `cam`'s image? At least `min_inside` of its finite projected
     points must land inside; no finite point is not in frame."""

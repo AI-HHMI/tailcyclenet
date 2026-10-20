@@ -24,8 +24,8 @@ from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
 from .crops import (adaptive_inflation, box_disagrees, boxes_from_points, camera_consensus,
-                    carry_duplicate, crop_views, fill_box_agreement, in_frame, overlaps, refine_every_camera,
-                    to_device, union_box)
+                    carry_duplicate, crop_views, fill_box_agreement, in_frame, overlaps,
+                    refine_every_camera, scale_agrees, to_device, union_box)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
@@ -158,6 +158,10 @@ class InferConfig:
     # for that animal; 0 restores the ungated R4.
     refine_carry_fallback: bool = False
     refine_carry_dup_radius: float = 0.75
+    # ...and a camera whose carried crop is more than `refine_carry_scale_max` times larger or
+    # smaller than the median of the animal's own boxes this window keeps its box (or stays
+    # box-less): an exploded or collapsed carry is not the animal (`scale_agrees`). 0 = off.
+    refine_carry_scale_max: float = 2.0
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -718,8 +722,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         """
         def _carry_fallback(plan):
             """R4 for one animal -> (plan, {camera: 1 replaced | 2 added}); the plan is returned
-            unchanged (and the dict empty) when the carry is stale, nothing disagrees, or no
-            camera's own box agrees with the carry."""
+            unchanged (and the dict empty) when the carry is stale, duplicates another slot's
+            carry, nothing disagrees, or no camera's own box agrees with the carry. A camera
+            whose carried crop fails the scale gate keeps its own box (or stays box-less)."""
             a, use, boxes, cgroup, scales, uncropped = plan
             c = carried[a]
             if c is None or int(c[1]) < int(frames[0]):
@@ -733,6 +738,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                cfg.refine_carry_dup_radius):
                 return plan, {}
             new, src, agree = {}, {}, 0
+            sides = [0.5 * (float(b[2] - b[0]) + float(b[3] - b[1])) for b in boxes]
+            ref = float(np.median(sides)) if sides else float('nan')
             for ci in cam_ix:
                 cam = window_cams[ci]
                 cg, bx = cropmod.crop_to_points_3d([cam], pts, cfg.min_crop_dim)
@@ -743,13 +750,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         agree += cbox is not None
                         new[ci] = (boxes[i], uncropped[i])
                         continue
-                    src[ci] = 1
                 elif cbox is None:
                     continue
-                else:
-                    src[ci] = 2
                 if cfg.crop_inflate != 1.0:
                     cbox = cropmod.inflate_box(cbox, cam['size'], cfg.crop_inflate)
+                if not scale_agrees(cbox, ref, cfg.refine_carry_scale_max):
+                    if ci in use:
+                        i = use.index(ci)
+                        new[ci] = (boxes[i], uncropped[i])
+                    continue
+                src[ci] = 1 if ci in use else 2
                 new[ci] = (cbox, cropmod.apply_crop(cam, cbox))
             if not src or not agree:
                 return plan, {}

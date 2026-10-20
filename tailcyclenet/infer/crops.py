@@ -190,6 +190,23 @@ def carry_duplicate(points, others, cams, min_crop_dim, radius, min_shared=2):
     return False
 
 
+def scale_agrees(box, ref_side, max_ratio):
+    """R4 gate: is `box`'s mean side within a factor `max_ratio` of `ref_side` (either way)?
+
+    The carried pose's crop must be the size of the animal the detector boxes describe: a carry
+    whose crop is more than 2x larger or smaller than the slot's own boxes this window is an
+    exploded or collapsed triangulation, not the animal (3dpop test, clean boxes: 65 of 163
+    acting camera-windows fall outside [0.5, 2] -- one 2-bird clip, P02 Seq50, carries the
+    whole clean regression; under swap:0.25 / drop:0.25 only 2.7% / 1.8% do). `max_ratio` 0
+    turns the gate off; a NaN or non-positive reference agrees.
+    """
+    if max_ratio <= 0 or not np.isfinite(ref_side) or ref_side <= 0:
+        return True
+    b = np.asarray(box, np.float64)
+    r = 0.5 * ((b[2] - b[0]) + (b[3] - b[1])) / ref_side
+    return bool(1.0 / max_ratio <= r <= max_ratio)
+
+
 def in_frame(points, cam, min_inside=0.5):
     """Does a 3D pose reproject into `cam`'s image? At least `min_inside` of its finite projected
     points must land inside; no finite point is not in frame."""

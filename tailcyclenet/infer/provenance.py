@@ -116,6 +116,7 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
             'crop_inflate_max': float(cfg.crop_inflate_max),
             'refine_carry_fallback': bool(cfg.refine_carry_fallback),
             'refine_carry_dup_radius': float(cfg.refine_carry_dup_radius),
+            'refine_carry_scale_max': float(cfg.refine_carry_scale_max),
             'precision': precision, 'camera_batch': bool(camera_batch),
             'boxes': (str(args.detector) if args.detector else
                       (str(args.boxes) if args.boxes else 'labels')),

@@ -125,3 +125,14 @@ def test_carry_duplicate_is_the_trackers_duplicate_rule_on_carried_poses():
     nanrow = near.clone()
     nanrow[0] = float('nan')
     assert carry_duplicate(pts, [nanrow], cg, 16, 0.75), 'a NaN keypoint is ignored, not fatal'
+
+
+def test_scale_agrees_is_a_factor_either_way_and_off_at_zero():
+    """R4's scale gate: mean side within [1/f, f] of the reference; 0 or a bad reference agrees."""
+    from tailcyclenet.infer.crops import scale_agrees
+    box = [0, 0, 100, 100]
+    assert scale_agrees(box, 100.0, 2.0) and scale_agrees(box, 50.0, 2.0)
+    assert scale_agrees(box, 200.0, 2.0)
+    assert not scale_agrees(box, 49.0, 2.0) and not scale_agrees(box, 201.0, 2.0)
+    assert scale_agrees(box, 10.0, 0.0)
+    assert scale_agrees(box, float('nan'), 2.0)

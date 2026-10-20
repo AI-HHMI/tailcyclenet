@@ -249,7 +249,11 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         crop_inflate_adaptive=bool(getattr(args, 'crop_inflate_adaptive', False)),
         crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)),
         refine_carry_fallback=bool(getattr(args, 'refine_carry_fallback', False)),
-        refine_carry_dup_radius=float(getattr(args, 'refine_carry_dup_radius', 0.75)))
+        refine_carry_dup_radius=float(getattr(args, 'refine_carry_dup_radius', 0.75)),
+        refine_carry_scale_max=float(getattr(args, 'refine_carry_scale_max', 2.0)))
+    if cfg.refine_carry_scale_max != 0 and cfg.refine_carry_scale_max < 1:
+        raise SystemExit(f'--refine-carry-scale-max {cfg.refine_carry_scale_max} is below 1; it is '
+                         'a factor either way (0 turns the scale gate off).')
     if cfg.refine_carry_dup_radius < 0:
         raise SystemExit(f'--refine-carry-dup-radius {cfg.refine_carry_dup_radius} is negative; '
                          '0 turns the duplicate-carry gate off.')

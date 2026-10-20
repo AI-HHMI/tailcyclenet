@@ -761,6 +761,8 @@ def test_refine_carry_fallback_adds_a_boxless_camera_only_with_a_fresh_agreeing_
     monkeypatch.setattr(wmod, 'in_frame', lambda *a, **k: True)
     kw = dict(boxes_for=_boxes_for(boxes), n_rows=1)
     off = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    on = _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True,
+                    refine_carry_scale_max=0.0)
     r4 = run_group(model, sess, 'g000', registry, name, on, **kw)
     assert not np.isfinite(off['crop'][..., 2, :]).any()
     cc = r4['carry_crop'][0]
@@ -812,5 +814,24 @@ def test_refine_carry_fallback_stands_down_on_a_duplicate_carry(mv16, monkeypatc
     _assert_same(off, gated, ' (R4, duplicate carries)')
     ungated = run_group(model, sess, 'g000', registry, name,
                         _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True,
-                                   refine_carry_dup_radius=0.0), **kw)
+                                   refine_carry_dup_radius=0.0, refine_carry_scale_max=0.0), **kw)
     assert (ungated['carry_crop'][:, 1:, 2] == 2).any()
+
+
+def test_refine_carry_fallback_scale_gate_keeps_a_box_less_camera_box_less(mv16, monkeypatch):
+    """R4's scale gate: a carried crop whose size disagrees with the animal's own boxes (forced
+    here) never adds a camera: byte-identical to R4 off."""
+    from tailcyclenet.infer import window as wmod
+    model, sess, registry, name = mv16
+    boxes = _whole_frame_boxes(sess, T=sess.groups['g000'].n_frames)
+    boxes[:, :, 2] = np.nan
+    monkeypatch.setattr(wmod, 'in_frame', lambda *a, **k: True)
+    monkeypatch.setattr(wmod, 'scale_agrees', lambda *a, **k: False)
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=1)
+    torch.manual_seed(0)
+    off = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    torch.manual_seed(0)
+    gated = run_group(model, sess, 'g000', registry, name,
+                      _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True), **kw)
+    assert (gated.pop('carry_crop') == 0).all()
+    _assert_same(off, gated, ' (R4, scale gate)')

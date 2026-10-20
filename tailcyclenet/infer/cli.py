@@ -191,6 +191,10 @@ def build_parser() -> argparse.ArgumentParser:
                           'crop sides of another slot\'s carry in >= 2 cameras (the tracker\'s '
                           'duplicate rule; a duplicate carry is a drifted or ghost row). 0 = the '
                           'ungated R4. Default 0.75.')
+    win.add_argument('--refine-carry-scale-max', type=float, default=2.0, metavar='FACTOR',
+                     help='R4 gate: a camera whose carried crop is more than this factor larger or '
+                          'smaller than the median of the animal\'s own boxes this window keeps its '
+                          'box (an exploded or collapsed carry). 0 = off. Default 2.0.')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')

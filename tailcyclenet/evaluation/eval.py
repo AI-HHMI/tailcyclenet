@@ -336,10 +336,11 @@ def _parser():
     ap.add_argument('--vs', type=Path, default=None,
                     help='a second prediction, reported as `predictions` minus this one under a '
                          'PAIRED bootstrap over the groups both scored, on the points BOTH matched.')
-    ap.add_argument('--min-match-kpts', type=float, default=0.0,
+    ap.add_argument('--min-match-kpts', type=float, default=0.5,
                     help='the FRACTION of the keypoint set a predicted instance must share with a '
                          'labelled one before its mean distance may stand for the pair. A fraction '
-                         'and not a count (K is 4 to 47); use 0.5 for deltas.')
+                         'and not a count (K is 4 to 47). Default 0.5 since 2026-10-21 (owner); pass 0 '
+                         'to reproduce numbers published before that.')
     ap.add_argument('--chunk', type=int, default=0,
                     help='split each group into N-frame scoring units (the bootstrap resamples '
                          'groups, so a long clip is one group and reads DEGENERATE). Chunks of one '

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+### Changes that move numbers
+- `--assoc-fast` is on by default: byte-identical association, about 1.9x faster (`--no-assoc-fast` is the reference loop).
+- `--refine-carry-fallback` (R4) is on by default in 3D: a camera with no box, or a box that disagrees with the fresh carried
+  pose, is cropped from that pose; it stands down on a duplicate carry and when the carried crop is off in scale. 3dpop test:
+  clean boxes MOTA unchanged, 25% dropped boxes +0.065, 25% swapped boxes +0.170. `--no-refine-carry-fallback` restores the
+  old crops.
+- `eval --min-match-kpts` defaults to 0.5; pass 0 to reproduce numbers published before 0.4.1.
+
+### New opt-in switches
+- `--box-corrupt` (diagnostic), `--refine-consensus` (residual-only camera consensus), `--crop-inflate-adaptive`,
+  `--refine-all-cams`, `--track-camera-claims`, `--track-age-decay`, `--track-affinity-2d`, `--assoc-res-max-sides`,
+  `--assoc-score-order`, `--assoc-random-drop` (diagnostic). All measured null or mixed on 3dpop; see each `--help`.
+
 ## 0.4.0 (2026-10-19)
 
 Architecture cleanup (`dev/plans/architecture_cleanup.md`, untracked). **Import paths break; the CLI does not.**

@@ -147,7 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
                           ' box misses its pass-1 box; add one with no pass-1 box when the pose'
                           ' reprojects into its frame). Default: off (all-or-nothing over the '
                           'pass-1 cameras). measured: 3dpop Seq59 coverage/MPJPE unchanged, '
-                          'idsw 13->20; byte-identical on Seq29 and a 2-bird clip (2026-10-19).')
+                          'idsw 13->20; byte-identical on Seq29 and a 2-bird clip (2026-10-19). '
+                          'With --refine-consensus (R2): swap:0.25 MOTA P02 Seq41 0.633->0.737, '
+                          'Seq59 0.852->0.849; drop:0.25 Seq59 0.870->0.890, Seq29 0.852->0.870 '
+                          '(2026-10-20).')
     win.add_argument('--refine-consensus', action=argparse.BooleanOptionalAction, default=False,
                      help='R1, 3D --refine: after pass 1, a camera whose own 2D head disagrees with '
                           'the fused pose (median reprojection residual > --refine-consensus-res '
@@ -156,11 +159,18 @@ def build_parser() -> argparse.ArgumentParser:
                           're-runs without it and pass 2 crops every camera (the outlier too, if '
                           'in frame) from that consensus pose. Never acts with < 3 pass-1 '
                           'cameras. With --refine-all-cams (R2) a camera with no pass-1 box is '
-                          'also cropped from the consensus pose. Default: off.')
+                          'also cropped from the consensus pose. Default: off. measured (3dpop, '
+                          'one lever vs base, --box-corrupt swap:0.25): MOTA Seq29 0.783->0.836, '
+                          'P02 Seq41 0.633->0.704, Seq59 0.852->0.856, MPJPE -3..-16 mm; '
+                          'clean boxes: metrics unchanged; allen mouse1: the vis test flags nearly '
+                          'every camera at pass-1 resolution (2026-10-20).')
     win.add_argument('--refine-consensus-res', type=float, default=0.5, metavar='SIDES',
                      help='R1 residual threshold in crop-box sides (default 0.5).')
     win.add_argument('--refine-consensus-vis', type=float, default=0.0, metavar='LOGIT',
-                     help='R1 visibility threshold, median vis_pred_2d logit (default 0.0).')
+                     help='R1 visibility threshold, median vis_pred_2d logit (default 0.0). '
+                          'measured: not portable -- pass-1 logits are negative on ~all allen '
+                          'mouse1 cameras; =-1e9 (residual only) matches R1 on 3dpop and is '
+                          'byte-identical to base on mouse1 (2026-10-20).')
     win.add_argument('--refine-carry-fallback', action=argparse.BooleanOptionalAction,
                      default=False,
                      help='R4, 3D: a camera with no box this window, or whose crop centre is more '
@@ -168,7 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
                           'into it, is cropped for pass 1 from that carried pose. Only with a '
                           'fresh carry and at least one camera agreeing with it; under '
                           '--refine-consensus such a camera that fails the test is dropped. '
-                          'Default: off.')
+                          'Default: off. measured (3dpop): swap:0.25 MOTA P02 Seq41 0.633->0.874,'
+                          ' Seq59 0.852->0.870, Seq29 0.783->0.836; drop:0.25 Seq59 '
+                          '0.870->0.922; clean boxes Seq29 0.920->0.909 (a regression), Seq59 '
+                          '0.9226->0.9225 (2026-10-20).')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')
@@ -185,7 +198,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help='R3: per (animal, window, camera), inflate the pass-1 crop by the largest '
                           'factor in [1, --crop-inflate-max] that touches no OTHER animal\'s box '
                           'in that camera this window; --crop-inflate where none has one. Needs '
-                          '--detector boxes to see neighbours. Default: off.')
+                          '--detector boxes to see neighbours. Default: off. measured (3dpop, '
+                          'clean boxes): Seq29 MOTA 0.920->0.930, fp_dup 44->20; Seq59 MOTA '
+                          '0.9226->0.9222, MPJPE -0.37 mm; P02 Seq41 MPJPE +0.36 mm; no help '
+                          'under swap (2026-10-20).')
     win.add_argument('--crop-inflate-max', type=float, default=2.0,
                      help='R3 ceiling on the adaptive inflation (default 2.0).')
     win.add_argument('--vis-thresh', type=float, default=None,
@@ -339,7 +355,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help='DIAGNOSTIC, needs --detector: break the detector boxes before cropping, '
                           'per (animal, window, camera), seeded (deterministic given SPEC): '
                           'drop:<p> | shift:<p>:<sides> | shrink:<p>:<f> | swap:<p> (the nearest '
-                          "other row's box), comma-joined. Never a deployment arm.")
+                          "other row's box), comma-joined. Never a deployment arm. measured: "
+                          '3dpop Seq59 MOTA 0.923 clean, 0.870 drop:0.25, 0.922 shift:0.25:0.5, '
+                          '0.923 shrink:0.25:0.6, 0.852 swap:0.25 (2026-10-20).')
     adv.add_argument('--dump-session', type=Path, default=None,
                      help='DEBUG: write the constructed --videos session (pixels symlinked) and '
                           'carry on.')

@@ -179,11 +179,13 @@ def build_parser() -> argparse.ArgumentParser:
                           'than one crop side from the crop rule on the carried pose reprojected '
                           'into it, is cropped for pass 1 from that carried pose. Only with a '
                           'fresh carry and at least one camera agreeing with it; under '
-                          '--refine-consensus such a camera that fails the test is dropped. '
-                          'Default: off. measured (3dpop): swap:0.25 MOTA P02 Seq41 0.633->0.874,'
-                          ' Seq59 0.852->0.870, Seq29 0.783->0.836; drop:0.25 Seq59 '
-                          '0.870->0.922; clean boxes Seq29 0.920->0.909 (a regression), Seq59 '
-                          '0.9226->0.9225 (2026-10-20).')
+                          '--refine-consensus such a camera that fails the test is dropped; '
+                          'stands down on a duplicate carry (--refine-carry-dup-radius). '
+                          'Default: off. measured with the gate (3dpop screens): swap:0.25 MOTA '
+                          'P02 Seq41 0.633->0.874, Seq59 0.852->0.876, Seq29 0.783->0.852; '
+                          'drop:0.25 Seq59 0.870->0.922, Seq29 0.852->0.919; clean boxes '
+                          'metric-identical on Seq59/Seq29/P02 Seq41 (ungated: Seq29 '
+                          '0.920->0.909) (2026-10-20).')
     win.add_argument('--refine-carry-dup-radius', type=float, default=0.75, metavar='SIDES',
                      help='R4 gate: stand down for an animal whose carried pose is within this many '
                           'crop sides of another slot\'s carry in >= 2 cameras (the tracker\'s '

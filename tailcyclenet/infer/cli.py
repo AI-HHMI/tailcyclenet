@@ -306,6 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help='ONLY with --anchor labels: break the oracle prior on purpose to '
                           'measure the echo coefficient: off:<x> (whole-body offset, crop '
                           'widths), stale:<n>, other, near, swap:<n>.')
+    adv.add_argument('--box-corrupt', default=None, metavar='SPEC',
+                     help='DIAGNOSTIC, needs --detector: break the detector boxes before cropping, '
+                          'per (animal, window, camera), seeded (deterministic given SPEC): '
+                          'drop:<p> | shift:<p>:<sides> | shrink:<p>:<f> | swap:<p> (the nearest '
+                          "other row's box), comma-joined. Never a deployment arm.")
     adv.add_argument('--dump-session', type=Path, default=None,
                      help='DEBUG: write the constructed --videos session (pixels symlinked) and '
                           'carry on.')

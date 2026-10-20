@@ -191,3 +191,60 @@ def test_oracle_corrupt_near_and_swap():
     base = torch.as_tensor(src[0, 0])
     assert sorted(p.tolist()) == sorted(base.tolist()), 'the keypoint SET must be unchanged'
     assert int((p != base).any(-1).sum()) == 2, 'swap:1 is exactly one pair'
+
+
+# --- `--box-corrupt` (a diagnostic for the refine robustness levers) ---
+
+def _two_animal_boxes():
+    """(S=2,T=3,C=2,4): animal 0 near the origin, animal 1 to its right, both in both cameras."""
+    bb = np.zeros((2, 3, 2, 4), np.float32)
+    bb[0, :, :] = [10, 10, 30, 30]
+    bb[1, :, :] = [100, 10, 120, 30]
+    return bb
+
+
+def test_box_corrupt_kinds_do_what_they_say():
+    """drop NaNs the camera; shift moves the centre by `sides` box sides; shrink scales the side
+    about the centre; swap takes the other row's boxes; p = 0 is the identity."""
+    from tailcyclenet.infer.oracle import corrupt_boxes, parse_box_corrupt
+    bb = _two_animal_boxes()
+    assert np.array_equal(corrupt_boxes(bb, parse_box_corrupt('drop:0,swap:0'), 'g', 0), bb)
+    out = corrupt_boxes(bb, parse_box_corrupt('drop:1'), 'g', 0)
+    assert np.isnan(out).all()
+    out = corrupt_boxes(bb, parse_box_corrupt('shift:1:0.5'), 'g', 0)
+    move = (out[..., :2] + out[..., 2:]) / 2 - (bb[..., :2] + bb[..., 2:]) / 2
+    np.testing.assert_allclose(np.linalg.norm(move, axis=-1), 10.0, rtol=1e-5)   # 0.5 x 20 px
+    np.testing.assert_allclose(out[..., 2:] - out[..., :2], bb[..., 2:] - bb[..., :2], atol=1e-4)
+    out = corrupt_boxes(bb, parse_box_corrupt('shrink:1:0.6'), 'g', 0)
+    np.testing.assert_allclose(out[..., 2] - out[..., 0], 12.0, rtol=1e-6)
+    np.testing.assert_allclose(out[..., 0] + out[..., 2], bb[..., 0] + bb[..., 2])
+    out = corrupt_boxes(bb, parse_box_corrupt('swap:1'), 'g', 0)
+    assert np.array_equal(out[0], bb[1]) and np.array_equal(out[1], bb[0])
+    one = corrupt_boxes(bb[:1], parse_box_corrupt('swap:1'), 'g', 0)
+    assert np.array_equal(one, bb[:1]), 'swap with no other row is a no-op'
+
+
+def test_box_corrupt_is_deterministic_and_per_animal_window_camera():
+    """The same (group, window, animal, camera) draws the same corruption on every call, a
+    different window draws independently, and the whole window's frames move together."""
+    from tailcyclenet.infer.oracle import corrupt_boxes, parse_box_corrupt
+    bb = np.tile(_two_animal_boxes(), (8, 1, 1, 1))[:16]          # 16 rows, plenty of draws
+    spec = parse_box_corrupt('drop:0.5')
+    a, b = corrupt_boxes(bb, spec, 'g', 0), corrupt_boxes(bb, spec, 'g', 0)
+    np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
+    dropped = np.isnan(a[..., 0])                                  # (S,T,C)
+    assert (dropped == dropped[:, :1]).all(), 'one decision per (animal, window, camera)'
+    assert 0 < dropped[:, 0].mean() < 1
+    other = np.isnan(corrupt_boxes(bb, spec, 'g', 12)[..., 0])
+    assert not np.array_equal(other, dropped), 'another window draws again'
+
+
+def test_box_corrupt_spec_is_parsed_strictly():
+    """A malformed spec is refused by name rather than read as something else."""
+    import pytest
+    from tailcyclenet.infer.oracle import parse_box_corrupt
+    assert parse_box_corrupt('drop:0.25,shift:0.25:0.5') == (('drop', 0.25, None),
+                                                            ('shift', 0.25, 0.5))
+    for bad in ('blur:0.1', 'shift:0.2', 'drop:1.5', 'shrink:0.2:1.5', 'swap:0.1:2'):
+        with pytest.raises(ValueError):
+            parse_box_corrupt(bad)

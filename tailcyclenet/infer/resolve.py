@@ -95,6 +95,18 @@ def refuse_before_load(args):
               f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
               'prediction of anything. ***')
 
+    if getattr(args, 'box_corrupt', None):
+        from .oracle import parse_box_corrupt
+        try:
+            parse_box_corrupt(args.box_corrupt)
+        except ValueError as e:
+            raise SystemExit(f'--box-corrupt {args.box_corrupt!r}: {e}')
+        if not args.detector:
+            raise SystemExit('--box-corrupt breaks DETECTOR boxes; without --detector there are '
+                             'none (--boxes and the labels give points, not boxes).')
+        print(f'*** DIAGNOSTIC: the detector boxes are deliberately corrupted '
+              f'({args.box_corrupt}). Not a deployment number. ***')
+
     if args.refine_px is not None:
         if args.refine is False:
             raise SystemExit('--refine-px sets the resolution of --refine\'s FIRST pass, and '
@@ -229,7 +241,8 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         crop_inflate=crop_inflate,
         prefetch_windows=args.prefetch_windows,
         capture_window_predictions=bool(args.window_predictions),
-        refine_all_cams=bool(args.refine_all_cams))
+        refine_all_cams=bool(args.refine_all_cams),
+        box_corrupt=getattr(args, 'box_corrupt', None) or None)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

@@ -578,3 +578,23 @@ def test_vis_gate_is_per_camera_and_drops_3d_only_when_every_camera_is_gated():
     assert drop.tolist() == [False, True]
     drop, cam_drop = vis_gate(None, np.array([[1.0, 1.0], [-1.0, -1.0]]), 0.0)
     assert cam_drop is None and drop.tolist() == [False, True]
+
+
+def test_box_corrupt_zero_is_byte_identical_and_one_drops_every_box(mv):
+    """`--box-corrupt` at probability 0 changes nothing; `drop:1` leaves no camera to crop."""
+    model, sess, registry, name = mv
+    C = len(sess.rig)
+    boxes = np.zeros((2, 4, C, 4), np.float32)
+    boxes[0, ..., :] = [2, 2, 40, 40]
+    boxes[1, ..., :] = [20, 20, 60, 60]
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=2)
+    torch.manual_seed(0)
+    base = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    torch.manual_seed(0)
+    zero = run_group(model, sess, 'g000', registry, name,
+                     _infer_cfg(anchor='carry', refine=True,
+                                box_corrupt='drop:0,shift:0:1,shrink:0:0.5,swap:0'), **kw)
+    _assert_same(base, zero, ' (box_corrupt at p=0)')
+    dropped = run_group(model, sess, 'g000', registry, name,
+                        _infer_cfg(anchor='carry', refine=True, box_corrupt='drop:1'), **kw)
+    assert not np.isfinite(dropped['pred']).any()

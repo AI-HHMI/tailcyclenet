@@ -112,3 +112,102 @@ def corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales=None):
     v = rng.normal(size=p.shape[-1])
     v = v / max(float(np.linalg.norm(v)), 1e-9)
     return p + torch.as_tensor(float(amt) * width * v, dtype=p.dtype), 0
+
+
+BOX_CORRUPTIONS = ('drop', 'shift', 'shrink', 'swap')
+
+
+def parse_box_corrupt(spec):
+    """`--box-corrupt SPEC` -> a tuple of (kind, p, amount); raises ValueError naming the fault.
+
+    SPEC is comma-joined `drop:<p>`, `shift:<p>:<sides>`, `shrink:<p>:<f>`, `swap:<p>`; p is the
+    per-(animal, window, camera) probability, applied in the order written.
+    """
+    out = []
+    for part in str(spec).split(','):
+        bits = part.strip().split(':')
+        kind = bits[0]
+        if kind not in BOX_CORRUPTIONS:
+            raise ValueError(f'{part!r}: kind must be one of {BOX_CORRUPTIONS}')
+        want = 3 if kind in ('shift', 'shrink') else 2
+        if len(bits) != want:
+            raise ValueError(f'{part!r}: {kind} takes {want - 1} number(s), e.g. '
+                             + {'drop': 'drop:0.25', 'swap': 'swap:0.25',
+                                'shift': 'shift:0.25:0.5', 'shrink': 'shrink:0.25:0.6'}[kind])
+        p = float(bits[1])
+        amt = float(bits[2]) if want == 3 else None
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f'{part!r}: probability {p} is not in [0, 1]')
+        if kind == 'shrink' and not 0.0 < amt < 1.0:
+            raise ValueError(f'{part!r}: the shrink factor must be in (0, 1)')
+        if kind == 'shift' and amt < 0:
+            raise ValueError(f'{part!r}: the shift is a distance in box sides, >= 0')
+        out.append((kind, p, amt))
+    return tuple(out)
+
+
+def _union(v):
+    """The union xyxy of a (T,4) box stack over its finite rows, or None."""
+    v = v[np.isfinite(v).all(-1)]
+    if not len(v):
+        return None
+    return np.array([v[:, 0].min(), v[:, 1].min(), v[:, 2].max(), v[:, 3].max()], np.float64)
+
+
+def corrupt_boxes(bb, specs, gid, start, seed=0):
+    """`--box-corrupt`: one window's detector boxes, broken on purpose. A diagnostic, never a
+    deployment arm.
+
+    Inputs: bb -- (S,T,C,4) the window's per-frame boxes (not modified); specs --
+        `parse_box_corrupt`'s tuple; gid / start -- the group and the window's first SOURCE
+        frame, which with (animal, camera) seed the draw.
+    Outputs: a corrupted (S,T,C,4) float32 copy.
+
+    One draw per (animal, window, camera) and spec, from a generator seeded on those indices, so
+    the result is deterministic given the flag and independent of prefetch order or block
+    partition. Every spec draws its numbers whether or not it fires, so adding a spec never
+    moves another's stream. `shift` moves every frame's box by `sides` x the window union's mean
+    side in one random direction; `shrink` scales each frame's box about its own centre; `swap`
+    takes the nearest OTHER row's boxes in that camera (union-centre distance, uncorrupted
+    boxes), and is a no-op where no other row has one.
+    """
+    import zlib
+
+    bb = np.asarray(bb, np.float32)
+    out = bb.copy()
+    S, _, C, _ = bb.shape
+    g = zlib.crc32(str(gid).encode())
+    for a in range(S):
+        for c in range(C):
+            rng = np.random.default_rng([int(seed), g, int(start), a, c])
+            for kind, p, amt in specs:
+                u, ang = rng.random(), rng.random() * 2 * np.pi
+                if u >= p:
+                    continue
+                v = out[a, :, c]
+                un = _union(v)
+                if un is None:
+                    continue
+                if kind == 'drop':
+                    out[a, :, c] = np.nan
+                elif kind == 'shift':
+                    side = 0.5 * ((un[2] - un[0]) + (un[3] - un[1]))
+                    dx, dy = amt * side * np.cos(ang), amt * side * np.sin(ang)
+                    out[a, :, c] = v + np.array([dx, dy, dx, dy], np.float32)
+                elif kind == 'shrink':
+                    cx, cy = (v[:, 0] + v[:, 2]) / 2, (v[:, 1] + v[:, 3]) / 2
+                    hw, hh = (v[:, 2] - v[:, 0]) * amt / 2, (v[:, 3] - v[:, 1]) * amt / 2
+                    out[a, :, c] = np.stack([cx - hw, cy - hh, cx + hw, cy + hh], -1)
+                else:
+                    ca = np.array([(un[0] + un[2]) / 2, (un[1] + un[3]) / 2])
+                    best, bd = None, None
+                    for b in range(S):
+                        ub = _union(bb[b, :, c]) if b != a else None
+                        if ub is None:
+                            continue
+                        d = float(np.hypot((ub[0] + ub[2]) / 2 - ca[0], (ub[1] + ub[3]) / 2 - ca[1]))
+                        if bd is None or d < bd:
+                            best, bd = b, d
+                    if best is not None:
+                        out[a, :, c] = bb[best, :, c]
+    return out

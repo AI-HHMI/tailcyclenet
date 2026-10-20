@@ -25,6 +25,7 @@ from ..format import Labels, Session
 from ..pose.model import share_scene
 from .crops import (boxes_from_points, crop_views, fill_box_agreement, overlaps,
                     refine_every_camera, to_device)
+from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
 from .traces import (FRAME_KEYS, WINDOW_KEYS, capture_model_confidence,
@@ -122,6 +123,9 @@ class InferConfig:
     # camera with no pass-1 box is added when the pose reprojects into its frame). False is the
     # shipped all-or-nothing refine over the pass-1 cameras only.
     refine_all_cams: bool = False
+    # DIAGNOSTIC (`--box-corrupt`): break the detector's boxes per (animal, window, camera)
+    # before cropping, for measuring the robustness levers. None -> the boxes as detected.
+    box_corrupt: str | None = None
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -297,7 +301,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     window wi+1 while wi forwards, bounded by `cfg.prefetch_windows` -- bit-exact, only
     wall-clock overlap is new. The store is evicted by window position, not LRU; `memory.trim()`
     runs at window boundaries (peak checked at block boundaries; warns once, never kills).
-    Telemetry goes in `stats`, never the block dict. In the yielded dict, `n_frames` is a COUNT,
+    Telemetry goes in `stats`, never the block dict. `--box-corrupt` keeps each in-flight
+    window's corrupted boxes in `corrupted[wi]` (written by `_build_plans`, possibly on the
+    prefetch thread; read by the box prompt; popped in window order). In the yielded dict, `n_frames` is a COUNT,
     not the stop index, and `refine` is the resolved value.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
@@ -342,6 +348,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
     carried = [None] * S
     window_records = []
+    box_specs = parse_box_corrupt(cfg.box_corrupt) if cfg.box_corrupt else ()
+    corrupted = {}
     cam_sizes = [session.rig.size(session.cam_names[ci]) for ci in cam_ix]
     starts, blocks, cam_decode, _pipeline_det = _plan_windows(
         session.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, T_total, frame_start)
@@ -391,10 +399,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         wl = wi - w0
         window_cams = session.cgroup(gid, frames)
         plans = []
+        win_boxes = None
+        if boxes_stc is not None:
+            win_boxes = boxes_stc[:, fl]
+            if box_specs:
+                win_boxes = corrupt_boxes(win_boxes, box_specs, gid, int(frames[0]))
+                corrupted[wi] = win_boxes
         for a in range(S):
             bb = None
             if boxes_stc is not None:
-                bb = boxes_stc[a][fl]
+                bb = win_boxes[a]
                 if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
                     continue
             elif inst_boxes is not None and a < len(inst_boxes):
@@ -558,6 +572,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 elif boxes_stc is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
+                elif wi in corrupted:
+                    box_t = deploy_box_prompt(mode, None, corrupted[wi], np.arange(len(frames)),
+                                              a, use, boxes, scales, cgroup, dev)
                 else:
                     box_t = deploy_box_prompt(mode, None, boxes_stc, frames - f0,
                                               a, use, boxes, scales, cgroup, dev)
@@ -926,6 +943,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 if _prefetch_pool is not None and nxt < w1 and nxt not in pending:
                     pending[nxt] = _prefetch_pool.submit(_prepare, nxt, starts[nxt])
                 _process_window(wi, frames, window_cams, plans, crops)
+                corrupted.pop(wi, None)
                 owner_window[frames - f0] = wi
                 if wi + 1 < w1:
                     store.evict_below(int(starts[max(w0, wi - n_ahead + 1)]))

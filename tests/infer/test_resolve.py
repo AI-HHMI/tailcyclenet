@@ -26,3 +26,21 @@ def test_the_run_configs_data_block_reaches_the_infer_config():
     cfg = _resolve({})
     assert (cfg.n_frames, cfg.image_size, cfg.min_crop_dim, cfg.box_source) == \
         (d.n_frames, d.image_size, d.min_crop_dim, d.box_source)
+
+
+def test_box_corrupt_needs_a_detector_and_a_valid_spec():
+    """`--box-corrupt` breaks detector boxes: refused without --detector or with a bad spec."""
+    import pytest
+    from tailcyclenet.infer.resolve import refuse_before_load
+    for argv, needle in ((['--box-corrupt', 'drop:0.2'], 'without --detector'),
+                         (['--box-corrupt', 'blur:0.2', '--detector', 'x'], 'kind must be')):
+        args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o', *argv])
+        with pytest.raises(SystemExit, match=needle):
+            refuse_before_load(args)
+    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o', '--detector',
+                                      'x', '--box-corrupt', 'swap:0.25'])
+    refuse_before_load(args)
+    config = {'data': {}, 'model': {'box_prompt': 'none'}}
+    frames, px = trained_window(args, config)
+    assert infer_config(args, config, SimpleNamespace(mode='3d'), frames, px,
+                        'cpu').box_corrupt == 'swap:0.25'

@@ -108,6 +108,7 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
             'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
             'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
             'refine_all_cams': bool(cfg.refine_all_cams),
+            'box_corrupt': str(cfg.box_corrupt or ''),
             'precision': precision, 'camera_batch': bool(camera_batch),
             'boxes': (str(args.detector) if args.detector else
                       (str(args.boxes) if args.boxes else 'labels')),

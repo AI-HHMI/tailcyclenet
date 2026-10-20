@@ -160,7 +160,7 @@ class CrossViewTracker:
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
                  duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0,
                  max_res_sides=None, score_order=False, age_decay=None, affinity_2d=0.0,
-                 camera_claims=False, fast=False, random_drop=0.0):
+                 camera_claims=False, fast=True, random_drop=0.0):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).

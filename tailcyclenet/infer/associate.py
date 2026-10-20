@@ -120,7 +120,7 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px, sides=None
 
 
 def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
-              max_res_sides=None, scores_per_cam=None, score_order=False, fast=False,
+              max_res_sides=None, scores_per_cam=None, score_order=False, fast=True,
               random_drop=None):
     """Group boxes across cameras into 3D instances.
 
@@ -329,7 +329,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0,
                     assoc_res_max_sides=None, assoc_score_order=False,
                     track_age_decay=None, track_affinity_2d=0.0, track_camera_claims=False,
-                    assoc_fast=False, assoc_random_drop=0.0):
+                    assoc_fast=True, assoc_random_drop=0.0):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:

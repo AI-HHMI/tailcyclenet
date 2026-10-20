@@ -267,12 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help='autocast dtype for the scene encode only.')
     spd.add_argument('--camera-batch', action=argparse.BooleanOptionalAction, default=True,
                      help='encode all cameras in one scene-encoder call per window.')
-    spd.add_argument('--assoc-fast', action=argparse.BooleanOptionalAction, default=False,
+    spd.add_argument('--assoc-fast', action=argparse.BooleanOptionalAction, default=True,
                      help='TR7: cross-view association with cached rays/projections and pairs '
                           'that fail their own residual gate dropped before support counting; '
-                          'meant to give the identical groups. Default: off (reference loop). '
+                          'identical groups. Default: on (owner, 2026-10-19); --no-assoc-fast is the reference loop. '
                           'measured: byte-identical on 3dpop Seq59 and Seq29 (all six tables), '
-                          'association 1.9x, wall -36%% on Seq29 (2026-10-19).')
+                          'association 1.9x, wall -36%% on Seq29; byte-identical on allen-mouse-tracked (golden) (2026-10-19).')
     spd.add_argument('--kpt-chunk', type=int, default=0,
                      help='decode keypoints in slices of this size (lower peak memory); 0 = one '
                           'pass.')

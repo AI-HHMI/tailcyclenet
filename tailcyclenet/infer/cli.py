@@ -162,6 +162,9 @@ def build_parser() -> argparse.ArgumentParser:
                           'also cropped from the consensus pose. Default: off. measured (3dpop, '
                           'one lever vs base, --box-corrupt swap:0.25): MOTA Seq29 0.783->0.836, '
                           'P02 Seq41 0.633->0.704, Seq59 0.852->0.856, MPJPE -3..-16 mm; '
+                          'full 3dpop test (residual-only, L4): clean counts identical to base, '
+                          'swap:0.25 MOTA 0.739->0.788, drop:0.25 inert; with R4 on, R1 adds '
+                          'nothing (swap 0.847 R4 vs 0.837 R1+R4); '
                           'clean boxes: metrics unchanged; allen mouse1: the vis test flags nearly '
                           'every camera at pass-1 resolution (2026-10-20).')
     win.add_argument('--refine-consensus-res', type=float, default=0.5, metavar='SIDES',
@@ -180,12 +183,13 @@ def build_parser() -> argparse.ArgumentParser:
                           'into it, is cropped for pass 1 from that carried pose. Only with a '
                           'fresh carry and at least one camera agreeing with it; under '
                           '--refine-consensus such a camera that fails the test is dropped; '
-                          'stands down on a duplicate carry (--refine-carry-dup-radius). '
-                          'Default: off. measured with the gate (3dpop screens): swap:0.25 MOTA '
-                          'P02 Seq41 0.633->0.874, Seq59 0.852->0.876, Seq29 0.783->0.852; '
-                          'drop:0.25 Seq59 0.870->0.922, Seq29 0.852->0.919; clean boxes '
-                          'metric-identical on Seq59/Seq29/P02 Seq41 (ungated: Seq29 '
-                          '0.920->0.909) (2026-10-20).')
+                          'stands down on a duplicate carry (--refine-carry-dup-radius) and keeps '
+                          'the box where the carried crop is off in scale (--refine-carry-scale-max). '
+                          'Default: off. measured with both gates (3dpop test, 58 sessions / 145 '
+                          'units, L4): clean boxes MOTA 0.9058->0.9058 (miss/fp/idsw identical, '
+                          'MPJPE -0.004 mm); drop:0.25 MOTA 0.847->0.902 (+0.065 [+0.049, '
+                          '+0.089]), MPJPE -6.8 mm; swap:0.25 0.739->0.847 (+0.170 [+0.137, '
+                          '+0.207]), MPJPE -9.9 mm (2026-10-21).')
     win.add_argument('--refine-carry-dup-radius', type=float, default=0.75, metavar='SIDES',
                      help='R4 gate: stand down for an animal whose carried pose is within this many '
                           'crop sides of another slot\'s carry in >= 2 cameras (the tracker\'s '

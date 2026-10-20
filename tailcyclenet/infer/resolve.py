@@ -248,7 +248,11 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', 0.0)),
         crop_inflate_adaptive=bool(getattr(args, 'crop_inflate_adaptive', False)),
         crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)),
-        refine_carry_fallback=bool(getattr(args, 'refine_carry_fallback', False)))
+        refine_carry_fallback=bool(getattr(args, 'refine_carry_fallback', False)),
+        refine_carry_dup_radius=float(getattr(args, 'refine_carry_dup_radius', 0.75)))
+    if cfg.refine_carry_dup_radius < 0:
+        raise SystemExit(f'--refine-carry-dup-radius {cfg.refine_carry_dup_radius} is negative; '
+                         '0 turns the duplicate-carry gate off.')
     if cfg.refine_carry_fallback and sess.mode != '3d':
         raise SystemExit('--refine-carry-fallback reprojects a carried 3D pose into each camera; '
                          'this is a 2D run.')

@@ -182,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
                           ' Seq59 0.852->0.870, Seq29 0.783->0.836; drop:0.25 Seq59 '
                           '0.870->0.922; clean boxes Seq29 0.920->0.909 (a regression), Seq59 '
                           '0.9226->0.9225 (2026-10-20).')
+    win.add_argument('--refine-carry-dup-radius', type=float, default=0.75, metavar='SIDES',
+                     help='R4 gate: stand down for an animal whose carried pose is within this many '
+                          'crop sides of another slot\'s carry in >= 2 cameras (the tracker\'s '
+                          'duplicate rule; a duplicate carry is a drifted or ghost row). 0 = the '
+                          'ungated R4. Default 0.75.')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')

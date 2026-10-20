@@ -24,7 +24,7 @@ from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
 from .crops import (adaptive_inflation, box_disagrees, boxes_from_points, camera_consensus,
-                    crop_views, fill_box_agreement, in_frame, overlaps, refine_every_camera,
+                    carry_duplicate, crop_views, fill_box_agreement, in_frame, overlaps, refine_every_camera,
                     to_device, union_box)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
@@ -152,7 +152,11 @@ class InferConfig:
     # before) and only when at least one camera's own box agrees with it (a carry never sustains
     # an animal the detector lost everywhere). Under R1 such a camera that then fails the
     # consensus test is dropped. The carried pose is never a prior beyond what `anchor` gives.
+    # A carry within `refine_carry_dup_radius` crop sides of another slot's fresh carry (the
+    # tracker's duplicate rule, `carry_duplicate`) is a drifted or ghost row and R4 stands down
+    # for that animal; 0 restores the ungated R4.
     refine_carry_fallback: bool = False
+    refine_carry_dup_radius: float = 0.75
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -721,6 +725,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 return plan, {}
             pts = c[0].float()[None].expand(len(frames), -1, -1)
             if pts.shape[-1] != 3:
+                return plan, {}
+            others = [carried[b][0] for b in range(S) if b != a and carried[b] is not None
+                      and int(carried[b][1]) >= int(frames[0])]
+            if carry_duplicate(c[0], others, window_cams, cfg.min_crop_dim,
+                               cfg.refine_carry_dup_radius):
                 return plan, {}
             new, src, agree = {}, {}, 0
             for ci in cam_ix:

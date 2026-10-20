@@ -104,3 +104,24 @@ def test_box_disagrees_is_centre_distance_in_box_sides():
     assert not box_disagrees(box, [10, 0, 20, 10])                 # exactly one side
     assert box_disagrees(box, [11, 0, 21, 10])
     assert not box_disagrees(box, [2, 2, 8, 8])
+
+
+def test_carry_duplicate_is_the_trackers_duplicate_rule_on_carried_poses():
+    """R4's gate: two carries a few units apart are one animal (within 0.75 crop sides in every
+    shared in-frame camera); far apart, out of frame, alone, or with the gate at 0 they are not."""
+    from tailcyclenet.infer.crops import carry_duplicate
+
+    cg = _skew_rig(SKEW_RIG3)
+    pts = torch.tensor([[0.0, 0.0, 0.0], [20.0, 10.0, 5.0], [-15.0, 5.0, 0.0]])
+    near = pts + torch.tensor([1.0, 0.0, 0.0])
+    far = pts + torch.tensor([400.0, 0.0, 0.0])
+    gone = pts + torch.tensor([5000.0, 0.0, 0.0])
+    assert carry_duplicate(pts, [near], cg, 16, 0.75)
+    assert carry_duplicate(pts, [far, near], cg, 16, 0.75)
+    assert not carry_duplicate(pts, [far], cg, 16, 0.75)
+    assert not carry_duplicate(pts, [gone], cg, 16, 0.75)
+    assert not carry_duplicate(pts, [], cg, 16, 0.75)
+    assert not carry_duplicate(pts, [near], cg, 16, 0.0)
+    nanrow = near.clone()
+    nanrow[0] = float('nan')
+    assert carry_duplicate(pts, [nanrow], cg, 16, 0.75), 'a NaN keypoint is ignored, not fatal'

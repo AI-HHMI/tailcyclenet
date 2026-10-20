@@ -75,3 +75,23 @@ def test_refine_carry_fallback_is_3d_only():
         infer_config(args, config, SimpleNamespace(mode='2d'), 4, 64, 'cpu')
     assert infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64,
                         'cpu').refine_carry_fallback
+
+
+def test_refine_carry_dup_radius_resolves_and_refuses_negative():
+    """R4's duplicate gate defaults to the tracker's 0.75 sides; 0 is accepted (ungated R4) and
+    a negative radius is refused by name."""
+    import pytest
+    config = {'data': {}, 'model': {'box_prompt': 'none'}}
+    base = ['--run', 'r', '--data', 'd', '--out', 'o', '--refine-carry-fallback']
+    args = build_parser().parse_args(base)
+    check_frame_range(args)
+    assert infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64,
+                        'cpu').refine_carry_dup_radius == 0.75
+    args = build_parser().parse_args(base + ['--refine-carry-dup-radius', '0'])
+    check_frame_range(args)
+    assert infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64,
+                        'cpu').refine_carry_dup_radius == 0.0
+    args = build_parser().parse_args(base + ['--refine-carry-dup-radius', '-1'])
+    check_frame_range(args)
+    with pytest.raises(SystemExit, match='refine-carry-dup-radius'):
+        infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64, 'cpu')

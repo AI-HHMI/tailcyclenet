@@ -138,6 +138,58 @@ def box_disagrees(box, other, sides=1.0):
     return bool(d > sides * side)
 
 
+def carry_duplicate(points, others, cams, min_crop_dim, radius, min_shared=2):
+    """R4 gate: is a carried 3D pose the same animal as another slot's carried pose?
+
+    Inputs: points -- (K,3) this slot's carried pose; others -- the OTHER slots' fresh carried
+        poses, each (K,3); cams -- the window's camera group; min_crop_dim -- the crop rule's
+        floor; radius -- duplicate radius in crop-box sides (0 turns the gate off).
+    Output: True when, in at least `min_shared` cameras where both poses are in frame, every
+        gap between the two poses' projected centroids is within `radius` sides of the smaller
+        crop box -- the 3D tracker's duplicate rule, in its unit system.
+
+    The carried pose is the slot's own previous answer, so it is evidence about WHERE the slot
+    is only while no other slot claims the same animal. A carry that duplicates another slot's
+    is a drifted or ghost row (Seq29 clean: 10 of R4's 13 windows, carries 1-11 mm apart, while
+    under drop/swap corruption the 5th-percentile gap is 185-430 mm on Seq59/P02 Seq41 and only
+    2-9% of acting windows are duplicates); cropping from it overrides the detector box that
+    would have pulled the row back.
+    """
+    if radius <= 0 or not others:
+        return False
+    pts = torch.as_tensor(points, dtype=torch.float32)
+
+    def per_cam(p):
+        """{camera: (projected centroid, crop-box mean side)} for the cameras `p` is in."""
+        out = {}
+        p = p[torch.isfinite(p).all(-1)]
+        if not len(p):
+            return out
+        cen = p.mean(0).reshape(1, 1, 3)
+        for ci, cam in enumerate(cams):
+            if not in_frame(p[None], cam):
+                continue
+            cg, bx = cropmod.crop_to_points_3d([cam], p[None], min_crop_dim)
+            if cg is None:
+                continue
+            b = np.asarray(bx[0], np.float64)
+            uv = project_points_torch([cam], cen)[0].reshape(-1, 2).mean(0).numpy()
+            out[ci] = (uv, 0.5 * ((b[2] - b[0]) + (b[3] - b[1])))
+        return out
+
+    mine = per_cam(pts)
+    for o in others:
+        theirs = per_cam(torch.as_tensor(o, dtype=torch.float32))
+        shared = sorted(set(mine) & set(theirs))
+        if len(shared) < min_shared:
+            continue
+        gaps = [float(np.linalg.norm(mine[c][0] - theirs[c][0]))
+                / max(min(mine[c][1], theirs[c][1]), 1e-6) for c in shared]
+        if max(gaps) <= radius:
+            return True
+    return False
+
+
 def in_frame(points, cam, min_inside=0.5):
     """Does a 3D pose reproject into `cam`'s image? At least `min_inside` of its finite projected
     points must land inside; no finite point is not in frame."""

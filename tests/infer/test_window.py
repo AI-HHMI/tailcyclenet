@@ -791,3 +791,26 @@ def test_a_carry_sourced_camera_that_fails_the_consensus_is_dropped(mv16, monkey
     assert hit.any()
     assert (out['refine_outlier'][0, hit, 2] == 2).all()
     assert not np.isfinite(out['crop_refined'][0, hit, 2]).any()
+
+
+def test_refine_carry_fallback_stands_down_on_a_duplicate_carry(mv16, monkeypatch):
+    """R4's duplicate gate: two rows on the same boxes carry the same pose, so neither may crop
+    its box-less camera from the carry (byte-identical to R4 off); radius 0 is the ungated R4,
+    which does."""
+    from tailcyclenet.infer import window as wmod
+    model, sess, registry, name = mv16
+    boxes = _whole_frame_boxes(sess, S=2, T=sess.groups['g000'].n_frames)
+    boxes[:, :, 2] = np.nan
+    monkeypatch.setattr(wmod, 'in_frame', lambda *a, **k: True)
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=2)
+    torch.manual_seed(0)
+    off = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    torch.manual_seed(0)
+    gated = run_group(model, sess, 'g000', registry, name,
+                      _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True), **kw)
+    assert (gated.pop('carry_crop') == 0).all()
+    _assert_same(off, gated, ' (R4, duplicate carries)')
+    ungated = run_group(model, sess, 'g000', registry, name,
+                        _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True,
+                                   refine_carry_dup_radius=0.0), **kw)
+    assert (ungated['carry_crop'][:, 1:, 2] == 2).any()

@@ -242,15 +242,16 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         prefetch_windows=args.prefetch_windows,
         capture_window_predictions=bool(args.window_predictions),
         refine_all_cams=bool(args.refine_all_cams),
-        box_corrupt=getattr(args, 'box_corrupt', None) or None,
-        refine_consensus=bool(getattr(args, 'refine_consensus', False)),
-        refine_consensus_res=float(getattr(args, 'refine_consensus_res', 0.5)),
-        refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', float('-inf'))),
-        crop_inflate_adaptive=bool(getattr(args, 'crop_inflate_adaptive', False)),
-        crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)),
-        refine_carry_fallback=bool(getattr(args, 'refine_carry_fallback', False)),
-        refine_carry_dup_radius=float(getattr(args, 'refine_carry_dup_radius', 0.75)),
-        refine_carry_scale_max=float(getattr(args, 'refine_carry_scale_max', 2.0)))
+        box_corrupt=args.box_corrupt or None,
+        refine_consensus=bool(args.refine_consensus),
+        refine_consensus_res=float(args.refine_consensus_res),
+        refine_consensus_vis=float(args.refine_consensus_vis),
+        crop_inflate_adaptive=bool(args.crop_inflate_adaptive),
+        crop_inflate_max=float(args.crop_inflate_max),
+        refine_carry_fallback=(sess.mode == '3d' if args.refine_carry_fallback is None
+                               else bool(args.refine_carry_fallback)),
+        refine_carry_dup_radius=float(args.refine_carry_dup_radius),
+        refine_carry_scale_max=float(args.refine_carry_scale_max))
     if cfg.refine_carry_scale_max != 0 and cfg.refine_carry_scale_max < 1:
         raise SystemExit(f'--refine-carry-scale-max {cfg.refine_carry_scale_max} is below 1; it is '
                          'a factor either way (0 turns the scale gate off).')

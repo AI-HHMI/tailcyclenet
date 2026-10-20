@@ -177,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
                           'camera-windows; residual-only matches the 0.0 test on 3dpop and is '
                           'byte-identical to base on mouse1 (2026-10-20).')
     win.add_argument('--refine-carry-fallback', action=argparse.BooleanOptionalAction,
-                     default=False,
+                     default=None,
                      help='R4, 3D: a camera with no box this window, or whose crop centre is more '
                           'than one crop side from the crop rule on the carried pose reprojected '
                           'into it, is cropped for pass 1 from that carried pose. Only with a '
@@ -185,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
                           '--refine-consensus such a camera that fails the test is dropped; '
                           'stands down on a duplicate carry (--refine-carry-dup-radius) and keeps '
                           'the box where the carried crop is off in scale (--refine-carry-scale-max). '
-                          'Default: off. measured with both gates (3dpop test, 58 sessions / 145 '
+                          'Default: ON in 3D (owner, 2026-10-21), off in 2D; --no-refine-carry-fallback restores the old crops. measured with both gates (3dpop test, 58 sessions / 145 '
                           'units, L4): clean boxes MOTA 0.9058->0.9058 (miss/fp/idsw identical, '
                           'MPJPE -0.004 mm); drop:0.25 MOTA 0.847->0.902 (+0.065 [+0.049, '
                           '+0.089]), MPJPE -6.8 mm; swap:0.25 0.739->0.847 (+0.170 [+0.137, '

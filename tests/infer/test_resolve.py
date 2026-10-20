@@ -44,3 +44,21 @@ def test_box_corrupt_needs_a_detector_and_a_valid_spec():
     frames, px = trained_window(args, config)
     assert infer_config(args, config, SimpleNamespace(mode='3d'), frames, px,
                         'cpu').box_corrupt == 'swap:0.25'
+
+
+def test_refine_consensus_needs_3d_and_refine():
+    """R1 compares pass 1's cameras: refused in 2D and under --no-refine, resolved in 3D."""
+    import pytest
+    config = {'data': {}, 'model': {'box_prompt': 'none'}}
+    for mode, extra in (('2d', []), ('3d', ['--no-refine'])):
+        args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o',
+                                          '--refine-consensus', *extra])
+        check_frame_range(args)
+        with pytest.raises(SystemExit, match='refine-consensus'):
+            infer_config(args, config, SimpleNamespace(mode=mode), 4, 64, 'cpu')
+    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o',
+                                      '--refine-consensus', '--refine-consensus-res', '0.3'])
+    check_frame_range(args)
+    cfg = infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64, 'cpu')
+    assert (cfg.refine_consensus, cfg.refine_consensus_res, cfg.refine_consensus_vis) == \
+        (True, 0.3, 0.0)

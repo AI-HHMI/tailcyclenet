@@ -148,6 +148,18 @@ def build_parser() -> argparse.ArgumentParser:
                           ' reprojects into its frame). Default: off (all-or-nothing over the '
                           'pass-1 cameras). measured: 3dpop Seq59 coverage/MPJPE unchanged, '
                           'idsw 13->20; byte-identical on Seq29 and a 2-bird clip (2026-10-19).')
+    win.add_argument('--refine-consensus', action=argparse.BooleanOptionalAction, default=False,
+                     help='R1, 3D --refine: after pass 1, a camera whose own 2D head disagrees with '
+                          'the fused pose (median reprojection residual > --refine-consensus-res '
+                          'box sides) or whose median vis_pred_2d logit is < '
+                          '--refine-consensus-vis is an outlier; with >= 2 cameras left, pass 1 '
+                          're-runs without it and pass 2 crops every camera (the outlier too, if '
+                          'in frame) from that consensus pose. Never acts with < 3 pass-1 '
+                          'cameras. Default: off.')
+    win.add_argument('--refine-consensus-res', type=float, default=0.5, metavar='SIDES',
+                     help='R1 residual threshold in crop-box sides (default 0.5).')
+    win.add_argument('--refine-consensus-vis', type=float, default=0.0, metavar='LOGIT',
+                     help='R1 visibility threshold, median vis_pred_2d logit (default 0.0).')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')

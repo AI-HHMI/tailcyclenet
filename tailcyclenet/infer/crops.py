@@ -98,13 +98,65 @@ def prior_to_model_frame(p, mode, boxes, scales):
     return p
 
 
-def refine_every_camera(points, use, boxes, cam_ix, window_cams, min_crop_dim, min_inside=0.5):
+def in_frame(points, cam, min_inside=0.5):
+    """Does a 3D pose reproject into `cam`'s image? At least `min_inside` of its finite projected
+    points must land inside; no finite point is not in frame."""
+    uv = project_points_torch([cam], points)[0].reshape(-1, 2)
+    uv = uv[torch.isfinite(uv).all(-1)]
+    w, h = (float(x) for x in cam['size'])
+    inside = ((uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h))
+    return bool(len(uv)) and float(inside.float().mean()) >= min_inside
+
+
+def camera_consensus(points, p2, v2, use, boxes, window_cams, res_max, vis_min):
+    """R1: which pass-1 cameras disagree with the pose the cameras made together.
+
+    Inputs: points -- (T,K,3) pass-1 world pose; p2 -- (C_use,T,K,2) each camera's own 2D head
+        in SOURCE pixels; v2 -- (C_use,T,K) per-camera visibility logits or None; use / boxes --
+        pass 1's cameras and crop boxes; res_max -- residual threshold in box sides; vis_min --
+        visibility-logit threshold.
+    Outputs: (res, vis, outlier), each (C_use,). `res` is the median over finite (frame, keypoint)
+        of |project(points) - p2| in units of that camera's crop-box side; `vis` the median of
+        its logits. A camera is an outlier when res > res_max or vis < vis_min; an unassessable
+        statistic (NaN) never makes one, so a camera with nothing finite is left alone.
+
+    A wrong-animal or truncated crop shows up here as a camera whose own 2D head describes a
+    different body than the fused pose: the other cameras outvote it in the triangulation, so its
+    residual is large, or its 2D head says the animal it was asked for is not there.
+    """
+    n = len(use)
+    res = np.full(n, np.nan)
+    vis = np.full(n, np.nan)
+    for i, ci in enumerate(use):
+        b = np.asarray(boxes[i], np.float64)
+        side = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
+        if p2 is not None and side > 0:
+            q = project_points_torch([window_cams[ci]],
+                                     torch.as_tensor(points, dtype=torch.float32))[0].numpy()
+            d = np.linalg.norm(q - np.asarray(p2[i], np.float64), axis=-1)
+            d = d[np.isfinite(d)]
+            if len(d):
+                res[i] = float(np.median(d)) / side
+        if v2 is not None:
+            v = np.asarray(v2[i], np.float64)
+            v = v[np.isfinite(v)]
+            if len(v):
+                vis[i] = float(np.median(v))
+    with np.errstate(invalid='ignore'):
+        outlier = (res > res_max) | (vis < vis_min)
+    return res, vis, outlier
+
+
+def refine_every_camera(points, use, boxes, cam_ix, window_cams, min_crop_dim, min_inside=0.5,
+                        outliers=()):
     """TR1: pass-2 crops for EVERY calibrated camera from pass 1's 3D pose, tested per camera.
 
     Inputs: points -- (T,K,3) pass-1 world pose; use / boxes -- pass 1's cameras and crop
         boxes; cam_ix -- every camera index; window_cams -- the window's camera group;
         min_crop_dim -- the crop rule's floor; min_inside -- fraction of the finite projected
         points that must land inside the image for a camera pass 1 did not use.
+        outliers -- pass-1 cameras `camera_consensus` rejected (R1): their pass-1 box is not
+            evidence, so they take the in-frame test a camera without a pass-1 box takes.
     Outputs: (use2, boxes2, cgroup2) in `cam_ix` order, cropped but not resized; empty lists
         when no camera survives (the caller keeps pass 1's plan).
 
@@ -121,16 +173,11 @@ def refine_every_camera(points, use, boxes, cam_ix, window_cams, min_crop_dim, m
         cg, bx = cropmod.crop_to_points_3d([cam], points, min_crop_dim)
         if cg is None:
             continue
-        if ci in use:
+        if ci in use and ci not in outliers:
             if not overlaps(bx[0], boxes[use.index(ci)]):
                 continue
-        else:
-            uv = project_points_torch([cam], points)[0].reshape(-1, 2)
-            uv = uv[torch.isfinite(uv).all(-1)]
-            w, h = (float(x) for x in cam['size'])
-            inside = ((uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h))
-            if not len(uv) or float(inside.float().mean()) < min_inside:
-                continue
+        elif not in_frame(points, cam, min_inside):
+            continue
         use2.append(ci)
         boxes2.append(bx[0])
         cg2.append(cg[0])

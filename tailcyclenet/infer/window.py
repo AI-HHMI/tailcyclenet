@@ -23,8 +23,8 @@ from ..data.camera import resize_camera
 from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
-from .crops import (boxes_from_points, crop_views, fill_box_agreement, overlaps,
-                    refine_every_camera, to_device)
+from .crops import (boxes_from_points, camera_consensus, crop_views, fill_box_agreement,
+                    overlaps, refine_every_camera, to_device)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
@@ -126,6 +126,15 @@ class InferConfig:
     # DIAGNOSTIC (`--box-corrupt`): break the detector's boxes per (animal, window, camera)
     # before cropping, for measuring the robustness levers. None -> the boxes as detected.
     box_corrupt: str | None = None
+    # R1 (3D, --refine): after pass 1, a camera whose own 2D head disagrees with the fused pose
+    # (median reprojection residual > `refine_consensus_res` box sides) or calls the animal
+    # unseen (median `vis_pred_2d` logit < `refine_consensus_vis`) is an outlier; when one is
+    # found and >= 2 cameras remain, pass 1 re-runs without it and pass 2 crops EVERY pass-1
+    # camera (outliers included, if the consensus pose is in frame) from that consensus pose.
+    # False is the shipped refine.
+    refine_consensus: bool = False
+    refine_consensus_res: float = 0.5
+    refine_consensus_vis: float = 0.0
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -356,7 +365,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     store = FrameStore(group, session.cam_names)
 
     f0, w0 = 0, 0
-    pred = conf = box_agree = outcome = crop = crop_refined = box_cams = None
+    pred = conf = box_agree = outcome = crop = crop_refined = box_cams = refine_outlier = None
     pred2d = conf2d = None
     boxes_stc = None
     _boxes_from = ('detector' if boxes_for is not None else
@@ -507,9 +516,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
-    def forward(frames, plan, crops, wi, *, score_quality=False, trace=True):
+    def forward(frames, plan, crops, wi, *, score_quality=False, trace=True, prompt_off=()):
         """One animal, one window -> its prediction in the SOURCE frame, or None.
 
+        `prompt_off` names cameras whose box-prompt column is withheld (NaN, the learned no-box
+        token): a camera R1 re-cropped away from its detector box must not be told that box.
         `trace` gates the overlap-trace probes (`prior_oob`, `model_conf`); `--refine`'s pass 1
         passes False so each (animal, window) is recorded once, from the pass it reports.
 
@@ -578,6 +589,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 else:
                     box_t = deploy_box_prompt(mode, None, boxes_stc, frames - f0,
                                               a, use, boxes, scales, cgroup, dev)
+            if box_t is not None and prompt_off:
+                box_t = box_t.clone()
+                for i, ci in enumerate(use):
+                    if ci in prompt_off:
+                        box_t[:, :, i] = float('nan')
             if box_t is not None:
                 mkw['box_prompt'] = box_t
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
@@ -659,6 +675,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         way or `points2d.pq` would disagree with what `pred` reports; 3D leaves its per-camera
         overlay untouched, a diagnostic rather than the primary output.
         """
+        no_prompt = {}
         if cfg.refine:
             def _at_image_size(plan):
                 """The same plan with pass 1 rebuilt at full `image_size` (a no-op when it
@@ -673,6 +690,53 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     sc.append(s)
                 return WindowPlan(a, use, boxes, cg, sc, uncropped)
 
+            def _resized(a, use2, b2, cg2):
+                """A pass-2 plan at full `image_size` from cropped cameras; records the boxes."""
+                uncropped2, sc2 = list(cg2), []
+                for i, cam in enumerate(cg2):
+                    cg2[i], s = resize_camera(cam, cfg.image_size)
+                    sc2.append(s)
+                for i, ci in enumerate(use2):
+                    crop_refined[a, wi - w0, ci] = np.asarray(b2[i], np.float32)
+                return WindowPlan(a, use2, b2, cg2, sc2, uncropped2)
+
+            def _consensus(plan, got):
+                """R1 for one animal: None when no pass-1 camera is an outlier (or fewer than two
+                would remain), so the caller runs the shipped refine untouched; else the pass-2
+                plan cropped from the consensus pose (`refine_outlier`: 0 inlier, 1 outlier
+                re-cropped, 2 outlier dropped, 3 outlier left alone for want of inliers)."""
+                a, use, boxes, cgroup, scales, uncropped = plan
+                _, _, bad = camera_consensus(got[0], got[3], got[4], use, boxes, window_cams,
+                                             cfg.refine_consensus_res, cfg.refine_consensus_vis)
+                for i, ci in enumerate(use):
+                    refine_outlier[a, wi - w0, ci] = int(bad[i])
+                if not bad.any():
+                    return None
+                keep = [i for i in range(len(use)) if not bad[i]]
+                if len(keep) < 2:
+                    for i, ci in enumerate(use):
+                        if bad[i]:
+                            refine_outlier[a, wi - w0, ci] = 3
+                    return None
+                sub = WindowPlan(a, [use[i] for i in keep], [boxes[i] for i in keep],
+                                 [cgroup[i] for i in keep], [scales[i] for i in keep],
+                                 [uncropped[i] for i in keep])
+                outl = {use[i] for i in range(len(use)) if bad[i]}
+                no_prompt[a] = outl
+                got_c = forward(frames, sub, crops, wi, trace=False)
+                fallback = sub
+                if got_c is not None:
+                    pts_c = torch.as_tensor(got_c[0], dtype=torch.float32)
+                    cams = cam_ix if cfg.refine_all_cams else use
+                    use2, b2, cg2 = refine_every_camera(pts_c, use, boxes, cams, window_cams,
+                                                        cfg.min_crop_dim, outliers=outl)
+                    if use2:
+                        fallback = None
+                for ci in outl:
+                    refine_outlier[a, wi - w0, ci] = 1 if fallback is None and ci in use2 else 2
+                return _at_image_size(fallback) if fallback is not None else \
+                    _resized(a, use2, b2, cg2)
+
             refined = []
             for plan in plans:
                 a, use, boxes, cgroup, scales, *_ = plan
@@ -681,6 +745,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     refined.append(_at_image_size(plan))
                     continue
                 pts = torch.as_tensor(got[0], dtype=torch.float32)
+                if cfg.refine_consensus and mode == '3d':
+                    new = _consensus(plan, got)
+                    if new is not None:
+                        refined.append(new)
+                        continue
                 if cfg.refine_all_cams and mode == '3d':
                     use2, b2, cg2 = refine_every_camera(pts, use, boxes, cam_ix, window_cams,
                                                         cfg.min_crop_dim)
@@ -716,7 +785,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         for plan in plans:
             a, use, boxes, cgroup, scales, *_ = plan
             got = forward(frames, plan, crops, wi,
-                          score_quality=scorer is not None)
+                          score_quality=scorer is not None, prompt_off=no_prompt.get(a, ()))
             if got is None:
                 continue
             p, q, out, p2, v2, c2, quality_window, precision_window = got
@@ -926,6 +995,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             outcome = np.full((S, n_win), OUTCOMES.index('no box'), np.int8)
             crop = np.full((S, n_win, len(session.rig), 4), np.nan, np.float32)
             crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
+            refine_outlier = (np.full((S, n_win, len(session.rig)), -1, np.int8)
+                              if cfg.refine and cfg.refine_consensus and mode == '3d' else None)
             box_cams = (np.full((S, n_win), -1, np.int8) if cfg.box_prompt != 'none' else None)
 
             window_records = []
@@ -985,6 +1056,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    'frame_start': frame_start, 'frame_stop': T_total,
                    'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
                    **({} if crop_refined is None else {'crop_refined': crop_refined}),
+                   **({} if refine_outlier is None else {'refine_outlier': refine_outlier}),
                    **({} if box_cams is None else {'box_prompt_cams': box_cams}),
                    'boxes_from': _boxes_from}
     finally:

@@ -292,6 +292,9 @@ class SessionWriter:
         for j, q in enumerate(('rx0', 'ry0', 'rx1', 'ry1')):
             rows[q] = (np.full(len(aw), np.nan, np.float32) if rf is None
                        else np.asarray(rf)[..., j].ravel().astype(np.float32))
+        ro = blk.get('refine_outlier')
+        if ro is not None:
+            rows['refine_outlier'] = np.asarray(ro).ravel().astype(np.int32)
         bp = blk.get('box_prompt_cams')
         rows['box_prompt_cams'] = (np.full(len(aw), -1, np.int32) if bp is None
                                    else np.asarray(bp)[aw, ww].astype(np.int32))

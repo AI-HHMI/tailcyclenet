@@ -598,3 +598,69 @@ def test_box_corrupt_zero_is_byte_identical_and_one_drops_every_box(mv):
     dropped = run_group(model, sess, 'g000', registry, name,
                         _infer_cfg(anchor='carry', refine=True, box_corrupt='drop:1'), **kw)
     assert not np.isfinite(dropped['pred']).any()
+
+
+def _whole_frame_boxes(sess, S=1, T=4):
+    """(S,T,C,4) boxes covering every camera's whole frame."""
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((S, T, len(sess.rig), 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h
+    return boxes
+
+
+def _count_forwards(model):
+    """Wrap `model.forward` to count calls; returns (calls list, restore)."""
+    calls, inner = [], model.forward
+
+    def spy(views, *a, **kw):
+        calls.append(len(views))
+        return inner(views, *a, **kw)
+    model.forward = spy
+
+    def restore():
+        model.forward = inner
+    return calls, restore
+
+
+def test_refine_consensus_is_inert_without_an_outlier_and_reruns_without_one(mv, monkeypatch):
+    """R1: no outlier -> byte-identical to the shipped refine (plus the trace); an outlier camera
+    costs exactly one extra pass-1 forward on the inliers, and pass 2 re-crops it from the
+    consensus pose; with fewer than two inliers left the shipped refine runs untouched."""
+    from tailcyclenet.infer import window as wmod
+    model, sess, registry, name = mv
+    boxes = _whole_frame_boxes(sess)
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=1)
+    torch.manual_seed(0)
+    base = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    real = wmod.camera_consensus
+
+    def flag(cams):
+        def fake(points, p2, v2, use, *a):
+            res, vis, _ = real(points, p2, v2, use, *a)
+            return res, vis, np.array([ci in cams for ci in use])
+        return fake
+
+    on = _infer_cfg(anchor='carry', refine=True, refine_consensus=True)
+    monkeypatch.setattr(wmod, 'camera_consensus', flag(()))
+    torch.manual_seed(0)
+    none = run_group(model, sess, 'g000', registry, name, on, **kw)
+    assert (none.pop('refine_outlier') == 0).all()
+    _assert_same(base, none, ' (R1 with no outlier)')
+
+    monkeypatch.setattr(wmod, 'camera_consensus', flag((0, 1)))
+    torch.manual_seed(0)
+    few = run_group(model, sess, 'g000', registry, name, on, **kw)
+    assert set(np.unique(few.pop('refine_outlier')[..., :2])) == {3}
+    _assert_same(base, few, ' (R1 with one inlier)')
+
+    monkeypatch.setattr(wmod, 'camera_consensus', flag((0,)))
+    calls, restore = _count_forwards(model)
+    try:
+        one = run_group(model, sess, 'g000', registry, name, on, **kw)
+    finally:
+        restore()
+    n_win = one['outcome'].shape[1]
+    assert calls.count(2) == n_win, 'one consensus forward per window, on the two inliers'
+    assert len(calls) == 3 * n_win
+    ro = one['refine_outlier'][0]
+    assert set(ro[:, 0]) <= {1, 2} and (ro[:, 1:] == 0).all()

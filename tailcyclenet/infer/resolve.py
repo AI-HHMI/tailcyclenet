@@ -242,7 +242,14 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         prefetch_windows=args.prefetch_windows,
         capture_window_predictions=bool(args.window_predictions),
         refine_all_cams=bool(args.refine_all_cams),
-        box_corrupt=getattr(args, 'box_corrupt', None) or None)
+        box_corrupt=getattr(args, 'box_corrupt', None) or None,
+        refine_consensus=bool(getattr(args, 'refine_consensus', False)),
+        refine_consensus_res=float(getattr(args, 'refine_consensus_res', 0.5)),
+        refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', 0.0)))
+    if cfg.refine_consensus and not (cfg.refine and sess.mode == '3d'):
+        raise SystemExit('--refine-consensus tests pass 1\'s cameras against each other, so it '
+                         'needs 3D and --refine; this run is '
+                         f'{sess.mode}{"" if cfg.refine else " with --no-refine"}.')
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

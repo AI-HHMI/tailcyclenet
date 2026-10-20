@@ -40,3 +40,40 @@ def test_refine_every_camera_keeps_drops_and_adds_per_camera():
     use3, _, _ = refine_every_camera(pts + torch.tensor([5000.0, 0.0, 0.0]), [0], [shipped[0]],
                                      [0, 1, 2], cg, 16)
     assert 1 not in use3 and 2 not in use3
+
+
+def test_camera_consensus_flags_the_disagreeing_camera_and_never_on_nan():
+    """R1: a camera whose 2D head describes another body (residual) or calls the animal unseen
+    (visibility) is an outlier; the others are not; a camera with nothing finite is left alone."""
+    from tracktail.model.cube import project_points_torch
+    from tailcyclenet.infer.crops import camera_consensus
+
+    cg = _skew_rig(SKEW_RIG3)
+    pts = torch.tensor([[[0.0, 0.0, 0.0], [20.0, 10.0, 5.0], [-15.0, 5.0, 0.0]]] * 2)
+    p2 = project_points_torch(cg, pts).numpy().copy()             # (C,T,K,2) agreeing heads
+    p2[1] += 200.0                                                 # camera 1 saw another animal
+    v2 = np.full(p2.shape[:-1], 3.0)
+    v2[2] = -2.0                                                   # camera 2 says "not here"
+    boxes = [torch.tensor([0, 0, 100, 100])] * 3
+    res, vis, bad = camera_consensus(pts, p2, v2, [0, 1, 2], boxes, cg, 0.5, 0.0)
+    assert bad.tolist() == [False, True, True]
+    assert res[0] < 1e-3 and res[1] > 2.0 and vis[2] == -2.0
+    p2[0] = np.nan
+    _, _, bad = camera_consensus(pts, p2, None, [0, 1, 2], boxes, cg, 0.5, 0.0)
+    assert bad.tolist() == [False, True, False]
+
+
+def test_refine_every_camera_recrops_an_outlier_whose_box_was_elsewhere():
+    """R1's recovery: an outlier's pass-1 box is not evidence, so a refined box that misses it is
+    kept when the pose is in frame (the TR1 overlap test would have dropped it)."""
+    from tailcyclenet.data import crop as cropmod
+    from tailcyclenet.infer.crops import refine_every_camera
+
+    cg = _skew_rig(SKEW_RIG3)
+    pts = torch.tensor([[[0.0, 0.0, 0.0], [20.0, 10.0, 5.0], [-15.0, 5.0, 0.0]]] * 2)
+    _, shipped = cropmod.crop_to_points_3d(cg, pts, 16)
+    far = torch.tensor([600, 400, 640, 480], dtype=torch.int32)
+    use, b, _ = refine_every_camera(pts, [0, 1], [shipped[0], far], [0, 1], cg, 16)
+    assert use == [0]
+    use, b, _ = refine_every_camera(pts, [0, 1], [shipped[0], far], [0, 1], cg, 16, outliers={1})
+    assert use == [0, 1] and torch.equal(b[1], shipped[1])

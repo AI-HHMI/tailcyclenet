@@ -14,7 +14,7 @@ import torch
 FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score', 'owner_window', 'triangulated', 'quality', 'quality_precision')
 
 
-WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start', 'window_stop', 'window_ordinal')
+WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'refine_outlier', 'box_prompt_cams', 'window_start', 'window_stop', 'window_ordinal')
 
 
 def capture_overlap_agreement(stats, a, frames, f0, pred, p):

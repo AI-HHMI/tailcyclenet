@@ -154,8 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     win.add_argument('--refine-consensus', action=argparse.BooleanOptionalAction, default=False,
                      help='R1, 3D --refine: after pass 1, a camera whose own 2D head disagrees with '
                           'the fused pose (median reprojection residual > --refine-consensus-res '
-                          'box sides) or whose median vis_pred_2d logit is < '
-                          '--refine-consensus-vis is an outlier; with >= 2 cameras left, pass 1 '
+                          'box sides), or whose median vis_pred_2d logit is < '
+                          '--refine-consensus-vis when that is set, is an outlier; with >= 2 cameras left, pass 1 '
                           're-runs without it and pass 2 crops every camera (the outlier too, if '
                           'in frame) from that consensus pose. Never acts with < 3 pass-1 '
                           'cameras. With --refine-all-cams (R2) a camera with no pass-1 box is '
@@ -166,10 +166,12 @@ def build_parser() -> argparse.ArgumentParser:
                           'every camera at pass-1 resolution (2026-10-20).')
     win.add_argument('--refine-consensus-res', type=float, default=0.5, metavar='SIDES',
                      help='R1 residual threshold in crop-box sides (default 0.5).')
-    win.add_argument('--refine-consensus-vis', type=float, default=0.0, metavar='LOGIT',
-                     help='R1 visibility threshold, median vis_pred_2d logit (default 0.0). '
-                          'measured: not portable -- pass-1 logits are negative on ~all allen '
-                          'mouse1 cameras; =-1e9 (residual only) matches R1 on 3dpop and is '
+    win.add_argument('--refine-consensus-vis', type=float, default=float('-inf'),
+                     metavar='LOGIT',
+                     help='R1 visibility threshold, median vis_pred_2d logit (default -inf = off, '
+                          'residual test only). measured: not portable -- at 0.0 pass-1 logits '
+                          'are negative on ~all allen mouse1 cameras and R1 stands down in 401/434 '
+                          'camera-windows; residual-only matches the 0.0 test on 3dpop and is '
                           'byte-identical to base on mouse1 (2026-10-20).')
     win.add_argument('--refine-carry-fallback', action=argparse.BooleanOptionalAction,
                      default=False,

@@ -133,13 +133,14 @@ class InferConfig:
     box_corrupt: str | None = None
     # R1 (3D, --refine): after pass 1, a camera whose own 2D head disagrees with the fused pose
     # (median reprojection residual > `refine_consensus_res` box sides) or calls the animal
-    # unseen (median `vis_pred_2d` logit < `refine_consensus_vis`) is an outlier; when one is
+    # unseen (median `vis_pred_2d` logit < `refine_consensus_vis`, -inf = residual only, the
+    # default: the logit scale is not portable across roots) is an outlier; when one is
     # found and >= 2 cameras remain, pass 1 re-runs without it and pass 2 crops EVERY pass-1
     # camera (outliers included, if the consensus pose is in frame) from that consensus pose.
     # False is the shipped refine.
     refine_consensus: bool = False
     refine_consensus_res: float = 0.5
-    refine_consensus_vis: float = 0.0
+    refine_consensus_vis: float = float('-inf')
     # R3 (2D and 3D): the pass-1 inflation per (animal, window, camera) is the largest factor in
     # [1, crop_inflate_max] whose inflated box touches no OTHER animal's box in that camera this
     # window; `crop_inflate` where no other animal has one. Needs detector/instances boxes (the

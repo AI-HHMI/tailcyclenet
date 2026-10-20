@@ -245,7 +245,7 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         box_corrupt=getattr(args, 'box_corrupt', None) or None,
         refine_consensus=bool(getattr(args, 'refine_consensus', False)),
         refine_consensus_res=float(getattr(args, 'refine_consensus_res', 0.5)),
-        refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', 0.0)),
+        refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', float('-inf'))),
         crop_inflate_adaptive=bool(getattr(args, 'crop_inflate_adaptive', False)),
         crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)),
         refine_carry_fallback=bool(getattr(args, 'refine_carry_fallback', False)),

@@ -61,7 +61,7 @@ def test_refine_consensus_needs_3d_and_refine():
     check_frame_range(args)
     cfg = infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64, 'cpu')
     assert (cfg.refine_consensus, cfg.refine_consensus_res, cfg.refine_consensus_vis) == \
-        (True, 0.3, 0.0)
+        (True, 0.3, float('-inf'))
 
 
 def test_refine_carry_fallback_is_3d_only():

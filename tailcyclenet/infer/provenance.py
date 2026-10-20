@@ -71,6 +71,15 @@ def identity_provenance(args):
         'identity_bridge': bool(args.identity_bridge),
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
+        'assoc_res_max_sides': (float(args.assoc_res_max_sides)
+                                if args.assoc_res_max_sides is not None else 0.0),
+        'assoc_score_order': bool(args.assoc_score_order),
+        'track_age_decay': (float(args.track_age_decay)
+                            if args.track_age_decay is not None else -1.0),
+        'track_affinity_2d': float(args.track_affinity_2d),
+        'track_camera_claims': bool(args.track_camera_claims),
+        'assoc_fast': bool(args.assoc_fast),
+        'assoc_random_drop': float(args.assoc_random_drop),
     }
 
 
@@ -98,6 +107,7 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
             'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
             'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
             'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
+            'refine_all_cams': bool(cfg.refine_all_cams),
             'precision': precision, 'camera_batch': bool(camera_batch),
             'boxes': (str(args.detector) if args.detector else
                       (str(args.boxes) if args.boxes else 'labels')),

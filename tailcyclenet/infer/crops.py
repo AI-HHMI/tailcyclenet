@@ -96,3 +96,42 @@ def prior_to_model_frame(p, mode, boxes, scales):
     if mode == '2d':
         return (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
     return p
+
+
+def refine_every_camera(points, use, boxes, cam_ix, window_cams, min_crop_dim, min_inside=0.5):
+    """TR1: pass-2 crops for EVERY calibrated camera from pass 1's 3D pose, tested per camera.
+
+    Inputs: points -- (T,K,3) pass-1 world pose; use / boxes -- pass 1's cameras and crop
+        boxes; cam_ix -- every camera index; window_cams -- the window's camera group;
+        min_crop_dim -- the crop rule's floor; min_inside -- fraction of the finite projected
+        points that must land inside the image for a camera pass 1 did not use.
+    Outputs: (use2, boxes2, cgroup2) in `cam_ix` order, cropped but not resized; empty lists
+        when no camera survives (the caller keeps pass 1's plan).
+
+    A pass-1 camera is kept only when its refined box overlaps its pass-1 box (the per-camera
+    form of the all-or-nothing test, so one wrong-animal camera no longer cancels the others).
+    A camera with no pass-1 box is added when the pose reprojects into its frame and the crop
+    rule returns a box. Each camera's box is the crop rule on that camera alone, which is what
+    `crop_to_points_3d` computes per camera, so a kept camera's box is byte-identical to the
+    shipped refine's.
+    """
+    use2, boxes2, cg2 = [], [], []
+    for ci in cam_ix:
+        cam = window_cams[ci]
+        cg, bx = cropmod.crop_to_points_3d([cam], points, min_crop_dim)
+        if cg is None:
+            continue
+        if ci in use:
+            if not overlaps(bx[0], boxes[use.index(ci)]):
+                continue
+        else:
+            uv = project_points_torch([cam], points)[0].reshape(-1, 2)
+            uv = uv[torch.isfinite(uv).all(-1)]
+            w, h = (float(x) for x in cam['size'])
+            inside = ((uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h))
+            if not len(uv) or float(inside.float().mean()) < min_inside:
+                continue
+        use2.append(ci)
+        boxes2.append(bx[0])
+        cg2.append(cg[0])
+    return use2, boxes2, cg2

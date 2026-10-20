@@ -228,7 +228,8 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         box_prompt=box_prompt, box_prompt_first_only=box_prompt_first_only,
         crop_inflate=crop_inflate,
         prefetch_windows=args.prefetch_windows,
-        capture_window_predictions=bool(args.window_predictions))
+        capture_window_predictions=bool(args.window_predictions),
+        refine_all_cams=bool(args.refine_all_cams))
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

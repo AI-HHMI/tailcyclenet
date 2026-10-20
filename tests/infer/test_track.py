@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 
-from tests.helpers import _flat_rig, _lever_boxes
+from tests.helpers import SKEW_RIG3, _flat_rig, _jittered_boxes, _lever_boxes, _skew_rig
 
 # --- cross-view tracker ------------------------------------------------------------------
 
@@ -421,3 +421,70 @@ def test_the_tracker_projects_correctly_on_a_moving_rig(mv):
     for n in (1, 3):
         out = _project(per_frame[0], np.zeros((n, 3), np.float32))
         assert out.shape == (n, 2)
+
+
+# --- Phase 8 levers (each a switch whose default is the shipped behaviour) ---
+
+def _p8_seat(tr, points_ages):
+    """Seat targets directly: {slot: (world point, age)}."""
+    for s, (p, age) in points_ages.items():
+        tr.targets[s] = {'point': torch.tensor(p, dtype=torch.float32), 'age': age}
+
+
+def test_age_decay_lets_a_close_stale_slot_keep_its_animal():
+    """T2's repro: a slot ~0.05 side from the animal but 6 frames stale loses it to a fresh slot
+    ~0.4 side away under the additive age term; a small multiplicative decay keeps it."""
+    from tailcyclenet.infer.track import CrossViewTracker
+
+    cg = _skew_rig(SKEW_RIG3)
+    boxes = _jittered_boxes(cg, [[0.0, 0.0, 0.0]])
+    scores = [torch.ones(1) for _ in cg]
+    picks = {}
+    for decay in (None, 0.05):
+        tr = CrossViewTracker(2, max_res_px=30.0, age_decay=decay)
+        _p8_seat(tr, {0: ([5.0, 0.0, 0.0], 6), 1: ([45.0, 0.0, 0.0], 0)})
+        out, _, _ = tr.step(cg, boxes, scores)
+        picks[decay] = [s for s in range(2) if np.isfinite(out[s]).all()]
+    assert picks[None] == [1]
+    assert picks[0.05] == [0]
+
+
+def test_camera_claims_take_a_single_view_detection():
+    """TR2: an animal visible in one camera only forms no `associate` group, so the shipped
+    tracker leaves its live target unclaimed and ageing; per-camera claiming takes the box and
+    resets the age while holding the point."""
+    from tailcyclenet.infer.track import CrossViewTracker
+
+    cg = _skew_rig(SKEW_RIG3)
+    full = _jittered_boxes(cg, [[0.0, 0.0, 0.0]])
+    boxes = [full[0], full[0][:0], full[0][:0]]
+    scores = [torch.ones(1), torch.ones(0), torch.ones(0)]
+    for claims in (False, True):
+        tr = CrossViewTracker(1, max_res_px=30.0, camera_claims=claims)
+        _p8_seat(tr, {0: ([3.0, 0.0, 0.0], 2)})
+        out, _, ix = tr.step(cg, boxes, scores)
+        if claims:
+            assert ix[0, 0] == 0 and tr.targets[0]['age'] == 0
+            assert torch.equal(tr.targets[0]['point'], torch.tensor([3.0, 0.0, 0.0]))
+        else:
+            assert not np.isfinite(out).any() and tr.targets[0]['age'] == 3
+
+
+def test_affinity_2d_prefers_the_slot_that_continues_its_own_camera_tracks():
+    """TR3: two slots whose 3D points sit equally far from a group; the one whose last claimed
+    boxes coincide with the group's detections wins once A_2D carries weight."""
+    from tailcyclenet.infer.track import CrossViewTracker
+
+    cg = _skew_rig(SKEW_RIG3)
+    boxes = _jittered_boxes(cg, [[0.0, 0.0, 0.0]])
+    scores = [torch.ones(1) for _ in cg]
+    picks = {}
+    for w2 in (0.0, 0.5):
+        tr = CrossViewTracker(2, max_res_px=30.0, affinity_2d=w2)
+        _p8_seat(tr, {0: ([-20.0, 0.0, 0.0], 0), 1: ([20.0, 0.0, 0.0], 0)})
+        tr._t = 0
+        tr._cam_history = {1: {c: (boxes[c][0].numpy(), 0) for c in range(3)},
+                           0: {c: ((boxes[c][0] + 60.0).numpy(), 0) for c in range(3)}}
+        out, _, _ = tr.step(cg, boxes, scores)
+        picks[w2] = [s for s in range(2) if np.isfinite(out[s]).all()]
+    assert picks[0.5] == [1]

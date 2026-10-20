@@ -91,7 +91,9 @@ def _report_group(key, wall, stats, det_stats, detected):
         _kept = det_stats.get('association_kept', 0)
         if _raw:
             print(f'{key}: association offered {_raw}, seated before link {_pre}, '
-                  f'kept {_kept}')
+                  f'kept {_kept}, cross-view groups {det_stats.get("association_groups", 0)}, '
+                  f'camera claims {det_stats.get("association_camera_claims", 0)}, '
+                  f'association {det_stats.get("association_s", 0.0):.1f}s')
     _window_counts = {k: v for k, v in stats.items() if k.startswith('window_')}
     if _window_counts:
         print(f'{key}: window outcomes ' + ' '.join(

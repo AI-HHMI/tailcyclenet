@@ -141,6 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
     win.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
                      help="re-crop each window to the first pass's own prediction and predict "
                           'again. Default: on in 3D, off in 2D (on for a box model).')
+    win.add_argument('--refine-all-cams', action=argparse.BooleanOptionalAction, default=False,
+                     help='TR1, 3D --refine: pass 2 re-crops every calibrated camera from pass '
+                          "1's pose with a per-camera overlap test (drop a camera whose refined"
+                          ' box misses its pass-1 box; add one with no pass-1 box when the pose'
+                          ' reprojects into its frame). Default: off (all-or-nothing over the '
+                          'pass-1 cameras). measured: 3dpop Seq59 coverage/MPJPE unchanged, '
+                          'idsw 13->20; byte-identical on Seq29 and a 2-bird clip (2026-10-19).')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')
@@ -207,6 +214,40 @@ def build_parser() -> argparse.ArgumentParser:
     ident.add_argument('--assoc-res-max-px', type=float, default=None,
                        help="override the session's reprojection gate (a PIXEL gate: sweep per "
                             "rig). Default: the session's own value.")
+    ident.add_argument('--assoc-res-max-sides', type=float, default=None,
+                       help='TR5: gate cross-view grouping on the reprojection residual in BOX '
+                            "SIDES (median over views of residual / that view's box side) "
+                            'instead of pixels; when set it REPLACES the pixel gate for '
+                            'association only (the GT triangulation keeps assoc_res_max_px). '
+                            'Default: off (pixel gate). measured: 3dpop Seq59/Seq29 at 0.19 (= '
+                            '30 px at the 157 px median side): MOTA -0.0003, idsw 13->10 / '
+                            '0->3, IDF1 -0.012 [-0.045, +0.009] (2026-10-19).')
+    ident.add_argument('--assoc-score-order', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='TR6a: rank cross-view candidate pairs by (support, lower box '
+                            'score, residual) instead of (support, residual). Default: off. '
+                            'measured: 3dpop Seq59/Seq29 MOTA +0.0000, fp_dup 97->84, idsw '
+                            '13->17 / 0->2, IDF1 -0.007 (2026-10-19).')
+    ident.add_argument('--track-camera-claims', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='TR2, 3D --track: after the targets x groups match, let each live '
+                            'target claim one detection per camera that no seated group used '
+                            '(per-camera Hungarian, same box-side gate). Births still need 2 '
+                            'views. Default: off. measured: 3dpop Seq59 on TR1: 253 claims, '
+                            'coverage unchanged, fp_dup 97->80, idsw 13->18, IDF1 0.848->0.779 '
+                            '(2026-10-19).')
+    ident.add_argument('--track-age-decay', type=float, default=None, metavar='LAMBDA',
+                       help='T2, 3D --track: replace the additive sticky-age term with the '
+                            "paper's multiplicative decay aff * exp(-LAMBDA * age). Default: "
+                            'off (additive). measured: 3dpop test at 0.05, 57 of 58 sessions '
+                            'byte-identical, every metric delta 0.0000; train Seq30 idsw '
+                            '27->25, IDF1 0.844->0.897 (2026-10-19).')
+    ident.add_argument('--track-affinity-2d', type=float, default=0.0, metavar='W2',
+                       help='TR3, 3D --track: blend a per-camera 2D continuity term into the '
+                            'target x group affinity, (1 - W2) * A_3D + W2 * A_2D. Default: 0 '
+                            '(A_3D only). measured: 3dpop test at 0.6 on T2 (0.05): MOTA '
+                            '+0.0001 [-0.0001, +0.0004], idsw 22->23, IDF1 -0.0001; train Seq30'
+                            ' idsw 25->20 (2026-10-19).')
     ident.add_argument('--identity-bridge', action='store_true',
                        help='OPT-IN post-pass repairing the slot permutation a hard interaction '
                             'leaves; TRADES MISSES FOR IDENTITY (quote miss and coverage with '
@@ -226,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help='autocast dtype for the scene encode only.')
     spd.add_argument('--camera-batch', action=argparse.BooleanOptionalAction, default=True,
                      help='encode all cameras in one scene-encoder call per window.')
+    spd.add_argument('--assoc-fast', action=argparse.BooleanOptionalAction, default=False,
+                     help='TR7: cross-view association with cached rays/projections and pairs '
+                          'that fail their own residual gate dropped before support counting; '
+                          'meant to give the identical groups. Default: off (reference loop). '
+                          'measured: byte-identical on 3dpop Seq59 and Seq29 (all six tables), '
+                          'association 1.9x, wall -36%% on Seq29 (2026-10-19).')
     spd.add_argument('--kpt-chunk', type=int, default=0,
                      help='decode keypoints in slices of this size (lower peak memory); 0 = one '
                           'pass.')
@@ -244,6 +291,10 @@ def build_parser() -> argparse.ArgumentParser:
     adv.add_argument('--gridresid-offset', default=None, choices=('query', 'triangulated'),
                      help='state the 3D residual anchor of a run folder written before '
                           '`[model].gridresid_offset` existed. Not a sweep knob.')
+    adv.add_argument('--assoc-random-drop', type=float, default=0.0, metavar='P',
+                     help='DIAGNOSTIC: reject each cross-view group that passes the gates with '
+                          'probability P (seed 0): the rate-matched random control for a gating '
+                          'lever (eval rule 14). Never a deployment arm.')
     adv.add_argument('--window-predictions', action='store_true',
                      help='write every window\'s pre-gate predictions to '
                           '<out>/window_predictions.pq')

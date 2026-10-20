@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.1 (2026-10-21)
 
 ### Changes that move numbers
 - `--assoc-fast` is on by default: byte-identical association, about 1.9x faster (`--no-assoc-fast` is the reference loop).

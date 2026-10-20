@@ -664,3 +664,43 @@ def test_refine_consensus_is_inert_without_an_outlier_and_reruns_without_one(mv,
     assert len(calls) == 3 * n_win
     ro = one['refine_outlier'][0]
     assert set(ro[:, 0]) <= {1, 2} and (ro[:, 1:] == 0).all()
+
+
+def test_refine_consensus_composes_with_refine_all_cams(mv, monkeypatch):
+    """R2 = R1 + TR1: with no outlier the pair is exactly TR1; with one, a camera pass 1 had no
+    box for is cropped from the CONSENSUS pose too (when in frame), which R1 alone never does."""
+    from tailcyclenet.infer import window as wmod
+    model, sess, registry, name = mv
+    boxes = _whole_frame_boxes(sess)
+    boxes[:, :, 2] = np.nan                                        # camera 2: no detector box
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=1)
+    real = wmod.camera_consensus
+
+    def flag(cams):
+        def fake(points, p2, v2, use, *a):
+            res, vis, _ = real(points, p2, v2, use, *a)
+            return res, vis, np.array([ci in cams for ci in use])
+        return fake
+
+    torch.manual_seed(0)
+    tr1 = run_group(model, sess, 'g000', registry, name,
+                    _infer_cfg(anchor='carry', refine=True, refine_all_cams=True), **kw)
+    monkeypatch.setattr(wmod, 'camera_consensus', flag(()))
+    torch.manual_seed(0)
+    both = run_group(model, sess, 'g000', registry, name,
+                     _infer_cfg(anchor='carry', refine=True, refine_all_cams=True,
+                                refine_consensus=True), **kw)
+    both.pop('refine_outlier')
+    _assert_same(tr1, both, ' (R2 with no outlier)')
+
+    monkeypatch.setattr(wmod, 'camera_consensus', flag((0,)))
+    monkeypatch.setattr(wmod, '_CONSENSUS_MIN_INLIERS', 1)        # 3-camera rig, one box-less
+    r1 = run_group(model, sess, 'g000', registry, name,
+                   _infer_cfg(anchor='carry', refine=True, refine_consensus=True), **kw)
+    r2 = run_group(model, sess, 'g000', registry, name,
+                   _infer_cfg(anchor='carry', refine=True, refine_consensus=True,
+                              refine_all_cams=True), **kw)
+    assert (r1['refine_outlier'][..., 0] != 3).all() and (r2['refine_outlier'][..., 0] != 3).all()
+    assert not np.isfinite(r1['crop_refined'][..., 2, :]).any(), 'R1 alone never adds a camera'
+    assert np.isfinite(r2['crop_refined'][..., 2, :]).all(-1).any(), \
+        'R2 adds the box-less camera from the consensus pose'

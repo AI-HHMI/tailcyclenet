@@ -49,6 +49,10 @@ OUTCOMES = ('ok', 'no box', 'no camera', 'no points', 'crop failed', 'decode fai
 # How many cameras `decode_crops` may decode at once. A memory bound, not a core count -- see there.
 _CAM_DECODE = 4
 
+# R1 acts only when this many pass-1 cameras survive its test: one camera cannot outvote
+# another, so a two-camera window is never second-guessed.
+_CONSENSUS_MIN_INLIERS = 2
+
 # Smallest store worth building: avoids per-block overhead on small-frame roots.
 _MIN_STORE_BYTES = 512 << 20
 
@@ -713,7 +717,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 if not bad.any():
                     return None
                 keep = [i for i in range(len(use)) if not bad[i]]
-                if len(keep) < 2:
+                if len(keep) < _CONSENSUS_MIN_INLIERS:
                     for i, ci in enumerate(use):
                         if bad[i]:
                             refine_outlier[a, wi - w0, ci] = 3

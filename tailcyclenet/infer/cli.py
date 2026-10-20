@@ -155,7 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
                           '--refine-consensus-vis is an outlier; with >= 2 cameras left, pass 1 '
                           're-runs without it and pass 2 crops every camera (the outlier too, if '
                           'in frame) from that consensus pose. Never acts with < 3 pass-1 '
-                          'cameras. Default: off.')
+                          'cameras. With --refine-all-cams (R2) a camera with no pass-1 box is '
+                          'also cropped from the consensus pose. Default: off.')
     win.add_argument('--refine-consensus-res', type=float, default=0.5, metavar='SIDES',
                      help='R1 residual threshold in crop-box sides (default 0.5).')
     win.add_argument('--refine-consensus-vis', type=float, default=0.0, metavar='LOGIT',

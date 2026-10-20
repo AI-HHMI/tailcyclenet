@@ -130,6 +130,14 @@ def adaptive_inflation(box, size, others, f_max, fallback, step=0.05):
     return best
 
 
+def box_disagrees(box, other, sides=1.0):
+    """R4: are two xyxy boxes' centres more than `sides` of `box`'s mean side apart?"""
+    b, o = np.asarray(box, np.float64), np.asarray(other, np.float64)
+    side = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
+    d = np.hypot((b[0] + b[2] - o[0] - o[2]) / 2, (b[1] + b[3] - o[1] - o[3]) / 2)
+    return bool(d > sides * side)
+
+
 def in_frame(points, cam, min_inside=0.5):
     """Does a 3D pose reproject into `cam`'s image? At least `min_inside` of its finite projected
     points must land inside; no finite point is not in frame."""

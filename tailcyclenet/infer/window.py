@@ -23,8 +23,9 @@ from ..data.camera import resize_camera
 from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
-from .crops import (adaptive_inflation, boxes_from_points, camera_consensus, crop_views,
-                    fill_box_agreement, overlaps, refine_every_camera, to_device, union_box)
+from .crops import (adaptive_inflation, box_disagrees, boxes_from_points, camera_consensus,
+                    crop_views, fill_box_agreement, in_frame, overlaps, refine_every_camera,
+                    to_device, union_box)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
@@ -145,6 +146,13 @@ class InferConfig:
     # labels path has no neighbours' boxes and keeps `crop_inflate`). False is the shipped rule.
     crop_inflate_adaptive: bool = False
     crop_inflate_max: float = 2.0
+    # R4 (3D): where a camera has no box this window, or its crop's centre is more than one crop
+    # side from the crop rule on last window's carried pose reprojected into it, pass 1 crops
+    # that camera from the carried pose instead. Only with a FRESH carry (written by the window
+    # before) and only when at least one camera's own box agrees with it (a carry never sustains
+    # an animal the detector lost everywhere). Under R1 such a camera that then fails the
+    # consensus test is dropped. The carried pose is never a prior beyond what `anchor` gives.
+    refine_carry_fallback: bool = False
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -376,7 +384,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
     f0, w0 = 0, 0
     pred = conf = box_agree = outcome = crop = crop_refined = box_cams = refine_outlier = None
-    inflate_used = None
+    inflate_used = carry_cams = None
     pred2d = conf2d = None
     boxes_stc = None
     _boxes_from = ('detector' if boxes_for is not None else
@@ -703,7 +711,64 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         way or `points2d.pq` would disagree with what `pred` reports; 3D leaves its per-camera
         overlay untouched, a diagnostic rather than the primary output.
         """
-        no_prompt = {}
+        def _carry_fallback(plan):
+            """R4 for one animal -> (plan, {camera: 1 replaced | 2 added}); the plan is returned
+            unchanged (and the dict empty) when the carry is stale, nothing disagrees, or no
+            camera's own box agrees with the carry."""
+            a, use, boxes, cgroup, scales, uncropped = plan
+            c = carried[a]
+            if c is None or int(c[1]) < int(frames[0]):
+                return plan, {}
+            pts = c[0].float()[None].expand(len(frames), -1, -1)
+            if pts.shape[-1] != 3:
+                return plan, {}
+            new, src, agree = {}, {}, 0
+            for ci in cam_ix:
+                cam = window_cams[ci]
+                cg, bx = cropmod.crop_to_points_3d([cam], pts, cfg.min_crop_dim)
+                cbox = bx[0] if cg is not None and in_frame(pts, cam) else None
+                if ci in use:
+                    i = use.index(ci)
+                    if cbox is None or not box_disagrees(boxes[i], cbox):
+                        agree += cbox is not None
+                        new[ci] = (boxes[i], uncropped[i])
+                        continue
+                    src[ci] = 1
+                elif cbox is None:
+                    continue
+                else:
+                    src[ci] = 2
+                if cfg.crop_inflate != 1.0:
+                    cbox = cropmod.inflate_box(cbox, cam['size'], cfg.crop_inflate)
+                new[ci] = (cbox, cropmod.apply_crop(cam, cbox))
+            if not src or not agree:
+                return plan, {}
+            use2 = [ci for ci in cam_ix if ci in new]
+            b2 = [new[ci][0] for ci in use2]
+            unc2 = [new[ci][1] for ci in use2]
+            cg2, sc2 = [], []
+            for cam in unc2:
+                cc, s = resize_camera(cam, pass1_res)
+                cg2.append(cc)
+                sc2.append(s)
+            for ci in src:
+                crop[a, wi - w0, ci] = np.asarray(new[ci][0], np.float32)
+                carry_cams[a, wi - w0, ci] = src[ci]
+            return WindowPlan(a, use2, b2, cg2, sc2, unc2), src
+
+        no_prompt, from_carry = {}, {}
+        if cfg.refine_carry_fallback and mode == '3d':
+            out_plans, changed = [], []
+            for plan in plans:
+                plan2, src = _carry_fallback(plan)
+                out_plans.append(plan2)
+                if src:
+                    changed.append(plan2)
+                    from_carry[plan2.animal] = set(src)
+                    no_prompt[plan2.animal] = set(src)
+            if changed:
+                crops = {**crops, **decode_crops(frames, changed)}
+            plans = out_plans
         if cfg.refine:
             def _at_image_size(plan):
                 """The same plan with pass 1 rebuilt at full `image_size` (a no-op when it
@@ -732,7 +797,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 """R1 for one animal: None when no pass-1 camera is an outlier (or fewer than two
                 would remain), so the caller runs the shipped refine untouched; else the pass-2
                 plan cropped from the consensus pose (`refine_outlier`: 0 inlier, 1 outlier
-                re-cropped, 2 outlier dropped, 3 outlier left alone for want of inliers)."""
+                re-cropped, 2 outlier dropped, 3 outlier left alone for want of inliers). An
+                outlier R4 sourced from the carry is dropped, never re-cropped."""
                 a, use, boxes, cgroup, scales, uncropped = plan
                 _, _, bad = camera_consensus(got[0], got[3], got[4], use, boxes, window_cams,
                                              cfg.refine_consensus_res, cfg.refine_consensus_vis)
@@ -750,18 +816,21 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                  [cgroup[i] for i in keep], [scales[i] for i in keep],
                                  [uncropped[i] for i in keep])
                 outl = {use[i] for i in range(len(use)) if bad[i]}
-                no_prompt[a] = outl
+                no_prompt[a] = no_prompt.get(a, set()) | outl
+                gone = outl & from_carry.get(a, set())
                 got_c = forward(frames, sub, crops, wi, trace=False)
                 fallback = sub
+                use2 = ()
                 if got_c is not None:
                     pts_c = torch.as_tensor(got_c[0], dtype=torch.float32)
-                    cams = cam_ix if cfg.refine_all_cams else use
+                    cams = [ci for ci in (cam_ix if cfg.refine_all_cams else use)
+                            if ci not in gone]
                     use2, b2, cg2 = refine_every_camera(pts_c, use, boxes, cams, window_cams,
                                                         cfg.min_crop_dim, outliers=outl)
                     if use2:
                         fallback = None
                 for ci in outl:
-                    refine_outlier[a, wi - w0, ci] = 1 if fallback is None and ci in use2 else 2
+                    refine_outlier[a, wi - w0, ci] = 1 if ci in use2 else 2
                 return _at_image_size(fallback) if fallback is not None else \
                     _resized(a, use2, b2, cg2)
 
@@ -1023,6 +1092,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             outcome = np.full((S, n_win), OUTCOMES.index('no box'), np.int8)
             crop = np.full((S, n_win, len(session.rig), 4), np.nan, np.float32)
             crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
+            carry_cams = (np.full((S, n_win, len(session.rig)), 0, np.int8)
+                          if cfg.refine_carry_fallback and mode == '3d' else None)
             inflate_used = (np.full((S, n_win, len(session.rig)), np.nan, np.float32)
                             if cfg.crop_inflate_adaptive else None)
             refine_outlier = (np.full((S, n_win, len(session.rig)), -1, np.int8)
@@ -1088,6 +1159,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    **({} if crop_refined is None else {'crop_refined': crop_refined}),
                    **({} if refine_outlier is None else {'refine_outlier': refine_outlier}),
                    **({} if inflate_used is None else {'crop_inflate_used': inflate_used}),
+                   **({} if carry_cams is None else {'carry_crop': carry_cams}),
                    **({} if box_cams is None else {'box_prompt_cams': box_cams}),
                    'boxes_from': _boxes_from}
     finally:

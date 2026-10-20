@@ -161,6 +161,14 @@ def build_parser() -> argparse.ArgumentParser:
                      help='R1 residual threshold in crop-box sides (default 0.5).')
     win.add_argument('--refine-consensus-vis', type=float, default=0.0, metavar='LOGIT',
                      help='R1 visibility threshold, median vis_pred_2d logit (default 0.0).')
+    win.add_argument('--refine-carry-fallback', action=argparse.BooleanOptionalAction,
+                     default=False,
+                     help='R4, 3D: a camera with no box this window, or whose crop centre is more '
+                          'than one crop side from the crop rule on the carried pose reprojected '
+                          'into it, is cropped for pass 1 from that carried pose. Only with a '
+                          'fresh carry and at least one camera agreeing with it; under '
+                          '--refine-consensus such a camera that fails the test is dropped. '
+                          'Default: off.')
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')

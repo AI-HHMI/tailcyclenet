@@ -114,6 +114,7 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
             'refine_consensus_vis': float(cfg.refine_consensus_vis),
             'crop_inflate_adaptive': bool(cfg.crop_inflate_adaptive),
             'crop_inflate_max': float(cfg.crop_inflate_max),
+            'refine_carry_fallback': bool(cfg.refine_carry_fallback),
             'precision': precision, 'camera_batch': bool(camera_batch),
             'boxes': (str(args.detector) if args.detector else
                       (str(args.boxes) if args.boxes else 'labels')),

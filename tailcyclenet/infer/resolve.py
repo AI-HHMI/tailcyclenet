@@ -247,7 +247,11 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         refine_consensus_res=float(getattr(args, 'refine_consensus_res', 0.5)),
         refine_consensus_vis=float(getattr(args, 'refine_consensus_vis', 0.0)),
         crop_inflate_adaptive=bool(getattr(args, 'crop_inflate_adaptive', False)),
-        crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)))
+        crop_inflate_max=float(getattr(args, 'crop_inflate_max', 2.0)),
+        refine_carry_fallback=bool(getattr(args, 'refine_carry_fallback', False)))
+    if cfg.refine_carry_fallback and sess.mode != '3d':
+        raise SystemExit('--refine-carry-fallback reprojects a carried 3D pose into each camera; '
+                         'this is a 2D run.')
     if cfg.crop_inflate_adaptive and cfg.crop_inflate_max < 1.0:
         raise SystemExit(f'--crop-inflate-max {cfg.crop_inflate_max} is below 1.0; R3 never '
                          'shrinks a crop below its box.')

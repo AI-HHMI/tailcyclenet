@@ -62,3 +62,16 @@ def test_refine_consensus_needs_3d_and_refine():
     cfg = infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64, 'cpu')
     assert (cfg.refine_consensus, cfg.refine_consensus_res, cfg.refine_consensus_vis) == \
         (True, 0.3, 0.0)
+
+
+def test_refine_carry_fallback_is_3d_only():
+    """R4 reprojects a carried 3D pose: refused on a 2D run, resolved on a 3D one."""
+    import pytest
+    config = {'data': {}, 'model': {'box_prompt': 'none'}}
+    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o',
+                                      '--refine-carry-fallback'])
+    check_frame_range(args)
+    with pytest.raises(SystemExit, match='refine-carry-fallback'):
+        infer_config(args, config, SimpleNamespace(mode='2d'), 4, 64, 'cpu')
+    assert infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64,
+                        'cpu').refine_carry_fallback

@@ -732,3 +732,62 @@ def test_crop_inflate_adaptive_follows_the_neighbours_in_2d(rat):
     assert (f >= 1.0).all() and (f < 1.5).all()
     assert not overlaps(c['crop'][0, 0, 0], two[1, 0, 0])
     assert not overlaps(c['crop'][1, 0, 0], two[0, 0, 0])
+
+
+def test_refine_carry_fallback_adds_a_boxless_camera_only_with_a_fresh_agreeing_carry(mv16, monkeypatch):
+    """R4: with every camera boxed and agreeing it is byte-identical to the shipped path; when no
+    camera's own box agrees with the carry nothing changes (a carry never sustains an animal on
+    its own); a camera with no box gets the carried crop from the second window on (the first
+    has no carry), and never with R4 off."""
+    from tailcyclenet.infer import window as wmod
+    model, sess, registry, name = mv16
+    boxes = _whole_frame_boxes(sess, T=sess.groups['g000'].n_frames)
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=1)
+    torch.manual_seed(0)
+    base = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    on = _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True)
+    torch.manual_seed(0)
+    same = run_group(model, sess, 'g000', registry, name, on, **kw)
+    same.pop('carry_crop')
+    _assert_same(base, same, ' (R4, every camera agreeing)')
+    monkeypatch.setattr(wmod, 'box_disagrees', lambda *a, **k: True)
+    torch.manual_seed(0)
+    lone = run_group(model, sess, 'g000', registry, name, on, **kw)
+    assert (lone.pop('carry_crop') == 0).all()
+    _assert_same(base, lone, ' (R4, no camera agreeing)')
+    monkeypatch.undo()
+
+    boxes[:, :, 2] = np.nan
+    monkeypatch.setattr(wmod, 'in_frame', lambda *a, **k: True)
+    kw = dict(boxes_for=_boxes_for(boxes), n_rows=1)
+    off = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='carry', refine=True), **kw)
+    r4 = run_group(model, sess, 'g000', registry, name, on, **kw)
+    assert not np.isfinite(off['crop'][..., 2, :]).any()
+    cc = r4['carry_crop'][0]
+    assert (cc[0] == 0).all(), 'the first window has no carry'
+    assert (cc[1:, 2] == 2).any() and (cc[:, :2] == 0).all()
+    assert np.isfinite(r4['crop'][0][cc[:, 2] == 2, 2]).all()
+
+
+def test_a_carry_sourced_camera_that_fails_the_consensus_is_dropped(mv16, monkeypatch):
+    """R4 + R1: a camera cropped from the carry that R1 then calls an outlier is dropped from
+    pass 2 (code 2), never re-cropped from the consensus pose."""
+    from tailcyclenet.infer import window as wmod
+    model, sess, registry, name = mv16
+    boxes = _whole_frame_boxes(sess, T=sess.groups['g000'].n_frames)
+    boxes[:, :, 2] = np.nan
+    real = wmod.camera_consensus
+
+    def fake(points, p2, v2, use, *a):
+        res, vis, _ = real(points, p2, v2, use, *a)
+        return res, vis, np.array([ci == 2 for ci in use])
+
+    monkeypatch.setattr(wmod, 'in_frame', lambda *a, **k: True)
+    monkeypatch.setattr(wmod, 'camera_consensus', fake)
+    out = run_group(model, sess, 'g000', registry, name,
+                    _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True,
+                               refine_consensus=True), boxes_for=_boxes_for(boxes), n_rows=1)
+    hit = out['carry_crop'][0, :, 2] == 2
+    assert hit.any()
+    assert (out['refine_outlier'][0, hit, 2] == 2).all()
+    assert not np.isfinite(out['crop_refined'][0, hit, 2]).any()

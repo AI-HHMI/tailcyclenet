@@ -95,3 +95,12 @@ def test_adaptive_inflation_widens_until_a_neighbour_and_falls_back_alone():
     assert not overlaps(cropmod.inflate_box(box, size, f), near)
     assert overlaps(cropmod.inflate_box(box, size, f + 0.05), near)
     assert adaptive_inflation(box, size, [np.array([130, 100, 170, 140])], 2.0, 1.5) == 1.0
+
+
+def test_box_disagrees_is_centre_distance_in_box_sides():
+    """R4's disagreement test: centre distance over the first box's mean side, strict."""
+    from tailcyclenet.infer.crops import box_disagrees
+    box = [0, 0, 10, 10]
+    assert not box_disagrees(box, [10, 0, 20, 10])                 # exactly one side
+    assert box_disagrees(box, [11, 0, 21, 10])
+    assert not box_disagrees(box, [2, 2, 8, 8])

@@ -292,6 +292,9 @@ class SessionWriter:
         for j, q in enumerate(('rx0', 'ry0', 'rx1', 'ry1')):
             rows[q] = (np.full(len(aw), np.nan, np.float32) if rf is None
                        else np.asarray(rf)[..., j].ravel().astype(np.float32))
+        cc = blk.get('carry_crop')
+        if cc is not None:
+            rows['carry_crop'] = np.asarray(cc).ravel().astype(np.int32)
         iu = blk.get('crop_inflate_used')
         if iu is not None:
             rows['crop_inflate_used'] = np.asarray(iu).ravel().astype(np.float32)

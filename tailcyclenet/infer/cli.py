@@ -237,13 +237,17 @@ def build_parser() -> argparse.ArgumentParser:
                             'coverage unchanged, fp_dup 97->80, idsw 13->18, IDF1 0.848->0.779 '
                             '(2026-10-19).')
     ident.add_argument('--track-age-decay', type=float, default=None, metavar='LAMBDA',
-                       help="T2, 3D --track: replace the additive sticky-age term with the "
+                       help='T2, 3D --track: replace the additive sticky-age term with the '
                             "paper's multiplicative decay aff * exp(-LAMBDA * age). Default: "
-                            'off (additive).')
+                            'off (additive). measured: 3dpop test at 0.05, 57 of 58 sessions '
+                            'byte-identical, every metric delta 0.0000; train Seq30 idsw '
+                            '27->25, IDF1 0.844->0.897 (2026-10-19).')
     ident.add_argument('--track-affinity-2d', type=float, default=0.0, metavar='W2',
                        help='TR3, 3D --track: blend a per-camera 2D continuity term into the '
                             'target x group affinity, (1 - W2) * A_3D + W2 * A_2D. Default: 0 '
-                            '(A_3D only).')
+                            '(A_3D only). measured: 3dpop test at 0.6 on T2 (0.05): MOTA '
+                            '+0.0001 [-0.0001, +0.0004], idsw 22->23, IDF1 -0.0001; train Seq30'
+                            ' idsw 25->20 (2026-10-19).')
     ident.add_argument('--identity-bridge', action='store_true',
                        help='OPT-IN post-pass repairing the slot permutation a hard interaction '
                             'leaves; TRADES MISSES FOR IDENTITY (quote miss and coverage with '

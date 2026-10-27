@@ -694,6 +694,8 @@ def main(argv: list[str] | None = None) -> int:
                         help='number of devices/ranks; each rank contributes one triplet')
     parser.add_argument('--strategy', default=None)
     parser.add_argument('--precision', default='32-true')
+    parser.add_argument('--no-tf32', action='store_true',
+                        help='disable TF32 matmuls/convs (on by default)')
     parser.add_argument('--num-workers', type=int, default=None,
                         help='loader workers per rank')
     parser.add_argument('--iterations', type=int, default=None)

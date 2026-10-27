@@ -161,6 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
                          'above it')
     ap.add_argument('--precision', default='32-true',
                     help='32-true (default) or bf16-mixed. 16-mixed is refused by name')
+    ap.add_argument('--no-tf32', action='store_true',
+                    help='disable TF32 matmuls/convs (on by default)')
     ap.add_argument('--num-workers', type=int, default=None,
                     help='loader workers PER RANK; the total is this times the world size')
     ap.add_argument('--no-warm-start', action='store_true')

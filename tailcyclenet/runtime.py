@@ -15,8 +15,19 @@ import torch
 from . import distributed as dist_utils
 
 
+def set_tf32(on: bool = True) -> bool:
+    """Allow (or forbid) TF32 tensor-core matmuls and convolutions; returns `on`.
+
+    PyTorch leaves matmul TF32 off by default, so under `32-true` an A100/H100 runs full-FP32
+    GEMMs. Every trainer turns it on (since 2026-10-27); `--no-tf32` restores strict FP32.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = bool(on)
+    torch.backends.cudnn.allow_tf32 = bool(on)
+    return bool(on)
+
+
 def launch(args):
-    """The Fabric, launched from `args.device/devices/strategy/precision`. Everything after this
+    """The Fabric, launched from `args.device/devices/strategy/precision/no_tf32`. Everything after this
     call runs once PER RANK.
 
     `--devices -1` means every visible GPU (one process on CPU) and resolves to that count
@@ -47,6 +58,7 @@ def launch(args):
             f'--device {args.device} names ONE gpu and --devices {args.devices} asks for several. '
             'At --devices != 1 the launcher places every rank, so --device would be silently '
             'ignored -- pick one (CUDA_VISIBLE_DEVICES selects WHICH gpus).')
+    tf32 = set_tf32(not getattr(args, 'no_tf32', False))
     strategy = args.strategy or ('auto' if devices == 1 else 'ddp_find_unused_parameters_true')
     if cpu:
         accelerator, dev_arg = 'cpu', devices
@@ -67,6 +79,7 @@ def launch(args):
                      f'print_freq and the unfreeze iteration are TOTALS across ranks; the '
                      f'learning rate is scaled by sqrt({fabric.world_size}) = '
                      f'{fabric.world_size ** 0.5:.3f}')
+    fabric.print(f'tf32: {"on" if tf32 else "off (--no-tf32)"}')
     if args.precision == 'bf16-mixed':
         fabric.print('--precision bf16-mixed is UNMEASURED on this repo\'s roots: every number '
                      'on record was measured at 32-true.')

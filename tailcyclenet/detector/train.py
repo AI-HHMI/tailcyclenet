@@ -557,7 +557,7 @@ def _evaluate_and_save(model, opt, train, val, device, data_cfg, train_cfg, mult
 def main(argv: list[str] | None = None):
     """Train the box predictor; exit via SystemExit on bad config.
 
-    Inputs: argv (via argparse): --config, --out, --iters, --device.
+    Inputs: argv (via argparse): --config, --out, --iters, --device, --no-tf32.
     Side effects: writes checkpoints + metrics.json + config/provenance under the run folder;
         prints progress and eval lines.
 
@@ -572,6 +572,8 @@ def main(argv: list[str] | None = None):
     ap.add_argument('--out', type=Path, default=None, help='override [training].out')
     ap.add_argument('--iters', type=int, default=None, help='override [training].iters')
     ap.add_argument('--device', default=None, help='override [training].device')
+    ap.add_argument('--no-tf32', action='store_true',
+                    help='disable TF32 matmuls/convs (on by default)')
     ap.add_argument('--weights-dir', action=_RemovedFlag, nargs='?', help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -579,6 +581,8 @@ def main(argv: list[str] | None = None):
                                   iters=args.iters, device=args.device)
     data_cfg, model_cfg, train_cfg = config['data'], config['model'], config['training']
 
+    from ..runtime import set_tf32
+    print(f'tf32: {"on" if set_tf32(not args.no_tf32) else "off (--no-tf32)"}')
     torch.manual_seed(train_cfg['seed'])
     np.random.seed(train_cfg['seed'])
     device = train_cfg['device'] if torch.cuda.is_available() else 'cpu'

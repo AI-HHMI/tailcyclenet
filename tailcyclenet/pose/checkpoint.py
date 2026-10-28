@@ -97,7 +97,8 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
     GROWN REGISTRY KEEPS ITS ROWS by position: the checkpoint's (n0, d) table fills the first n0
     rows. Either way the copy is refused if `base_names`'s length does not match n0, because a
     mis-applied copy points each row at a different body part. `_interp_res_params` returns
-    (dict, BOOL): `interpolated` is the flag, not a key list.
+    (dict, BOOL): `interpolated` is the flag, not a key list. The name-mapped table is built on the
+    CPU, since the model may already be on a GPU.
     """
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
@@ -132,7 +133,7 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
                           f'all {n} rows fresh')
                 state.pop(k)
                 continue
-            mapped = msd[k].detach().cpu().clone()     # the model may already be on a GPU
+            mapped = msd[k].detach().cpu().clone()
             rows, cols = zip(*hits)
             mapped[list(rows)] = v[list(cols)].to(mapped.dtype).cpu()
             state[k] = mapped

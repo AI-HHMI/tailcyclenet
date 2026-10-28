@@ -132,9 +132,9 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
                           f'all {n} rows fresh')
                 state.pop(k)
                 continue
-            mapped = msd[k].clone()
+            mapped = msd[k].detach().cpu().clone()     # the model may already be on a GPU
             rows, cols = zip(*hits)
-            mapped[list(rows)] = v[list(cols)].to(mapped.dtype)
+            mapped[list(rows)] = v[list(cols)].to(mapped.dtype).cpu()
             state[k] = mapped
             if verbose:
                 kept = {names[i] for i in rows}

@@ -603,7 +603,9 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             this run folder's own checkpoint (`--fresh`).
     Side effects: writes the run folder, checkpoints and wandb logs. Train metrics are averaged
     over `print_freq` steps (one step is K triplets, so one step's accuracy is quantised in 1/K);
-    the val pass is the number to read. A warm start gets the SOURCE run's registry names.
+    the val pass is the number to read. A resume keeps every id (appends to the source registry);
+    a warm start builds the registry from the data and `warm_start` copies the identity rows by
+    name.
     """
     world = int(fabric.world_size) if fabric is not None else 1
     is0 = bool(fabric.is_global_zero) if fabric is not None else True
@@ -617,8 +619,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     ckpt_path, base_reg = _start_reference(out, checkpoint, train_cfg, fresh)
     contract_mismatch, mode_mismatch, may_resume = _probe_checkpoint(
         ckpt_path, config, output_granularity)
-    # A resume keeps every id (append to the source registry); a warm start builds the registry
-    # from the data and `warm_start` copies the identity rows by name.
     if base_reg is not None:
         print('keypoint registry: ' + ('appending to the resume checkpoint\'s' if may_resume
                                        else 'built from the data; identity rows copied by name'))

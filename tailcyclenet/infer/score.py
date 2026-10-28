@@ -155,9 +155,10 @@ def _alias_registry(registry, target: str, alias: str):
 def _cams_config(lc, cams):
     """The loader config with the per-window camera count `cams` applies.
 
-    Inputs: lc -- the run's LoaderConfig; cams -- None or 'run' (the run's own `cams_to_sample`,
-            a per-window draw seeded by the window index), 'val' (`val_cams_to_sample`), 'all'
-            (every camera of the session), or an int.
+    Inputs: lc -- the run's LoaderConfig; cams -- 'all' (every camera of the session; the
+            default since 2026-10-28), 'run' or None (the run's own TRAINING `cams_to_sample`, a
+            per-window random subset seeded by the window index -- how every score before that
+            date was made), 'val' (`val_cams_to_sample`), or an int.
     Outputs: a LoaderConfig.
     Side effects: raises ValueError on an unknown spelling.
     """
@@ -237,7 +238,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                val_stride: int | None = None, spans: dict | None = None, coverage: list[dict] | None = None, *,
                checkpoint_info: dict | None = None, checkpoint: str | None = None,
                session: str | None = None, start: int | None = None,
-               stop: int | None = None, num_workers: int = 0, cams=None,
+               stop: int | None = None, num_workers: int = 0, cams='all',
                dataset_name: str | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
@@ -716,9 +717,10 @@ def main(argv=None):
                         help='decode workers, each walking a contiguous run of windows so every '
                              'camera decodes forward once; default: cores - 1, at most 8; 0 = '
                              'decode in this process')
-    parser.add_argument('--cams', default=None,
-                        help="cameras per window: 'run' (default; the run's cams_to_sample, a "
-                             "per-window draw), 'val' (val_cams_to_sample), 'all', or an int")
+    parser.add_argument('--cams', default='all',
+                        help="cameras per window: 'all' (default), 'run' (the run's training "
+                             "cams_to_sample, a per-window random subset; scores before "
+                             "2026-10-28), 'val' (val_cams_to_sample), or an int")
     parser.add_argument('--dataset-name', default=None,
                         help="read --data's keypoints as this dataset of the scorer's registry "
                              '(e.g. a full-length root of the root the scorer was trained on)')

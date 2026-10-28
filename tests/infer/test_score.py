@@ -100,7 +100,8 @@ def _patch_score_root(monkeypatch, index=(), config=None, load=None):
                 SimpleNamespace(name='checkpoint_last.pth'))
 
     monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
-    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    from tailcyclenet.loader.config import LoaderConfig
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: LoaderConfig())
     monkeypatch.setattr(qc, 'load_scorer_run',
                         (lambda *a, **k: load(FakeModel(), *a, **k)) if load else default_load)
 

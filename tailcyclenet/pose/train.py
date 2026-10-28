@@ -199,10 +199,15 @@ def load_train_config(args) -> tuple[dict, Path]:
 
 
 def build_datasets(data_cfg: dict, lc, plan):
-    """(train_ds, val_ds or None): the train set appends to the start checkpoint's registry."""
-    if plan.registry is not None:
+    """(train_ds, val_ds or None): a resume appends to the start checkpoint's registry; a warm
+    start builds the registry from the data and `warm_start` maps the identity rows by name."""
+    base = plan.registry if plan.resumes else None
+    if base is not None:
         print(f'keypoint registry: appending to the {plan.mode} checkpoint\'s ({plan.path})')
-    train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=plan.registry)
+    elif plan.registry is not None:
+        print(f'keypoint registry: built from the data; identity rows copied by name from '
+              f'{plan.path}')
+    train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=base)
     registry = train_ds.registry
     print(f'train: {len(train_ds)} windows across {len(train_ds.datasets)} dataset(s), '
           f'{registry.n_keypoints} keypoints')
@@ -516,8 +521,8 @@ def main(argv: list[str] | None = None):
     - Unknown `[training]`/`[data]` keys are refused (a typo would train at the
       defaults and report as the arm it is not); a missing `val/` split is the
       only error swallowed.
-    - Every rank builds the same registry, appended to the start checkpoint's own, so
-      `warm_start` can prove the checkpoint's keypoint table is a prefix of this run's.
+    - Every rank builds the same registry: appended to the checkpoint's own on a resume, built
+      from the data on a warm start (identity rows then copied by name).
     - One epoch for the whole run (sampling is with replacement); `num_workers` and the RAM
       ceiling are per rank. Val windows decode in a one-worker child, not the parent. A resumed
       run's sampler continues at its step (`StepSampler(start=)`) on a new index stream.
@@ -578,7 +583,8 @@ def main(argv: list[str] | None = None):
                                                   'video_encoder_pretrained': False}
         return build_model(cfg, n_keypoints=registry.n_keypoints)
 
-    started = build_start(plan, make_model, opt_cfg_scaled, config['model'], device)
+    started = build_start(plan, make_model, opt_cfg_scaled, config['model'], device,
+                          names=registry.names)
     raw, opt, fresh, plan = started.model, started.optimizer, started.fresh, started.plan
     start_it = plan.start_it
     if not plan.resumes and (run / 'checkpoints' / 'checkpoint_last.pth').exists():

@@ -16,8 +16,10 @@ The rules, in order:
   repo id) RESUMES when it is a full pose training state whose optimizer kind, layout metadata
   and world size match; anything else WARM-STARTS from its weights at iteration 0, saying why.
 - otherwise the run starts fresh.
-The keypoint registry a run appends to is the checkpoint's own (embedded, else the run folder it
-sits in), so identity rows keep their body parts; a keypoint table with no registry is refused.
+A RESUME appends the run's keypoint registry to the checkpoint's own (embedded, else the run
+folder it sits in), so ids never move; a WARM START builds the registry from the data alone and
+copies identity rows by name (matching names load, base-only names are dropped, new names start
+fresh). A keypoint table with no registry is refused.
 """
 from __future__ import annotations
 
@@ -212,7 +214,7 @@ def _describe_encoder(model, model_cfg: dict) -> None:
 
 
 def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | None = None,
-                device='cpu') -> Started:
+                device='cpu', names: tuple[str, ...] | None = None) -> Started:
     """Build the model and optimizer `plan` names.
 
     `make_model(pretrained)` returns a new model; `pretrained` is False whenever a checkpoint
@@ -220,7 +222,8 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
     optimizer config, the ONE dict the build, the resume replay and the live unfreeze all read.
     A resume loads the raw weights, replays the staged unfreeze to the checkpoint's iteration,
     then asks `check_resume`; a refusal is a `SystemExit` for the run's own folder and a clean
-    warm start (a NEW model) for a `checkpoint_path`.
+    warm start (a NEW model) for a `checkpoint_path`. `names` is this run's registry names: a
+    warm start copies the identity rows BY NAME from the checkpoint's registry.
     """
     model = make_model(plan.mode == 'fresh')
     fresh = set(plan.fresh)
@@ -230,10 +233,11 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
         except RuntimeError as e:
             why = (f'its weights do not load into this model ({type(e).__name__}: '
                    f'{str(e).splitlines()[0]})')
-            return _refused(plan, why, make_model, opt_cfg, model_cfg, device)
+            return _refused(plan, why, make_model, opt_cfg, model_cfg, device, names)
     elif plan.mode == 'warm':
         fresh = warm_start(model, plan.path,
-                           base_names=plan.registry.names if plan.registry else None)
+                           base_names=plan.registry.names if plan.registry else None,
+                           names=names)
     _describe_encoder(model, model_cfg or {})
     model = model.to(device)
     opt = build_optimizer(model, fresh, opt_cfg)
@@ -241,7 +245,7 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
         info = apply_staged_unfreeze(model, opt, opt_cfg, plan.start_it, fresh=fresh)
         verdict = check_resume(opt, plan.state['optimizer_state'], model, plan.layout)
         if not verdict:
-            return _refused(plan, verdict.reason, make_model, opt_cfg, model_cfg, device)
+            return _refused(plan, verdict.reason, make_model, opt_cfg, model_cfg, device, names)
         if info:
             print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
                   f'norms {info["norms"]}, {info["n_params"]:,} params)')
@@ -250,7 +254,7 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
     return Started(model, opt, fresh, replace(plan, state=None))
 
 
-def _refused(plan, why, make_model, opt_cfg, model_cfg, device) -> Started:
+def _refused(plan, why, make_model, opt_cfg, model_cfg, device, names=None) -> Started:
     """A resume `build_start` could not carry out: an error for the run's own folder, a warm
     start from the same checkpoint otherwise."""
     if plan.mode == 'resume_own':
@@ -258,4 +262,4 @@ def _refused(plan, why, make_model, opt_cfg, model_cfg, device) -> Started:
                          f'configuration it was trained with, or {_OVERWRITES}.')
     print(f'checkpoint_path: {plan.path} does not resume -- {why}; warm-starting from its '
           'weights at iteration 0')
-    return build_start(plan.as_warm(why), make_model, opt_cfg, model_cfg, device)
+    return build_start(plan.as_warm(why), make_model, opt_cfg, model_cfg, device, names)

@@ -233,14 +233,17 @@ def _start_reference(out: Path, checkpoint, train_cfg: dict, fresh: bool):
         ref = ref.parent.parent if ref.is_file() else ref
         if (ref / 'keypoint_registry.toml').exists():
             base_reg = Registry.load(ref / 'keypoint_registry.toml')
-            print(f'keypoint registry: appending to {ref / "keypoint_registry.toml"}')
+            print(f'keypoint registry: source {ref / "keypoint_registry.toml"}')
     return ckpt_path, base_reg
 
 
-def _probe_checkpoint(ckpt_path, config: dict, output_granularity: str) -> tuple[bool, bool]:
-    """(contract mismatch, mode mismatch) of a scorer start checkpoint; either forces a warm start."""
+def _probe_checkpoint(ckpt_path, config: dict,
+                      output_granularity: str) -> tuple[bool, bool, bool]:
+    """(contract mismatch, mode mismatch, may resume) of a start checkpoint; either mismatch
+    forces a warm start, and only a full scorer state with neither may resume."""
     checkpoint_contract_mismatch = False
     checkpoint_mode_mismatch = False
+    may_resume = False
     if ckpt_path:
         probe = Path(ckpt_path)
         if probe.is_dir():
@@ -265,7 +268,10 @@ def _probe_checkpoint(ckpt_path, config: dict, output_granularity: str) -> tuple
                     except ValueError as e:
                         checkpoint_contract_mismatch = True
                         print(f'{probe}: {e}; using warm-start weights')
-    return checkpoint_contract_mismatch, checkpoint_mode_mismatch
+                may_resume = (full_training_state(checkpoint_probe)
+                              and not checkpoint_contract_mismatch
+                              and not checkpoint_mode_mismatch)
+    return checkpoint_contract_mismatch, checkpoint_mode_mismatch, may_resume
 
 
 def _started_loaders(train_ds, val_ds, config: dict, seed: int, n_target: int, fabric, world: int,
@@ -294,7 +300,7 @@ def _started_loaders(train_ds, val_ds, config: dict, seed: int, n_target: int, f
 
 
 def _resume_candidate(model, ckpt_path, output_granularity: str, base_reg,
-                      contract_mismatch: bool, mode_mismatch: bool):
+                      contract_mismatch: bool, mode_mismatch: bool, names=None):
     """(resume_state, resume_file, fresh names): a matching full scorer state, else a warm start."""
     resume_state = None
     resume_file = None
@@ -320,14 +326,16 @@ def _resume_candidate(model, ckpt_path, output_granularity: str, base_reg,
                 require_scorer_granularity(output_granularity,
                                            scorer_checkpoint_granularity(loaded),
                                            where=str(ckpt_file))
-            fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
+            fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg),
+                               names=names)
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',
                                            'precision_head', 'frame_loss.'))}
     return resume_state, resume_file, fresh
 
 
-def _optimizer_and_resume(model, fresh: set, opt_cfg: dict, resume_state, resume_file, base_reg):
+def _optimizer_and_resume(model, fresh: set, opt_cfg: dict, resume_state, resume_file, base_reg,
+                          names=None):
     """(optimizer, resume_state): a resume that does not load falls back to a clean warm start."""
     optimizer = build_optimizer(model, fresh, opt_cfg)
     if resume_state is not None:
@@ -340,7 +348,8 @@ def _optimizer_and_resume(model, fresh: set, opt_cfg: dict, resume_state, resume
             print(f'resuming {resume_file} at iteration {resume_state.get("iteration", "?")}')
         except (KeyError, RuntimeError, ValueError, SystemExit) as e:
             print(f'resume: {resume_file} is not reusable ({e}); warm-starting at iteration 0')
-            fresh.update(warm_start(model, resume_file, base_names=warm_start_names(base_reg)))
+            fresh.update(warm_start(model, resume_file, base_names=warm_start_names(base_reg),
+                                    names=names))
             optimizer = build_optimizer(model, fresh, opt_cfg)
             resume_state = None
     return optimizer, resume_state
@@ -606,11 +615,16 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     np.random.seed(seed)
 
     ckpt_path, base_reg = _start_reference(out, checkpoint, train_cfg, fresh)
-    contract_mismatch, mode_mismatch = _probe_checkpoint(ckpt_path, config, output_granularity)
-
+    contract_mismatch, mode_mismatch, may_resume = _probe_checkpoint(
+        ckpt_path, config, output_granularity)
+    # A resume keeps every id (append to the source registry); a warm start builds the registry
+    # from the data and `warm_start` copies the identity rows by name.
+    if base_reg is not None:
+        print('keypoint registry: ' + ('appending to the resume checkpoint\'s' if may_resume
+                                       else 'built from the data; identity rows copied by name'))
     train_ds, val_ds, registry = build_datasets(
-        config, base_reg, rank=(fabric.global_rank if fabric is not None else 0),
-        world_size=world)
+        config, base_reg if may_resume else None,
+        rank=(fabric.global_rank if fabric is not None else 0), world_size=world)
     if fabric is not None:
         dist_utils.check_registry(fabric, registry.names)
     n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
@@ -623,14 +637,15 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     if output_granularity == 'frame':
         model.add_module('frame_loss', loss_fn.to(device))
     resume_state, resume_file, fresh_names = _resume_candidate(
-        model, ckpt_path, output_granularity, base_reg, contract_mismatch, mode_mismatch)
+        model, ckpt_path, output_granularity, base_reg, contract_mismatch, mode_mismatch,
+        names=registry.names)
 
     opt_cfg = dist_utils.scale_optimizer_cfg(config['training']['optimizer'], world)
     if world > 1 and is0:
         print(f'lr: scaled by sqrt({world}) -> learning_rate {opt_cfg["learning_rate"]:g}'
               + (f', kpt_lr {opt_cfg["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg else ''))
     optimizer, resume_state = _optimizer_and_resume(model, fresh_names, opt_cfg, resume_state,
-                                                    resume_file, base_reg)
+                                                    resume_file, base_reg, names=registry.names)
 
     val_loss_fn = build_scorer_loss(config, output_granularity).to(device)
     if output_granularity == 'frame':

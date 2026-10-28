@@ -86,12 +86,16 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
 
 
 def warm_start(model, checkpoint_path: Path, verbose: bool = True,
-               base_names: tuple[str, ...] | None = None) -> set[str]:
+               base_names: tuple[str, ...] | None = None,
+               names: tuple[str, ...] | None = None) -> set[str]:
     """Load the base tracker into a pose model. Returns the names of the params left fresh.
 
-    Base migrations run first and every `strict=False` drop is named. A GROWN REGISTRY KEEPS ITS
-    ROWS: the checkpoint's (n0, d) identity table is copied into the first n0 rows of this
-    model's (n, d) one -- refused if `base_names`'s length does not match n0, because a
+    Base migrations run first and every `strict=False` drop is named. The identity table is
+    copied BY NAME when both registries are given: row i of this model (`names[i]`) takes the
+    checkpoint's row for the same name in `base_names`; a base name this run does not have is
+    dropped, and a name the base lacks keeps its fresh init. Without `names` (legacy callers) a
+    GROWN REGISTRY KEEPS ITS ROWS by position: the checkpoint's (n0, d) table fills the first n0
+    rows. Either way the copy is refused if `base_names`'s length does not match n0, because a
     mis-applied copy points each row at a different body part. `_interp_res_params` returns
     (dict, BOOL): `interpolated` is the flag, not a key list.
     """
@@ -108,13 +112,42 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
         if not k.endswith('kpt_embed.weight') or k not in msd:
             continue
         n0, n = v.shape[0], msd[k].shape[0]
-        if not (n0 < n and v.shape[1:] == msd[k].shape[1:]):
+        if v.shape[1:] != msd[k].shape[1:]:
             continue
         if base_names is not None and len(base_names) != n0:
             if verbose:
                 print(f'warm start: {k} is {n0} rows but the base registry names '
                       f'{len(base_names)}, so it is NOT that registry\'s table -- the rows are '
                       'left fresh rather than copied onto the wrong keypoints')
+            state.pop(k)
+            continue
+        if base_names is not None and names is not None:
+            if len(names) != n:
+                raise ValueError(f'warm start: {k} has {n} rows but {len(names)} names given')
+            src = {nm: j for j, nm in enumerate(base_names)}
+            hits = [(i, src[nm]) for i, nm in enumerate(names) if nm in src]
+            if not hits:
+                if verbose:
+                    print(f'warm start: {k}: no keypoint name in common with the base registry; '
+                          f'all {n} rows fresh')
+                state.pop(k)
+                continue
+            mapped = msd[k].clone()
+            rows, cols = zip(*hits)
+            mapped[list(rows)] = v[list(cols)].to(mapped.dtype)
+            state[k] = mapped
+            if verbose:
+                kept = {names[i] for i in rows}
+                new = [nm for nm in names if nm not in kept]
+                gone = [nm for nm in base_names if nm not in kept]
+                print(f'warm start: {k} mapped by name: {len(hits)} rows copied, {len(new)} new, '
+                      f'{len(gone)} base rows dropped')
+                if new:
+                    print(f'  new: {new}')
+                if gone:
+                    print(f'  dropped: {gone}')
+            continue
+        if not n0 < n:
             continue
         grown = msd[k].clone()
         grown[:n0] = v

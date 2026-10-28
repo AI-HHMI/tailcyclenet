@@ -412,6 +412,34 @@ def test_a_grown_registry_keeps_its_trained_keypoint_rows(tmp_path):
     torch.testing.assert_close(model2.query_encoder.kpt_embed.weight.detach(), virgin2)
 
 
+def test_a_warm_start_copies_keypoint_rows_by_name(tmp_path):
+    """With this run's names, rows are matched BY NAME: shared names load (reordered), base-only
+    names are dropped, new names keep their fresh init; no shared name leaves the table fresh."""
+    from tailcyclenet.pose.checkpoint import warm_start
+
+    base = build_model(small(), n_keypoints=3)
+    ckpt = tmp_path / 'base.pth'
+    torch.save({'model_state': base.state_dict()}, ckpt)
+    src = base.query_encoder.kpt_embed.weight.detach()
+
+    model = build_model(small(), n_keypoints=4)
+    virgin = model.query_encoder.kpt_embed.weight.detach().clone()
+    fresh = warm_start(model, ckpt, verbose=False, base_names=('a', 'b', 'c'),
+                       names=('c', 'x', 'a', 'y'))
+    got = model.query_encoder.kpt_embed.weight.detach()
+    torch.testing.assert_close(got[0], src[2])
+    torch.testing.assert_close(got[2], src[0])
+    torch.testing.assert_close(got[[1, 3]], virgin[[1, 3]])
+    assert not any('kpt_embed' in n for n in fresh)
+
+    same = build_model(small(), n_keypoints=3)
+    virgin3 = same.query_encoder.kpt_embed.weight.detach().clone()
+    fresh = warm_start(same, ckpt, verbose=False, base_names=('a', 'b', 'c'),
+                       names=('p', 'q', 'r'))
+    torch.testing.assert_close(same.query_encoder.kpt_embed.weight.detach(), virgin3)
+    assert any('kpt_embed' in n for n in fresh)
+
+
 # ----------------------------------------------------------------------------------------------
 # the 3D output: gridresid_offset and the anchors
 # ----------------------------------------------------------------------------------------------

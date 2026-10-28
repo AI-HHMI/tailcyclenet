@@ -95,6 +95,9 @@ def _patch_score_root(monkeypatch, index=(), config=None, load=None):
         def eval(self):
             return self
 
+        def set_scene_speed(self, **_kwargs):
+            return None
+
     def default_load(*_args, **_kwargs):
         return (FakeModel(), config or {}, SimpleNamespace(names=['k']),
                 SimpleNamespace(name='checkpoint_last.pth'))

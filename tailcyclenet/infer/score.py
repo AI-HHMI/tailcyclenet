@@ -239,7 +239,8 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                checkpoint_info: dict | None = None, checkpoint: str | None = None,
                session: str | None = None, start: int | None = None,
                stop: int | None = None, num_workers: int = 0, cams='all',
-               dataset_name: str | None = None) -> tuple:
+               dataset_name: str | None = None, precision: str = 'bf16',
+               camera_batch: bool = True) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
@@ -258,7 +259,9 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             num_workers -- decode in this many loader workers, each walking a contiguous chunk
             of windows, overlapping the forward (0 = in this process); cams -- per-window camera
             count, see `_cams_config`; dataset_name -- read the root's keypoints as this
-            registry dataset (`_alias_registry`).
+            registry dataset (`_alias_registry`); precision / camera_batch -- the scene-encode
+            speed settings, `set_scene_speed`, with inference's defaults (bf16 autocast for the
+            video encoder only; every camera in one encoder call).
     With workers, `limit` caps the windows REQUESTED (a failed window still counts); in this
     process it caps the windows scored. Rows come out in index order either way.
     The session for each row comes from the index entry: coordinates and keypoint ids retain the
@@ -321,6 +324,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     stream = _items(ds, where, num_workers)
     if num_workers > 0:
         model = model.to(device)
+    model.set_scene_speed(precision=precision, camera_batch=camera_batch)
     t_start = time.perf_counter()
     for i, item in stream:
         if limit is not None and n_seen >= limit:
@@ -592,7 +596,8 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
                   output_granularity: str | None = None,
                   session: str | None = None, start: int | None = None,
                   stop: int | None = None, val_stride: int | None = None,
-                  cams=None, dataset_name: str | None = None) -> None:
+                  cams=None, dataset_name: str | None = None, precision: str | None = None,
+                  camera_batch: bool | None = None) -> None:
     """Write mode-aware QC tables, report, provenance, and optional coverage.
 
     Framewise ``table`` is the raw contextual window table returned by :func:`score_root`.  It is
@@ -656,6 +661,10 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         output_provenance['cams'] = str(cams)
     if dataset_name is not None:
         output_provenance['dataset_name'] = str(dataset_name)
+    if precision is not None:
+        output_provenance['precision'] = str(precision)
+    if camera_batch is not None:
+        output_provenance['camera_batch'] = bool(camera_batch)
     (out / 'provenance.toml').write_text(toml.dumps(output_provenance))
     if coverage is not None:
         coverage_schema = {
@@ -726,6 +735,11 @@ def main(argv=None):
                              '(e.g. a full-length root of the root the scorer was trained on)')
     parser.add_argument('--no-tf32', action='store_true',
                         help='disable TF32 matmuls/convs (on by default)')
+    parser.add_argument('--precision', choices=('fp32', 'bf16', 'fp16'), default='bf16',
+                        help='autocast dtype for the scene (video encoder) encode only, as in '
+                             'infer; fp32 reproduces scores before 2026-10-28')
+    parser.add_argument('--camera-batch', action=argparse.BooleanOptionalAction, default=True,
+                        help='encode all cameras in one scene-encoder call per window')
     args = parser.parse_args(argv)
     from ..runtime import set_tf32
     set_tf32(not args.no_tf32)
@@ -747,7 +761,8 @@ def main(argv=None):
         val_stride=args.val_stride, spans=spans, coverage=coverage,
         checkpoint=args.checkpoint, checkpoint_info=checkpoint_info,
         session=args.session, start=args.start, stop=args.stop, num_workers=num_workers,
-        cams=args.cams, dataset_name=args.dataset_name)
+        cams=args.cams, dataset_name=args.dataset_name, precision=args.precision,
+        camera_batch=args.camera_batch)
     report = rank(table, args.top)
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage,
@@ -755,5 +770,6 @@ def main(argv=None):
                   checkpoint_iteration=checkpoint_info.get('checkpoint_iteration'),
                   output_granularity=scorer_output_granularity(_config), session=args.session,
                   start=args.start, stop=args.stop, val_stride=args.val_stride,
-                  cams=args.cams, dataset_name=args.dataset_name)
+                  cams=args.cams, dataset_name=args.dataset_name, precision=args.precision,
+                  camera_batch=args.camera_batch)
     return 0

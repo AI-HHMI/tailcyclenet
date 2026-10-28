@@ -66,7 +66,7 @@ def reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None
         ram_gb = _memory.current().budget_gb
     if procs is None:
         procs = int(os.environ.get('TAILCYCLENET_LOCAL_WORLD_SIZE', '1') or 1)
-    want = 4 if workers else max(int(n_cams), 4)
+    want = max(int(n_cams), 4) if (_full_rig or not workers) else 4
     k = _READER_GB_PER_MP * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
     share = max(workers or 1, 1) * max(int(procs), 1)
     budget_bytes = max(0.0, ram_gb * _memory.FRACTION_READERS) * _memory.GB
@@ -76,6 +76,19 @@ def reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None
 
 _readers = None
 _cache_lock = threading.Lock()
+_full_rig = False
+
+
+def want_full_rig() -> None:
+    """Size this process's cache to hold EVERY camera of the rig, even as a loader worker.
+
+    A training worker interleaves windows from many groups and wants 4 (`ChunkShuffle.mix`); a
+    streaming worker (`infer.score`) walks one run of consecutive windows, where a cache below
+    the camera count re-opens and re-seeks a container on nearly every window. Call before the
+    first video read; the RAM clamp still bounds the size.
+    """
+    global _full_rig
+    _full_rig = True
 
 
 class ReaderCache:

@@ -14,6 +14,8 @@ spec is the human's and is untouched. Everything this writes goes to `--out`.
 from __future__ import annotations
 
 import argparse
+import os
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -119,11 +121,124 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
     return views, coords, cgroup, kpt_ids
 
 
+def _alias_registry(registry, target: str, alias: str):
+    """`registry` with `alias`'s keypoint ids also filed under the dataset name `target`.
+
+    A multi-dataset registry spells names `<dataset>-<keypoint>`, so a scorer trained on
+    `qdmouse4m-ref-cleaned-v2` knows no `qdmouse4m-ref-full-*` name even when the two roots share a
+    rig and a skeleton. The alias reuses the SAME ids (the same embedding rows), renaming only.
+
+    Inputs: registry -- the scorer's registry; target -- the scored root's dataset name; alias --
+            a dataset name the registry already holds.
+    Outputs: a new Registry; `registry` itself is untouched.
+    Side effects: raises SystemExit when `alias` is not in the registry.
+    """
+    from ..format.registry import Registry
+
+    known = dict(registry.datasets)
+    if alias not in known:
+        raise SystemExit(f'--dataset-name {alias!r} is not in this scorer\'s registry; it holds '
+                         f'{sorted(known)}')
+    if target == alias:
+        return registry
+    ids = known[alias]
+    names = list(registry.names)
+    pre = f'{alias}-'
+    for i in ids:
+        if names[i].startswith(pre):
+            names[i] = f'{target}-{names[i][len(pre):]}'
+    out = {k: v for k, v in known.items() if k != alias}
+    out[target] = tuple(ids)
+    return Registry(names=tuple(names), datasets=tuple(sorted(out.items())))
+
+
+def _cams_config(lc, cams):
+    """The loader config with the per-window camera count `cams` applies.
+
+    Inputs: lc -- the run's LoaderConfig; cams -- None or 'run' (the run's own `cams_to_sample`,
+            a per-window draw seeded by the window index), 'val' (`val_cams_to_sample`), 'all'
+            (every camera of the session), or an int.
+    Outputs: a LoaderConfig.
+    Side effects: raises ValueError on an unknown spelling.
+    """
+    if cams is None or cams == 'run':
+        return lc
+    if cams == 'val':
+        return replace(lc, cams_to_sample=lc.val_cams_to_sample)
+    if cams == 'all':
+        return replace(lc, cams_to_sample=1 << 16)
+    try:
+        n = int(cams)
+    except (TypeError, ValueError):
+        raise ValueError(f'cams must be run, val, all or an int, got {cams!r}') from None
+    if n < 1:
+        raise ValueError(f'cams must be >= 1, got {n}')
+    return replace(lc, cams_to_sample=n)
+
+
+def default_num_workers() -> int:
+    """Loader workers for a scoring pass: every core this process may use but one, at most 8."""
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 1
+    return max(0, min(8, cores - 1))
+
+
+class _WindowStream(torch.utils.data.IterableDataset):
+    """`ds.get_once` over `where`, each loader worker walking ONE contiguous chunk.
+
+    Contiguous, not strided: consecutive windows of a group are consecutive frames, so a worker
+    that owns a run of them keeps every camera's decoder moving forward (`PyAVReader.get_batch`
+    continues instead of seeking) and decodes each source frame once. Yields `(index, item)`;
+    `item` is None for a window that failed to build.
+    """
+
+    def __init__(self, ds, where, n_chunks: int):
+        """Split `where` into `n_chunks` contiguous, near-equal chunks."""
+        super().__init__()
+        self.ds = ds
+        self.chunks = [list(map(int, c)) for c in np.array_split(np.asarray(where, dtype=np.int64),
+                                                                max(1, int(n_chunks)))]
+
+    def __iter__(self):
+        """Yield this worker's chunk, in index order."""
+        info = torch.utils.data.get_worker_info()
+        chunk = self.chunks[0 if info is None else info.id]
+        for i in chunk:
+            yield i, self.ds.get_once(i)
+
+
+def _stream_worker_init(_worker_id: int) -> None:
+    """A scoring worker holds a reader for every camera and leaves the cores to the decoders."""
+    from ..data import reader_cache
+    reader_cache.want_full_rig()
+    torch.set_num_threads(1)
+
+
+def _items(ds, where, num_workers: int, prefetch: int = 2):
+    """An iterator of `(index, item)` over `where`; arrival order is NOT `where` order.
+
+    `num_workers <= 0` decodes in this process, in order. Otherwise the decode runs in
+    `_WindowStream` workers so it overlaps the model's forward (gotcha 10: nothing here has
+    decoded in the parent, and the parent only reads tables). The workers fork HERE, eagerly,
+    so a caller can move its model to the GPU only afterwards.
+    """
+    if num_workers <= 0:
+        return ((i, ds.get_once(i)) for i in where)
+    loader = torch.utils.data.DataLoader(
+        _WindowStream(ds, where, num_workers), batch_size=None, num_workers=num_workers,
+        prefetch_factor=max(1, int(prefetch)), worker_init_fn=_stream_worker_init,
+        persistent_workers=False)
+    return iter(loader)
+
+
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
                val_stride: int | None = None, spans: dict | None = None, coverage: list[dict] | None = None, *,
                checkpoint_info: dict | None = None, checkpoint: str | None = None,
                session: str | None = None, start: int | None = None,
-               stop: int | None = None) -> tuple:
+               stop: int | None = None, num_workers: int = 0, cams=None,
+               dataset_name: str | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
@@ -138,19 +253,28 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             coverage -- optional list populated with one record per requested window; checkpoint --
             an explicit checkpoint filename passed to the scorer loader (for example
             ``checkpoint_best.pth``); checkpoint_info -- optional mutable mapping populated with
-            the resolved checkpoint file and training iteration for output provenance.
+            the resolved checkpoint file and training iteration for output provenance;
+            num_workers -- decode in this many loader workers, each walking a contiguous chunk
+            of windows, overlapping the forward (0 = in this process); cams -- per-window camera
+            count, see `_cams_config`; dataset_name -- read the root's keypoints as this
+            registry dataset (`_alias_registry`).
+    With workers, `limit` caps the windows REQUESTED (a failed window still counts); in this
+    process it caps the windows scored. Rows come out in index order either way.
     The session for each row comes from the index entry: coordinates and keypoint ids retain the
     session's own name order, which may reorder or subset the dataset registry.
     Outputs: (Polars DataFrame of per-keypoint scores, the scorer's registry, the run's config).
-    Side effects: decodes video frames; puts the model in eval mode.
+    Side effects: decodes video frames; puts the model in eval mode. With workers the model is
+    loaded on the CPU and moved to `device` only after they fork (they never touch CUDA).
     """
     model, config, registry, ckpt = load_scorer_run(
-        Path(run), checkpoint=checkpoint, device=device)
+        Path(run), checkpoint=checkpoint, device='cpu' if num_workers > 0 else device)
     if checkpoint_info is not None:
         checkpoint_info['checkpoint_file'] = str(ckpt)
         checkpoint_data = torch.load(ckpt, map_location='cpu', weights_only=False, mmap=True)
         checkpoint_info['checkpoint_iteration'] = checkpoint_data.get('iteration')
-    lc = _loader_config(config)
+    lc = _cams_config(_loader_config(config), cams)
+    if dataset_name is not None:
+        registry = _alias_registry(registry, Path(str(data).rstrip('/')).name, dataset_name)
     if val_stride is not None:
         lc = replace(lc, val_stride=int(val_stride))
     dataset_cls = PoseDataset
@@ -187,24 +311,32 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     print(f'scoring up to {len(where)} windows from {data}/{split} with {ckpt.name}')
 
     output_granularity = scorer_output_granularity(config)
-    rows = []
+    rows_by: dict[int, list] = {}
+    cov_by: dict[int, list] = {}
     model.eval()
     n_seen = 0
-    for i in where:
+    if num_workers > 0 and limit is not None:
+        where = where[:int(limit)]
+    stream = _items(ds, where, num_workers)
+    if num_workers > 0:
+        model = model.to(device)
+    t_start = time.perf_counter()
+    for i, item in stream:
         if limit is not None and n_seen >= limit:
             break
+        rows = rows_by.setdefault(int(i), [])
+        cov = cov_by.setdefault(int(i), [])
         requested = ds.index[i]
         expected_session = requested.session.session_id
         expected_group = requested.gid
         expected_animal = str(requested.session.labels(requested.gid).animal_ids[requested.animal])
         expected_start = int(requested.start)
-        item = ds.get_once(i)
         if item is None:
             if coverage is not None:
-                coverage.append({'index': int(i), 'session': expected_session,
-                                 'group': expected_group, 'animal': expected_animal,
-                                 'start': expected_start, 'status': 'unscorable',
-                                 'reason': 'item_build_failed'})
+                cov.append({'index': int(i), 'session': expected_session,
+                            'group': expected_group, 'animal': expected_animal,
+                            'start': expected_start, 'status': 'unscorable',
+                            'reason': 'item_build_failed'})
             continue
         row_identity = (str(item[5]['session']), str(item[5]['group']),
                         str(item[5]['animal']), int(item[5]['start']))
@@ -212,16 +344,17 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                              expected_start)
         if row_identity != expected_identity:
             if coverage is not None:
-                coverage.append({'index': int(i), 'session': expected_session,
-                                 'group': expected_group, 'animal': expected_animal,
-                                 'start': expected_start, 'status': 'identity_mismatch',
-                                 'reason': f'returned {row_identity}'})
+                cov.append({'index': int(i), 'session': expected_session,
+                            'group': expected_group, 'animal': expected_animal,
+                            'start': expected_start, 'status': 'identity_mismatch',
+                            'reason': f'returned {row_identity}'})
+                coverage.extend(c for j in where for c in cov_by.get(int(j), ()))
             raise RuntimeError(f'QC index {i} returned {row_identity}, expected '
                                f'{expected_identity}; refusing cross-group scoring')
         if coverage is not None:
-            coverage.append({'index': int(i), 'session': expected_session,
-                             'group': expected_group, 'animal': expected_animal,
-                             'start': expected_start, 'status': 'scored', 'reason': ''})
+            cov.append({'index': int(i), 'session': expected_session,
+                        'group': expected_group, 'animal': expected_animal,
+                        'start': expected_start, 'status': 'scored', 'reason': ''})
         n_seen += 1
         sess = ds.index[i].session
         views, coords, _vis, frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
@@ -273,6 +406,14 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                     'score': float(scores[ki]), 'precision': float(precision[ki]),
                     'n_observed_frames': int(observed[ki]), 'n_cams': len(cgroup),
                 })
+
+    elapsed = time.perf_counter() - t_start
+    if n_seen:
+        print(f'scored {n_seen} windows in {elapsed:.1f} s ({elapsed / n_seen:.3f} s/window, '
+              f'{num_workers} decode worker(s))')
+    rows = [r for i in where for r in rows_by.get(int(i), ())]
+    if coverage is not None:
+        coverage.extend(c for i in where for c in cov_by.get(int(i), ()))
 
     if rows:
         table = pl.DataFrame(rows)
@@ -449,7 +590,8 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
                   checkpoint_iteration: int | None = None,
                   output_granularity: str | None = None,
                   session: str | None = None, start: int | None = None,
-                  stop: int | None = None, val_stride: int | None = None) -> None:
+                  stop: int | None = None, val_stride: int | None = None,
+                  cams=None, dataset_name: str | None = None) -> None:
     """Write mode-aware QC tables, report, provenance, and optional coverage.
 
     Framewise ``table`` is the raw contextual window table returned by :func:`score_root`.  It is
@@ -509,6 +651,10 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         output_provenance['window_stop_index'] = int(stop)
     if val_stride is not None:
         output_provenance['val_stride'] = int(val_stride)
+    if cams is not None:
+        output_provenance['cams'] = str(cams)
+    if dataset_name is not None:
+        output_provenance['dataset_name'] = str(dataset_name)
     (out / 'provenance.toml').write_text(toml.dumps(output_provenance))
     if coverage is not None:
         coverage_schema = {
@@ -566,7 +712,24 @@ def main(argv=None):
                              'starting inside each span (a targeted look at a clip bad stretch)')
     parser.add_argument('--val-stride', type=int, default=None,
                         help='window spacing; default is the run n_frames (non-overlapping)')
+    parser.add_argument('--num-workers', type=int, default=None,
+                        help='decode workers, each walking a contiguous run of windows so every '
+                             'camera decodes forward once; default: cores - 1, at most 8; 0 = '
+                             'decode in this process')
+    parser.add_argument('--cams', default=None,
+                        help="cameras per window: 'run' (default; the run's cams_to_sample, a "
+                             "per-window draw), 'val' (val_cams_to_sample), 'all', or an int")
+    parser.add_argument('--dataset-name', default=None,
+                        help="read --data's keypoints as this dataset of the scorer's registry "
+                             '(e.g. a full-length root of the root the scorer was trained on)')
+    parser.add_argument('--no-tf32', action='store_true',
+                        help='disable TF32 matmuls/convs (on by default)')
     args = parser.parse_args(argv)
+    from ..runtime import set_tf32
+    set_tf32(not args.no_tf32)
+    num_workers = default_num_workers() if args.num_workers is None else int(args.num_workers)
+    if str(args.device).startswith('cpu') and args.num_workers is None:
+        num_workers = 0
     spans = None
     if args.spans_csv:
         import csv as _csv
@@ -581,12 +744,14 @@ def main(argv=None):
         Path(args.run), args.data, args.split, args.device, args.limit,
         val_stride=args.val_stride, spans=spans, coverage=coverage,
         checkpoint=args.checkpoint, checkpoint_info=checkpoint_info,
-        session=args.session, start=args.start, stop=args.stop)
+        session=args.session, start=args.start, stop=args.stop, num_workers=num_workers,
+        cams=args.cams, dataset_name=args.dataset_name)
     report = rank(table, args.top)
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage,
                   checkpoint_file=checkpoint_info.get('checkpoint_file'),
                   checkpoint_iteration=checkpoint_info.get('checkpoint_iteration'),
                   output_granularity=scorer_output_granularity(_config), session=args.session,
-                  start=args.start, stop=args.stop, val_stride=args.val_stride)
+                  start=args.start, stop=args.stop, val_stride=args.val_stride,
+                  cams=args.cams, dataset_name=args.dataset_name)
     return 0

@@ -199,3 +199,40 @@ def test_the_deleted_window_offset_levers_are_refused_by_name():
                  lambda: loader_config({'val_offset': 3}, {})):
         with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
             call()
+
+
+def test_alias_registry_reuses_ids_under_the_scored_roots_name():
+    """A full-length root reads its keypoints through the trained root's embedding rows."""
+    from tailcyclenet.format.registry import Registry
+
+    reg = Registry(names=('a-x', 'a-y', 'b-x'), datasets=(('a', (0, 1)), ('b', (2,))))
+    out = qc._alias_registry(reg, 'a-full', 'a')
+    assert out.ids_for('a-full', ['y', 'x']).tolist() == [1, 0]
+    assert dict(out.datasets)['b'] == (2,) and 'a' not in dict(out.datasets)
+    assert qc._alias_registry(reg, 'a', 'a') is reg
+    with pytest.raises(SystemExit, match='not in this scorer'):
+        qc._alias_registry(reg, 'c', 'zzz')
+
+
+def test_cams_config_spellings():
+    """`--cams` maps onto `cams_to_sample`; the default leaves the run's own draw alone."""
+    from tailcyclenet.loader.config import LoaderConfig
+
+    lc = LoaderConfig()
+    assert qc._cams_config(lc, None) is lc and qc._cams_config(lc, 'run') is lc
+    assert qc._cams_config(lc, 'val').cams_to_sample == lc.val_cams_to_sample
+    assert qc._cams_config(lc, 'all').cams_to_sample >= 64
+    assert qc._cams_config(lc, '3').cams_to_sample == 3
+    for bad in ('0', 'many'):
+        with pytest.raises(ValueError):
+            qc._cams_config(lc, bad)
+
+
+def test_window_stream_chunks_are_contiguous_and_cover_where():
+    """Each worker owns ONE contiguous run of windows (its decoders only move forward)."""
+    where = [3, 4, 5, 9, 10, 11, 12]
+    stream = qc._WindowStream(SimpleNamespace(get_once=lambda i: i), where, 3)
+    assert [i for c in stream.chunks for i in c] == where
+    assert all(c == sorted(c) for c in stream.chunks) and len(stream.chunks) == 3
+    assert list(qc._items(SimpleNamespace(get_once=lambda i: -i), where, 0)) == [
+        (i, -i) for i in where]

@@ -15,6 +15,7 @@ SCORER_CONFIG_KEYS = {
     'inactive_consistency_weight', 'anchor_consistency_weight', 'selection_metric',
     'loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy',
     'two_d_sampling', 'collapse_patience', 'same_label_pull_weight',
+    'same_label_pull_start', 'same_label_pull_ramp',
 }
 FRAME_SELECTION_METRICS = {
     'triplet_acc', 'active_triplet_acc', 'score_gap', 'active_score_gap',
@@ -100,7 +101,8 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
             raise SystemExit(
                 f'[scorer]: frame-only setting(s) {bad} require '
                 'output_granularity = "frame"; sequence mode keeps the legacy loss.')
-        if float(scorer.get('same_label_pull_weight', 1.0)) != 1.0:
+        if (float(scorer.get('same_label_pull_weight', 1.0)) != 1.0
+                or int(scorer.get('same_label_pull_start', 0)) != 0):
             raise SystemExit(
                 '[scorer].same_label_pull_weight applies to the frame loss only; the installed '
                 'sequence loss always pulls at 1.0, so a sequence config must set it to 1.0')

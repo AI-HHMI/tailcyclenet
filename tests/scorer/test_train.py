@@ -448,3 +448,15 @@ def test_a_collapsed_val_gap_stops_the_run_after_its_patience():
     loop.check_collapse(dead, 10 ** 6)
     loop.collapse_patience = 1000
     loop.check_collapse({'val/score_gap': float('nan')}, 10 ** 6)
+
+
+def test_the_same_label_pull_schedule_is_off_then_ramps_to_its_weight():
+    """0 before the start, linear over the ramp, the configured weight after; start 0 = always on."""
+    from tailcyclenet.scorer.train import ScorerLoop
+
+    loop = ScorerLoop.__new__(ScorerLoop)
+    loop.pull_target, loop.pull_start, loop.pull_ramp = 1.0, 1000, 500
+    assert [loop.pull_weight(i) for i in (0, 999, 1000, 1250, 1500, 10 ** 6)] == \
+        [0.0, 0.0, 0.0, 0.5, 1.0, 1.0]
+    loop.pull_start, loop.pull_ramp = 0, 0
+    assert loop.pull_weight(0) == 1.0

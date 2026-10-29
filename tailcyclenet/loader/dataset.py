@@ -278,8 +278,11 @@ class PoseDataset(Dataset):
                 for name, n, t in boxed))
         multi = self.train and cfg.balance_datasets and len(self.datasets) > 1
         pools = self.by_dataset if multi else [list(range(len(self.index)))]
+        names = ([ds.name for ds in self.datasets] if multi else [None])
+        kept = [(n, p) for n, p in zip(names, pools) if p]
         self._pools = [(np.asarray(p, dtype=np.int64),
-                        self._pool_weights(p) if self.train else None) for p in pools if p]
+                        self._pool_weights(p) if self.train else None) for _, p in kept]
+        self._pool_cum = self._dataset_pool_weights([n for n, _ in kept], multi)
 
     # -- indexing ------------------------------------------------------------------------
     def _labelled_frames(self, vis, a):
@@ -361,6 +364,37 @@ class PoseDataset(Dataset):
             raise ValueError('sampling weights are all zero -- check annot_frac / mode_3d_frac')
         return np.cumsum(w / w.sum())
 
+    def _dataset_pool_weights(self, names, multi):
+        """Cumulative P(pool) from `[data].dataset_weights`, or None for the uniform draw.
+
+        A relative weight per dataset-root NAME (absent = 1.0); renormalised over the pools that
+        hold train windows. None (the default) keeps `_pick`'s uniform `rng.integers` draw, so a
+        config without the key is byte-identical. A name that matches no root is refused (a typo
+        would otherwise train at the defaults and report as the arm it is not).
+        """
+        dw = self.cfg.dataset_weights
+        if not dw or not self.train:
+            return None
+        if not multi:
+            raise ValueError('dataset_weights needs balance_datasets = true and a folder of '
+                             'dataset roots on the train split')
+        known = {ds.name for ds in self.datasets}
+        unknown = sorted(set(dw) - known)
+        if unknown:
+            raise ValueError(f'dataset_weights: unknown dataset root(s) {unknown}; '
+                             f'known: {sorted(known)}')
+        w = np.asarray([float(dw.get(n, 1.0)) for n in names], dtype=np.float64)
+        if not np.all(np.isfinite(w)) or (w < 0).any() or w.sum() <= 0:
+            raise ValueError(f'dataset_weights must be finite, >= 0 and not all zero, got {dw}')
+        return np.cumsum(w / w.sum())
+
+    def pool_shares(self):
+        """P(pool) per train pool, in `_pools` order (uniform unless `dataset_weights`)."""
+        n = len(self._pools)
+        if self._pool_cum is None:
+            return np.full(n, 1.0 / n)
+        return np.diff(self._pool_cum, prepend=0.0)
+
     def mix(self):
         """Source-session share per (label_source, mode) cell before the 2-D path coin.
 
@@ -368,9 +402,9 @@ class PoseDataset(Dataset):
         3-D sessions contribute `prob_2d_only` of their train draws to the runtime 2-D path.
         """
         out: dict[str, float] = {}
-        for p, cum in self._pools:
+        for (p, cum), share in zip(self._pools, self.pool_shares()):
             wt = np.diff(cum, prepend=0.0) if cum is not None else np.full(len(p), 1.0 / len(p))
-            for j, x in zip(p, wt / len(self._pools)):
+            for j, x in zip(p, wt * share):
                 sess = self.index[j].session
                 out[f'{sess.mode}-{sess.label_source}'] = (
                     out.get(f'{sess.mode}-{sess.label_source}', 0.0) + float(x))
@@ -390,8 +424,14 @@ class PoseDataset(Dataset):
         """
         if not self.train:
             return self.index[idx]
-        pool, cum = (self._pools[rng.integers(len(self._pools))] if len(self._pools) > 1
-                     else self._pools[0])
+        if len(self._pools) == 1:
+            pool, cum = self._pools[0]
+        elif self._pool_cum is None:
+            pool, cum = self._pools[rng.integers(len(self._pools))]
+        else:
+            k = min(int(np.searchsorted(self._pool_cum, rng.random(), side='right')),
+                    len(self._pools) - 1)
+            pool, cum = self._pools[k]
         if cum is None:
             return self.index[idx if len(self._pools) == 1 else pool[rng.integers(len(pool))]]
         return self.index[int(pool[np.searchsorted(cum, rng.random())])]

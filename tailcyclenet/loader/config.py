@@ -77,6 +77,9 @@ class LoaderConfig:
     annot_frac: float | None = None
     # P(3d | source), i.e. applied WITHIN each source
     mode_3d_frac: float | None = None
+    # Relative P(dataset root) on train, keyed by root NAME (absent = 1.0); applied on top of
+    # `balance_datasets`'s uniform-over-roots draw. None/empty = uniform (byte-identical).
+    dataset_weights: dict | None = None
     # 'none' | 'film': emit a per-frame animal box (`box_prompt.compute_box_prompt`); set by
     # `scripts/train.py` from `[model].box_prompt` so the two cannot disagree
     box_prompt: str = 'none'

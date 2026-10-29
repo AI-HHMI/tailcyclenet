@@ -352,6 +352,29 @@ def test_mixed_2d_and_3d_in_one_run(tiny_root):
     assert modes == {'2d', '3d'}
 
 
+def test_dataset_weights_reweight_the_root_draw(tiny_root):
+    """`dataset_weights` moves P(root) by name; absent = 1.0, an unknown name is refused, and
+    the key leaves val/test (index-addressed) alone."""
+    import dataclasses
+
+    ds = PoseDataset(tiny_root, 'train', dataclasses.replace(
+        CFG, dataset_weights={'ratlike': 3.0}))
+    names = [ds.datasets[ds.index[int(p[0])].ds].name for p, _ in ds._pools]
+    shares = dict(zip(names, ds.pool_shares()))
+    assert shares == pytest.approx({'ratlike': 0.75, 'mouselike': 0.25})
+    assert sum(ds.mix().values()) == pytest.approx(1.0)
+    rng = np.random.default_rng(0)
+    picks = [ds.datasets[ds._pick(0, rng).ds].name for _ in range(4000)]
+    assert picks.count('ratlike') / len(picks) == pytest.approx(0.75, abs=0.03)
+
+    assert PoseDataset(tiny_root, 'train', CFG)._pool_cum is None   # absent key = uniform draw
+    with pytest.raises(ValueError, match='unknown dataset root'):
+        PoseDataset(tiny_root, 'train', dataclasses.replace(CFG, dataset_weights={'ratlik': 2.0}))
+    with pytest.raises(ValueError, match='not all zero'):
+        PoseDataset(tiny_root, 'train', dataclasses.replace(
+            CFG, dataset_weights={'ratlike': 0.0, 'mouselike': 0.0}))
+
+
 def test_registry_ids_are_append_only(tiny_root):
     """Ids are APPEND-ONLY against an existing registry (discovery order is not stable), or warm
     start remaps the embedding."""

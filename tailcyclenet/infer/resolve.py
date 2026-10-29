@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..loader.config import LoaderConfig
-from ..data.crop import legacy_crop_rule
+from ..data.crop import crop_rule
 from .window import InferConfig
 
 
@@ -230,8 +230,7 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
     cfg = InferConfig(
         n_frames=args.n_frames or trained_frames,
         overlap=args.overlap, image_size=trained_px,
-        **dict(zip(('crop_pad_px', 'crop_pad_frac', 'min_crop_dim'),
-                   legacy_crop_rule(config['data']))),
+        **dict(zip(('crop_pad_frac', 'min_crop_dim'), crop_rule(config['data']))),
         box_source=config['data'].get('box_source', LoaderConfig.box_source),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         frame_start=args.frame_start, frame_stop=args.frame_stop,

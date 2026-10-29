@@ -755,7 +755,6 @@ class PoseDataset(Dataset):
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
                                                          inflate=inflate,
-                                                         pad=self.cfg.crop_pad_px,
                                                          pad_frac=self.cfg.crop_pad_frac)
             if cam is None:
                 return None
@@ -807,7 +806,6 @@ class PoseDataset(Dataset):
             cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
                                                       jit, crop_pts=cp3,
                                                       inflate=inflate,
-                                                      pad=self.cfg.crop_pad_px,
                                                       pad_frac=self.cfg.crop_pad_frac)
             if cgroup is None:
                 return None

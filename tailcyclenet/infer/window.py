@@ -60,7 +60,7 @@ _MIN_STORE_BYTES = 512 << 20
 
 def _pad_rule(cfg):
     """The run's pad rule as the crop functions' keyword arguments."""
-    return {'pad': cfg.crop_pad_px, 'pad_frac': cfg.crop_pad_frac}
+    return {'pad_frac': cfg.crop_pad_frac}
 
 
 @dataclass
@@ -68,11 +68,9 @@ class InferConfig:
     n_frames: int = 24
     overlap: int = 4
     image_size: int = 256
-    # THE crop rule the POSE RUN trained under (data/crop.py); defaults are the LEGACY rule, which
-    # is what a saved run that names none of them means -- resolve.py reads the run's own values.
-    min_crop_dim: int = 64
-    crop_pad_px: float = 20.0
-    crop_pad_frac: float = float('inf')
+    # THE crop rule the POSE RUN trained under (data/crop.py); resolve.py reads the run's own values
+    min_crop_dim: int = 32
+    crop_pad_frac: float = 0.05
     anchor: str = 'carry'
     # 0 -> every animal the box source offers
     max_animals: int = 0

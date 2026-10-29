@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from .yolox import YOLOXNano
-from ..data.crop import legacy_crop_rule
+from ..data.crop import crop_rule
 
 
 def resolve_detector_checkpoint(path, checkpoint='latest'):
@@ -75,8 +75,7 @@ class LoadedDetector:
     dataset: str
     min_crop_dim: int
     reduce: bool
-    # the pad rule its targets were cut with (data/crop.py); absent in a checkpoint = legacy
-    crop_pad_px: float
+    # the pad rule its targets were cut with (data/crop.py)
     crop_pad_frac: float
     box_source: str
     tile_scale: float | None
@@ -145,9 +144,8 @@ def load_detector(path, device='cpu', checkpoint='latest'):
     model.box_target = str(ckpt.get('box_target', 'crop'))
     model.antialias = bool(ckpt.get('antialias', False))
     model.input_norm = str(ckpt.get('input_norm', 'none'))
-    pad_px, pad_frac, mcd = legacy_crop_rule(ckpt)
-    model.min_crop_dim = mcd
-    model.crop_pad_px, model.crop_pad_frac = pad_px, pad_frac
+    pad_frac, mcd = crop_rule(ckpt)
+    model.min_crop_dim, model.crop_pad_frac = mcd, pad_frac
     model.box_source = str(ckpt.get('box_source', 'keypoints'))
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:
@@ -158,7 +156,7 @@ def load_detector(path, device='cpu', checkpoint='latest'):
     return LoadedDetector(
         model=model.to(device).eval(), input_wh=tuple(wh), dataset=str(ckpt.get('dataset', '')),
         min_crop_dim=mcd, reduce=bool(ckpt.get('reduce', False)),
-        crop_pad_px=pad_px, crop_pad_frac=pad_frac,
+        crop_pad_frac=pad_frac,
         box_source=str(ckpt.get('box_source', 'keypoints')),
         tile_scale=None if ts is None or ckpt.get('tile_wh') is None else float(ts),
         obj_quantiles=dict(ckpt.get('obj_quantiles') or {}), path=Path(p))

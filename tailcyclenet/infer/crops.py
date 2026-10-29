@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import warnings
 
-import math
-
 import numpy as np
 import torch
 
@@ -14,7 +12,7 @@ from ..data import crop as cropmod
 from ..data.pixels import crop_affine
 
 
-def boxes_from_points(points, cgroup, min_crop_dim, mode, pad=20, pad_frac=math.inf):
+def boxes_from_points(points, cgroup, min_crop_dim, mode, pad_frac=0.05):
     """Crop boxes for one animal in one window, from points -- the crop rule, shared with training.
 
     3D points are world coordinates and get projected; 2D are already pixels. None when nothing
@@ -22,11 +20,9 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode, pad=20, pad_frac=math.
     per-frame extrinsics).
     """
     if mode == '3d':
-        cg, boxes = cropmod.crop_to_points_3d(cgroup, points, min_crop_dim, pad=pad,
-                                              pad_frac=pad_frac)
+        cg, boxes = cropmod.crop_to_points_3d(cgroup, points, min_crop_dim, pad_frac=pad_frac)
         return (cg, boxes) if cg is not None else (None, None)
-    cam, box, _ = cropmod.crop_to_points_2d(cgroup[0], points, min_crop_dim, pad=pad,
-                                            pad_frac=pad_frac)
+    cam, box, _ = cropmod.crop_to_points_2d(cgroup[0], points, min_crop_dim, pad_frac=pad_frac)
     return ([cam], [box]) if cam is not None else (None, None)
 
 
@@ -142,8 +138,7 @@ def box_disagrees(box, other, sides=1.0):
     return bool(d > sides * side)
 
 
-def carry_duplicate(points, others, cams, min_crop_dim, radius, min_shared=2, pad=20,
-                    pad_frac=math.inf):
+def carry_duplicate(points, others, cams, min_crop_dim, radius, min_shared=2, pad_frac=0.05):
     """R4 gate: is a carried 3D pose the same animal as another slot's carried pose?
 
     Inputs: points -- (K,3) this slot's carried pose; others -- the OTHER slots' fresh carried
@@ -174,8 +169,7 @@ def carry_duplicate(points, others, cams, min_crop_dim, radius, min_shared=2, pa
         for ci, cam in enumerate(cams):
             if not in_frame(p[None], cam):
                 continue
-            cg, bx = cropmod.crop_to_points_3d([cam], p[None], min_crop_dim, pad=pad,
-                                               pad_frac=pad_frac)
+            cg, bx = cropmod.crop_to_points_3d([cam], p[None], min_crop_dim, pad_frac=pad_frac)
             if cg is None:
                 continue
             b = np.asarray(bx[0], np.float64)
@@ -263,7 +257,7 @@ def camera_consensus(points, p2, v2, use, boxes, window_cams, res_max, vis_min):
 
 
 def refine_every_camera(points, use, boxes, cam_ix, window_cams, min_crop_dim, min_inside=0.5,
-                        outliers=(), pad=20, pad_frac=math.inf):
+                        outliers=(), pad_frac=0.05):
     """TR1: pass-2 crops for EVERY calibrated camera from pass 1's 3D pose, tested per camera.
 
     Inputs: points -- (T,K,3) pass-1 world pose; use / boxes -- pass 1's cameras and crop
@@ -285,8 +279,7 @@ def refine_every_camera(points, use, boxes, cam_ix, window_cams, min_crop_dim, m
     use2, boxes2, cg2 = [], [], []
     for ci in cam_ix:
         cam = window_cams[ci]
-        cg, bx = cropmod.crop_to_points_3d([cam], points, min_crop_dim, pad=pad,
-                                           pad_frac=pad_frac)
+        cg, bx = cropmod.crop_to_points_3d([cam], points, min_crop_dim, pad_frac=pad_frac)
         if cg is None:
             continue
         if ci in use and ci not in outliers:

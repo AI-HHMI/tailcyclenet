@@ -31,7 +31,7 @@ def test_targets_are_the_crop_rule(tiny_root):
     for s in range(boxes.shape[0]):
         want = crop_box_for_points(
             torch.as_tensor(lab.points2d[s, f, :, ci], dtype=torch.float32),
-            cam['size'], ds.min_crop_dim)
+            cam['size'], ds.min_crop_dim, 0.0, ds.crop_pad_frac)
         got = boxes[s]
         if want is None:
             assert torch.isnan(got).all()
@@ -66,7 +66,7 @@ def test_augmented_targets_are_still_the_crop_rule(tiny_root):
         w, h = float(cam['size'][0]), float(cam['size'][1])
         outside = (p[:, 0] < 0) | (p[:, 0] > w) | (p[:, 1] < 0) | (p[:, 1] > h)
         want = crop_box_for_points(torch.where(outside[:, None], torch.nan, p),
-                                   cam['size'], ds.min_crop_dim)
+                                   cam['size'], ds.min_crop_dim, 0.0, ds.crop_pad_frac)
         if want is None:
             assert torch.isnan(got[s]).all()
             continue
@@ -138,7 +138,7 @@ def test_tiled_targets_are_still_the_crop_rule(tiny_root):
             keep = ((pts[:, 0] >= ox) & (pts[:, 0] <= ox + tw) &
                     (pts[:, 1] >= oy) & (pts[:, 1] <= oy + th))
             want = crop_box_for_points(torch.where(keep[:, None], pts, torch.nan),
-                                       cam['size'], ds.min_crop_dim)
+                                       cam['size'], ds.min_crop_dim, 0.0, ds.crop_pad_frac)
             if want is None:
                 assert torch.isnan(boxes[s]).all()
                 continue
@@ -216,8 +216,10 @@ def test_extent_target_is_tight_and_gives_back_the_crop_rule(tiny_root):
                 lo = fin.min(0).values.clamp(min=0)
                 hi = torch.minimum(fin.max(0).values, cam['size'].float())
                 torch.testing.assert_close(back, torch.cat([lo, hi]), atol=1e-3, rtol=0)
-                rule = crop_boxes_from_extents(back[None], cam['size'], ext.min_crop_dim, 20)[0]
-                want = crop_box_for_points(pts, cam['size'], ext.min_crop_dim).float()
+                rule = crop_boxes_from_extents(back[None], cam['size'], ext.min_crop_dim, 0.0,
+                                               ext.crop_pad_frac)[0]
+                want = crop_box_for_points(pts, cam['size'], ext.min_crop_dim, 0.0,
+                                           ext.crop_pad_frac).float()
                 torch.testing.assert_close(rule, want, atol=1.0, rtol=0)
                 legacy = unletterbox_boxes(crop.boxes_for(i)[s][None], scale, pad)[0]
                 torch.testing.assert_close(legacy, want, atol=0.51, rtol=0)

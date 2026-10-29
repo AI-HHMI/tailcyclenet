@@ -47,7 +47,7 @@ out = "/tmp/run-det"
     cfg = load_detector_config(overlay, out='/tmp/run-det', iters=7, device='cpu')
     d, m, t = cfg['data'], cfg['model'], cfg['training']
     assert d['boxes'] == 'instances' and d['min_crop_dim'] == 32 and d['min_box_px'] == 32
-    assert (d['crop_pad_px'], d['crop_pad_frac']) == (5.0, 0.05)
+    assert d['crop_pad_frac'] == 0.05
     assert d['max_input_px'] == 4 * 416 * 416 and d['val_frames_per_group'] == 8
     assert 'frames_per_group' not in d and 'use_regions' not in d and 'keypoints' not in d
     assert d['augment'] is True and d['augment_strong'] is True and d['rotate_deg'] == 180.0

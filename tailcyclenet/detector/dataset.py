@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import math
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -97,7 +99,7 @@ class BoxDataset(IndexWeights, Dataset):
     """
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
-                 crop_pad_px=20.0, crop_pad_frac=float('inf'),
+                 crop_pad_frac=0.05,
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, hflip=0.5, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
@@ -199,7 +201,7 @@ class BoxDataset(IndexWeights, Dataset):
                              + ', '.join(map(str, prediction_sessions[:5])))
         self.input_wh = tuple(input_wh) if self.tile_wh is None else self.tile_wh
         self.min_crop_dim = min_crop_dim
-        self.crop_pad_px, self.crop_pad_frac = float(crop_pad_px), float(crop_pad_frac)
+        self.crop_pad_frac = float(crop_pad_frac)
         self.train = split == 'train'
         rng = np.random.default_rng(seed)
 
@@ -519,9 +521,9 @@ class BoxDataset(IndexWeights, Dataset):
                 x0, y0, x1, y1 = b
                 src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
                                    torch.stack([x1, y1]), torch.stack([x0, y1])])
-                pad = 0
+                frac = 0.0
             else:
-                src, pad = p2d[s], self.crop_pad_px
+                src, frac = p2d[s], self.crop_pad_frac
             if warp is not None:
                 src = apply_affine(src, (warp, None))
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
@@ -530,8 +532,7 @@ class BoxDataset(IndexWeights, Dataset):
             if self.box_target == 'extent':
                 box = _extent(src, cam['size'])
             else:
-                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad,
-                                          self.crop_pad_frac)
+                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, 0.0, frac)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
         scale, pad = self._transform(i, cam['size'])
@@ -578,7 +579,9 @@ class BoxDataset(IndexWeights, Dataset):
         stays a positive target), and the item is returned unchanged if none fits.
 
         An `extent` target stops at the outermost POINT,
-        not the animal's edge, so its paste carries a quarter-side margin of context.
+        not the animal's edge, so its paste carries a quarter-side margin of context. The copied
+        region is the box's floor/ceil cover, so a fractional box (letterboxing is float) can never
+        land outside its pasted region -- `round` put a 1.5 px edge at -0.5 on the canvas.
         """
         if len(self) < 2:
             return boxes, img
@@ -592,14 +595,18 @@ class BoxDataset(IndexWeights, Dataset):
                 continue
             cand = torch.nonzero(finite).flatten().tolist()
             s = int(rng.choice(cand))
-            b = src_boxes[s]
+            lim = torch.tensor([self.input_wh[0], self.input_wh[1]] * 2, dtype=src_boxes.dtype)
+            b = torch.minimum(src_boxes[s].clamp(min=0), lim)
             region = b
             if self.box_target == 'extent':
                 m = 0.25 * float(0.5 * ((b[2] - b[0]) + (b[3] - b[1])))
                 region = torch.stack([(b[0] - m).clamp(min=0), (b[1] - m).clamp(min=0),
                                       (b[2] + m).clamp(max=self.input_wh[0]),
                                       (b[3] + m).clamp(max=self.input_wh[1])])
-            x0, y0, x1, y1 = (int(v) for v in region.round().tolist())
+            x0, y0 = (int(math.floor(v)) for v in region[:2].tolist())
+            x1, y1 = (int(math.ceil(v)) for v in region[2:].tolist())
+            x0, y0 = max(x0, 0), max(y0, 0)
+            x1, y1 = min(x1, int(self.input_wh[0])), min(y1, int(self.input_wh[1]))
             bw, bh = x1 - x0, y1 - y0
             if bw <= 0 or bh <= 0 or bw > self.input_wh[0] or bh > self.input_wh[1]:
                 continue

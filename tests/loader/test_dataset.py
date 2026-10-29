@@ -30,8 +30,10 @@ from tests.helpers import (
 # ----------------------------------------------------------------------------------------------
 
 def test_crop_rule_is_int32_exact():
-    """`crop_box_for_points` equals the library's `crop_cgroup_to_points` exactly (gotcha 7), and is
-    None (not a raise) when nothing is finite so the detector can emit a NaN box."""
+    """`crop_box_for_points` given the LIBRARY's own rule (pad 20 px, no fraction) equals
+    `crop_cgroup_to_points` exactly (gotcha 7) -- the arithmetic is shared; THE rule differs from the
+    library only in the pad it passes (5% of the longer side since 2026-10-29) -- and is None (not a
+    raise) when nothing is finite so the detector can emit a NaN box."""
     from types import SimpleNamespace
 
     rng = np.random.default_rng(0)
@@ -43,7 +45,7 @@ def test_crop_rule_is_int32_exact():
         if trial % 7 == 0:                        # some non-finite points, the normal case
             pts[rng.integers(n)] = float('nan')
         size = torch.tensor([w, h], dtype=torch.int32)
-        mine = cropmod.crop_box_for_points(pts, size, 64)
+        mine = cropmod.crop_box_for_points(pts, size, 64, 20)
         good = torch.all(torch.isfinite(pts), dim=1)
         theirs = _library_box(shim, pts[good], size)
         assert mine is not None and mine.dtype == torch.int32
@@ -709,7 +711,7 @@ def test_prompt_noise_is_in_pixels_on_both_modes(tiny_root):
     def mk(s, drop=0.0):
         return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
                             prompt_dropout=drop, prompt_noise_px=s, prob_2d_only=0.0,
-                            min_crop_dim=64, crop_pad_px=20.0, crop_pad_frac=float('inf'))
+                            min_crop_dim=64, crop_pad_frac=0.3)
 
     def spread(root, sigma):
         clean = _batch(PoseDataset(root, 'train', mk(0.0))).kpt_prior

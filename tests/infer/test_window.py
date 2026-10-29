@@ -773,7 +773,8 @@ def test_refine_carry_fallback_adds_a_boxless_camera_only_with_a_fresh_agreeing_
 
 def test_a_carry_sourced_camera_that_fails_the_consensus_is_dropped(mv16, monkeypatch):
     """R4 + R1: a camera cropped from the carry that R1 then calls an outlier is dropped from
-    pass 2 (code 2), never re-cropped from the consensus pose."""
+    pass 2 (code 2), never re-cropped from the consensus pose. R4's scale gate is off, as in the
+    test above: the fixture boxes are the WHOLE frame, which a crop-rule carry is >2x smaller than."""
     from tailcyclenet.infer import window as wmod
     model, sess, registry, name = mv16
     boxes = _whole_frame_boxes(sess, T=sess.groups['g000'].n_frames)
@@ -788,7 +789,8 @@ def test_a_carry_sourced_camera_that_fails_the_consensus_is_dropped(mv16, monkey
     monkeypatch.setattr(wmod, 'camera_consensus', fake)
     out = run_group(model, sess, 'g000', registry, name,
                     _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True,
-                               refine_consensus=True), boxes_for=_boxes_for(boxes), n_rows=1)
+                               refine_carry_scale_max=0.0, refine_consensus=True),
+                    boxes_for=_boxes_for(boxes), n_rows=1)
     hit = out['carry_crop'][0, :, 2] == 2
     assert hit.any()
     assert (out['refine_outlier'][0, hit, 2] == 2).all()

@@ -88,7 +88,7 @@ def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
                             score_thresh=0.0)
     det.box_target, det.min_crop_dim = 'extent', 16
     try:
-        for source, pad in (('keypoints', 20), ('instances', 0)):
+        for source, frac in (('keypoints', 0.05), ('instances', 0.0)):
             got, sc2 = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
                                      score_thresh=0.0, box_source=source)
             assert np.array_equal(sc, sc2, equal_nan=True)
@@ -96,7 +96,7 @@ def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
             for ci, cam in enumerate(sess.cam_names):
                 size = sess.rig.size(cam)
                 want = crop_boxes_from_extents(torch.as_tensor(raw[:, :, ci].reshape(-1, 4)),
-                                               size, 16, pad).numpy()
+                                               size, 16, 0.0, frac).numpy()
                 assert np.array_equal(got[:, :, ci].reshape(-1, 4), want, equal_nan=True)
     finally:
         det.box_target = 'crop'

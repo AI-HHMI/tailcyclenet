@@ -32,7 +32,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         read -- replaces the decode with `(ci, cam_name, frames, pool) -> imgs`.
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
         box_source -- this session's box source: 'instances' extents are already padded (pad 0);
-            'keypoints' get the checkpoint's own pad rule (absent = legacy 20 px, no cap);
+            'keypoints' get the checkpoint's own `crop_pad_frac`;
             None = the checkpoint's. An `extent` head's boxes get the crop rule HERE, in source
             px (`crop_boxes_from_extents`), so callers still receive crop-rule boxes.
     Outputs:
@@ -56,15 +56,14 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     antialias = bool(getattr(det, 'antialias', False))
     input_norm = str(getattr(det, 'input_norm', 'none'))
     from ..detector.augment import normalize_input
-    crop_pad = (0 if (box_source or getattr(det, 'box_source', 'keypoints')) == 'instances'
-                else float(getattr(det, 'crop_pad_px', 20.0)))
-    crop_pad_frac = float(getattr(det, 'crop_pad_frac', float('inf')))
-    crop_mcd = int(getattr(det, 'min_crop_dim', 64))
+    crop_pad_frac = (0.0 if (box_source or getattr(det, 'box_source', 'keypoints')) == 'instances'
+                     else float(getattr(det, 'crop_pad_frac', 0.05)))
+    crop_mcd = int(getattr(det, 'min_crop_dim', 32))
 
     def _to_crop(bx, src):
         """Unletterboxed (N,4) boxes -> what callers consume: crop-rule boxes for an `extent`
         checkpoint, unchanged for a `crop` one (re-applying the rule would pad twice)."""
-        return crop_boxes_from_extents(bx, src, crop_mcd, crop_pad, crop_pad_frac) if extent else bx
+        return crop_boxes_from_extents(bx, src, crop_mcd, 0.0, crop_pad_frac) if extent else bx
 
     group = session.groups[gid]
     T_clip = min(group.n_frames, max_frames or group.n_frames)

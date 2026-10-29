@@ -45,6 +45,9 @@ from .contract import refuse_deleted_data_keys
 from .triplet import seed_worker
 
 
+COLLAPSE_GAP = 1e-4   # |val score gap| below this counts as the constant-score attractor
+
+
 def warm_start_names(base_reg) -> tuple[str, ...] | None:
     """The registry `warm_start` must be given: the SOURCE run's, never this run's grown one.
 
@@ -238,12 +241,14 @@ def _start_reference(out: Path, checkpoint, train_cfg: dict, fresh: bool):
 
 
 def _probe_checkpoint(ckpt_path, config: dict,
-                      output_granularity: str) -> tuple[bool, bool, bool]:
-    """(contract mismatch, mode mismatch, may resume) of a start checkpoint; either mismatch
-    forces a warm start, and only a full scorer state with neither may resume."""
+                      output_granularity: str) -> tuple[bool, bool, bool, str | None]:
+    """(contract mismatch, mode mismatch, may resume, source kind) of a start checkpoint; either
+    mismatch forces a warm start, and only a full scorer state with neither may resume. The kind
+    is the checkpoint's recorded `kind` ('pose' when absent), or None without a checkpoint."""
     checkpoint_contract_mismatch = False
     checkpoint_mode_mismatch = False
     may_resume = False
+    source_kind = None
     if ckpt_path:
         probe = Path(ckpt_path)
         if probe.is_dir():
@@ -251,7 +256,8 @@ def _probe_checkpoint(ckpt_path, config: dict,
             probe = resolve_checkpoint(probe / 'checkpoints')
         if probe.exists():
             checkpoint_probe = torch.load(probe, map_location='cpu', weights_only=False)
-            if checkpoint_probe.get('kind', 'pose') == 'scorer':
+            source_kind = str(checkpoint_probe.get('kind', 'pose'))
+            if source_kind == 'scorer':
                 checkpoint_mode = scorer_checkpoint_granularity(checkpoint_probe)
                 checkpoint_mode_mismatch = scorer_checkpoint_mode_mismatch(output_granularity, checkpoint_probe)
                 if checkpoint_mode_mismatch:
@@ -271,7 +277,27 @@ def _probe_checkpoint(ckpt_path, config: dict,
                 may_resume = (full_training_state(checkpoint_probe)
                               and not checkpoint_contract_mismatch
                               and not checkpoint_mode_mismatch)
-    return checkpoint_contract_mismatch, checkpoint_mode_mismatch, may_resume
+    return checkpoint_contract_mismatch, checkpoint_mode_mismatch, may_resume, source_kind
+
+
+def warn_untrained_keypoints(registry, base_reg, source) -> list[str]:
+    """Name the keypoints a POSE warm start leaves without a trained identity row.
+
+    Measured (dev/reports/75): with the installed same-label pull (`same_label_pull_weight =
+    1.0`) such a scorer collapses to a constant score; at 0.0 it learned on univ-rat with 135 of
+    155 rows untrained. The rows still start untrained, so the run is told which.
+
+    Inputs: registry -- this run's; base_reg -- the source's, or None; source -- for the message.
+    Outputs: the untrained names (empty when every keypoint has a trained row).
+    Side effects: prints a warning when any is untrained.
+    """
+    known = set(base_reg.names) if base_reg is not None else set()
+    new = [n for n in registry.names if n not in known]
+    if new:
+        shown = ', '.join(new[:8]) + (f', ... (+{len(new) - 8} more)' if len(new) > 8 else '')
+        print(f'WARNING: {len(new)} of {registry.n_keypoints} keypoints have no identity row '
+              f'trained by the pose checkpoint {source}: {shown} (dev/reports/75)')
+    return new
 
 
 def _started_loaders(train_ds, val_ds, config: dict, seed: int, n_target: int, fabric, world: int,
@@ -422,6 +448,8 @@ class ScorerLoop:
         self.window: dict[str, list] = {}
         self.selection_metric = resolve_selection_metric(config, output_granularity)
         self.best_acc, self.best_iter, self.best_locked = best
+        self.collapse_patience = int(config.get('scorer', {}).get('collapse_patience', 0))
+        self.last_alive = int(start_iter)
 
     def selected_value(self, values: dict) -> float | None:
         """Read the explicitly configured validation metric, never infer it from the loss."""
@@ -553,6 +581,32 @@ class ScorerLoop:
             if acc is not None:
                 print(f'[{iteration}] best val/{self.selection_metric} {self.best_acc:.4f} at '
                       f'iteration {self.best_iter}')
+        self.check_collapse(values, iteration)
+
+    def check_collapse(self, values: dict, iteration: int) -> None:
+        """Stop a run whose val score gap has sat at the constant-score attractor too long.
+
+        A collapsed scorer emits one score for clean and corrupted tracks alike (|gap| ~1e-6;
+        dev/reports/75) and has never been seen to recover past a few thousand iterations.
+        `[scorer].collapse_patience` iterations without one val reaching |gap| >= COLLAPSE_GAP
+        raises SystemExit naming the state; 0 disables. Val values are pooled across ranks, so
+        every rank decides alike.
+        """
+        if self.collapse_patience <= 0:
+            return
+        gap = values.get('val/active_score_gap', values.get('val/score_gap'))
+        if gap is None or not np.isfinite(gap):
+            return
+        if abs(float(gap)) >= COLLAPSE_GAP:
+            self.last_alive = iteration
+            return
+        if iteration - self.last_alive >= self.collapse_patience:
+            raise SystemExit(
+                f'[{iteration}] scorer COLLAPSED: val score gap |{float(gap):.2g}| < '
+                f'{COLLAPSE_GAP:g} on every val since iteration {self.last_alive} '
+                f'([scorer].collapse_patience = {self.collapse_patience}). It emits one score for '
+                'clean and corrupted tracks (dev/reports/75); check same_label_pull_weight and '
+                'the warm start. Checkpoints are kept.')
 
     def report(self, values: dict, iteration: int, grad_norm) -> None:
         """The print-interval line and W&B payload; then reset the interval clocks."""
@@ -617,7 +671,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     np.random.seed(seed)
 
     ckpt_path, base_reg = _start_reference(out, checkpoint, train_cfg, fresh)
-    contract_mismatch, mode_mismatch, may_resume = _probe_checkpoint(
+    contract_mismatch, mode_mismatch, may_resume, source_kind = _probe_checkpoint(
         ckpt_path, config, output_granularity)
     if base_reg is not None:
         print('keypoint registry: ' + ('appending to the resume checkpoint\'s' if may_resume
@@ -627,6 +681,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         rank=(fabric.global_rank if fabric is not None else 0), world_size=world)
     if fabric is not None:
         dist_utils.check_registry(fabric, registry.names)
+    if ckpt_path and not may_resume and source_kind == 'pose':
+        warn_untrained_keypoints(registry, base_reg, ckpt_path)
     n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
     train_loader, val_loader = _started_loaders(train_ds, val_ds, config, seed, n_target,
                                                 fabric, world, is0)

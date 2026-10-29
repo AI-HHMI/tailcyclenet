@@ -74,8 +74,14 @@ def _weighted_mean(values, mask, weights=None, *, reduction='mean'):
     return torch.where(denominator > 0, numerator / safe_denominator, zero), denominator
 
 
-def _triplet_values(scores, precisions, labels):
-    """Installed tracktail triplet algebra on an already-selected ``[N,3]`` row set."""
+def _triplet_values(scores, precisions, labels, pull_weight=1.0):
+    """Installed tracktail triplet algebra on an already-selected ``[N,3]`` row set.
+
+    ``pull_weight`` scales ``|s_close0 - s_close1|``, the pull between the two same-label members
+    (view A vs the anchor's view B). 1.0 is the installed algebra. That pull is what drives a
+    fresh scorer into the constant-score attractor (dev/reports/75): at a tie it shrinks every
+    score difference the two views do not share, faster than the ranking term can grow one.
+    """
     if scores.numel() == 0:
         zero = scores.sum() * 0.0
         return zero, torch.empty(0, device=scores.device), torch.empty(0, device=scores.device)
@@ -87,7 +93,7 @@ def _triplet_values(scores, precisions, labels):
     distant_scores = scores[~close_mask].reshape(-1, 1)
     close_prec = precisions[close_mask].reshape(-1, 2)
     distant_prec = precisions[~close_mask].reshape(-1, 1)
-    dist_pos = torch.abs(close_scores[:, 0] - close_scores[:, 1])
+    dist_pos = float(pull_weight) * torch.abs(close_scores[:, 0] - close_scores[:, 1])
     dist_neg = torch.min((distant_scores - close_scores) * example_type, dim=-1).values
     triplet = dist_pos + dist_neg
     all_prec = torch.cat([close_prec, distant_prec], dim=-1)
@@ -165,9 +171,12 @@ class FrameTripletScorerLoss(nn.Module):
     def __init__(self, margin=0.5, precision_reg_weight=0.01, score_reg_weight=0.0,
                  reduction='mean', pointwise_weight=0.0, pointwise_balance=True,
                  pointwise_label_smoothing=0.0, inactive_consistency_weight=0.0,
-                 anchor_consistency_weight=0.0, triplet_margin=None):
+                 anchor_consistency_weight=0.0, triplet_margin=None, same_label_pull_weight=1.0):
         """Initialize loss weights and the fresh positive pointwise calibration scale."""
         super().__init__()
+        if float(same_label_pull_weight) < 0:
+            raise ValueError('same_label_pull_weight must be non-negative')
+        self.same_label_pull_weight = float(same_label_pull_weight)
         if triplet_margin is not None:
             margin = triplet_margin
         if reduction not in ('mean', 'sum'):
@@ -340,7 +349,8 @@ class FrameTripletScorerLoss(nn.Module):
             selected_prec = flat_prec[flat_active]
             selected_labels = flat_labels[flat_active]
             raw_triplet, triplet_precision, _ = _triplet_values(
-                selected_scores, selected_prec, selected_labels)
+                selected_scores, selected_prec, selected_labels,
+                pull_weight=self.same_label_pull_weight)
             raw_triplet = raw_triplet + self.margin
             per_row = F.relu(raw_triplet) * triplet_precision
             rank_value, active_weight = _weighted_mean(
@@ -564,4 +574,5 @@ def build_scorer_loss(config: dict, output_granularity: str | None = None):
         pointwise_balance=bool(cfg.get('pointwise_balance', True)),
         pointwise_label_smoothing=float(cfg.get('pointwise_label_smoothing', 0.0)),
         inactive_consistency_weight=float(cfg.get('inactive_consistency_weight', 0.0)),
-        anchor_consistency_weight=float(cfg.get('anchor_consistency_weight', 0.0)))
+        anchor_consistency_weight=float(cfg.get('anchor_consistency_weight', 0.0)),
+        same_label_pull_weight=float(cfg.get('same_label_pull_weight', 1.0)))

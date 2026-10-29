@@ -116,6 +116,12 @@ source_frame_duplicate_policy = "inverse_multiplicity"
 # Semantic version for the loader's prob_2d_only path; changes force a weights-only warm start.
 two_d_sampling = "true-2d-hybrid-v1"
 min_valid_frames = 6       # DISTINCT OBSERVED frames per keypoint; selects the corruption menu
+# Weight of |s_close0 - s_close1| (the pull between the two same-label triplet members, view A vs
+# the anchor's view B). 1.0 is the installed algebra and drives a fresh scorer into the
+# constant-score attractor; 0.0 learned where 1.0 collapsed (dev/reports/75). Frame mode only.
+same_label_pull_weight = 0.0
+# Stop after this many iterations with every val |score gap| < 1e-4 (the collapsed state); 0 = off.
+collapse_patience = 5000
 
 [scorer.corruption]
 const_offset_prob = 0.5

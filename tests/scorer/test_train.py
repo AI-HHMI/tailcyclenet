@@ -397,3 +397,54 @@ def test_widening_the_identity_table_does_not_move_it_between_optimizer_groups()
         else:
             assert routes[0][2] == pytest.approx(5e-4), (
                 'the schedule-free path pins the table to kpt_lr by NAME (query_encoder.kpt_)')
+
+
+def test_untrained_keypoints_of_a_pose_warm_start_are_named(capsys):
+    """A pose warm start names every keypoint its identity table does not cover."""
+    from tailcyclenet.format import Registry
+    from tailcyclenet.scorer.train import warn_untrained_keypoints
+
+    base = Registry(names=('a', 'b'), datasets=(('src', (0, 1)),))
+    same = Registry(names=('b', 'a'), datasets=(('src', (0, 1)),))
+    grown = Registry(names=('a', 'b', 'c'), datasets=(('src', (0, 1)), ('new', (2,))))
+    assert warn_untrained_keypoints(same, base, 'x.pth') == []
+    assert capsys.readouterr().out == ''
+    assert warn_untrained_keypoints(grown, base, 'x.pth') == ['c']
+    assert '1 of 3 keypoints' in capsys.readouterr().out
+    assert warn_untrained_keypoints(grown, None, 'x.pth') == ['a', 'b', 'c']
+
+
+def test_the_same_label_pull_is_a_frame_loss_weight():
+    """0 removes |s_close0 - s_close1| from the triplet; 1 is the installed algebra; sequence
+    mode refuses anything but 1."""
+    from tailcyclenet.scorer.config import validate_scorer_config
+    from tailcyclenet.scorer.losses import _triplet_values
+
+    scores = torch.tensor([[0.3, -0.2, 0.1]])
+    prec = torch.ones(1, 3)
+    labels = torch.tensor([[1.0, -1.0, 1.0]])
+    full, _, _ = _triplet_values(scores, prec, labels)
+    none, _, _ = _triplet_values(scores, prec, labels, pull_weight=0.0)
+    torch.testing.assert_close(full - none, torch.tensor([0.2]))
+    with pytest.raises(SystemExit, match='same_label_pull_weight'):
+        validate_scorer_config({'scorer': {'output_granularity': 'sequence',
+                                           'same_label_pull_weight': 0.0}})
+
+
+def test_a_collapsed_val_gap_stops_the_run_after_its_patience():
+    """Only a val |gap| >= COLLAPSE_GAP resets the clock; 0 patience never stops."""
+    from tailcyclenet.scorer.train import COLLAPSE_GAP, ScorerLoop
+
+    loop = ScorerLoop.__new__(ScorerLoop)
+    loop.collapse_patience, loop.last_alive = 1000, 0
+    dead = {'val/active_score_gap': COLLAPSE_GAP / 100}
+    loop.check_collapse(dead, 600)
+    loop.check_collapse({'val/active_score_gap': -10 * COLLAPSE_GAP}, 800)
+    assert loop.last_alive == 800
+    loop.check_collapse(dead, 1600)
+    with pytest.raises(SystemExit, match='COLLAPSED'):
+        loop.check_collapse(dead, 1800)
+    loop.collapse_patience = 0
+    loop.check_collapse(dead, 10 ** 6)
+    loop.collapse_patience = 1000
+    loop.check_collapse({'val/score_gap': float('nan')}, 10 ** 6)

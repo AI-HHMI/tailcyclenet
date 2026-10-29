@@ -15,7 +15,7 @@ SCORER_CONFIG_KEYS = {
     'inactive_consistency_weight', 'anchor_consistency_weight', 'selection_metric',
     'loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy',
     'two_d_sampling', 'collapse_patience', 'same_label_pull_weight',
-    'same_label_pull_start', 'same_label_pull_ramp', 'same_label_pull_selective',
+    'same_label_pull_selective',
 }
 FRAME_SELECTION_METRICS = {
     'triplet_acc', 'active_triplet_acc', 'score_gap', 'active_score_gap',
@@ -54,6 +54,13 @@ DELETED_CORRUPTION_KEYS = {
 }
 
 
+DELETED_SCORER_KEYS = {
+    key: ('an iteration schedule for the same-label pull re-collapsed univ-rat even as a 4k ramp '
+          '(dev/reports/75 §9); the selective pull (same_label_pull_selective = true) replaces it')
+    for key in ('same_label_pull_start', 'same_label_pull_ramp')
+}
+
+
 def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
     """Validate scorer-only settings and return the resolved output mode.
 
@@ -66,6 +73,9 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
     mode = scorer_output_granularity(config)
     if legacy_run and 'output_granularity' not in scorer:
         mode = 'sequence'
+    for key in DELETED_SCORER_KEYS:
+        if key in scorer:
+            raise SystemExit(f'[scorer].{key} is deleted: {DELETED_SCORER_KEYS[key]}')
     unknown = set(scorer) - SCORER_CONFIG_KEYS - {'corruption'}
     if unknown:
         raise SystemExit(
@@ -102,10 +112,12 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
                 f'[scorer]: frame-only setting(s) {bad} require '
                 'output_granularity = "frame"; sequence mode keeps the legacy loss.')
         if (float(scorer.get('same_label_pull_weight', 1.0)) != 1.0
-                or int(scorer.get('same_label_pull_start', 0)) != 0):
+                or bool(scorer.get('same_label_pull_selective', False))):
             raise SystemExit(
-                '[scorer].same_label_pull_weight applies to the frame loss only; the installed '
-                'sequence loss always pulls at 1.0, so a sequence config must set it to 1.0')
+                '[scorer].same_label_pull_weight / same_label_pull_selective apply to the frame '
+                'loss only; the installed sequence loss always pulls at 1.0 on every row, so a '
+                'sequence config must set same_label_pull_weight = 1.0 and '
+                'same_label_pull_selective = false')
     else:
         if pointwise > 0 and float(scorer.get('score_reg_weight', 0.0)) != 0.0:
             raise SystemExit(

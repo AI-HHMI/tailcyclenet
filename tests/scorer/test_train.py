@@ -450,16 +450,22 @@ def test_a_collapsed_val_gap_stops_the_run_after_its_patience():
     loop.check_collapse({'val/score_gap': float('nan')}, 10 ** 6)
 
 
-def test_the_same_label_pull_schedule_is_off_then_ramps_to_its_weight():
-    """0 before the start, linear over the ramp, the configured weight after; start 0 = always on."""
-    from tailcyclenet.scorer.train import ScorerLoop
+def test_the_deleted_pull_schedule_keys_raise_by_name():
+    """The iteration schedule for the pull is deleted (re-collapsed univ-rat); naming it raises."""
+    from tailcyclenet.scorer.config import validate_scorer_config
 
-    loop = ScorerLoop.__new__(ScorerLoop)
-    loop.pull_target, loop.pull_start, loop.pull_ramp = 1.0, 1000, 500
-    assert [loop.pull_weight(i) for i in (0, 999, 1000, 1250, 1500, 10 ** 6)] == \
-        [0.0, 0.0, 0.0, 0.5, 1.0, 1.0]
-    loop.pull_start, loop.pull_ramp = 0, 0
-    assert loop.pull_weight(0) == 1.0
+    for key in ('same_label_pull_start', 'same_label_pull_ramp'):
+        with pytest.raises(SystemExit, match=f'{key} is deleted'):
+            validate_scorer_config({'scorer': {'output_granularity': 'frame', key: 1000}})
+
+
+def test_the_shipped_recipe_uses_the_selective_pull():
+    """configs/scorer.toml ships the selective pull at full weight."""
+    from tailcyclenet.config import SCORER_CONFIG, load_config
+
+    scorer = load_config(SCORER_CONFIG)['scorer']
+    assert scorer['same_label_pull_weight'] == 1.0
+    assert scorer['same_label_pull_selective'] is True
 
 
 def test_the_selective_pull_acts_only_on_rows_ranked_right_in_both_views():

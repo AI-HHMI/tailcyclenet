@@ -457,10 +457,6 @@ class ScorerLoop:
         self.selection_metric = resolve_selection_metric(config, output_granularity)
         self.best_acc, self.best_iter, self.best_locked = best
         self.opt_cfg, self.fresh = dict(opt_cfg or {}), set(fresh or ())
-        scorer_cfg = config.get('scorer', {})
-        self.pull_target = float(scorer_cfg.get('same_label_pull_weight', 1.0))
-        self.pull_start = int(scorer_cfg.get('same_label_pull_start', 0))
-        self.pull_ramp = int(scorer_cfg.get('same_label_pull_ramp', 0))
         self.collapse_patience = int(config.get('scorer', {}).get('collapse_patience', 0))
         self.last_alive = int(start_iter)
 
@@ -487,7 +483,6 @@ class ScorerLoop:
                 if self.step >= self.local_target:
                     break
                 self.maybe_unfreeze()
-                self.set_pull()
                 grad_norm = self.train_step(trip)
                 if grad_norm is None:
                     continue
@@ -495,27 +490,6 @@ class ScorerLoop:
                 self.after_step(grad_norm)
             require_progress(stepped_this_epoch, self.stepped_this_run, self.step,
                              self.local_target)
-
-    def pull_weight(self, iteration: int) -> float:
-        """The same-label pull at `iteration`: 0 before `same_label_pull_start`, then a linear
-        ramp over `same_label_pull_ramp` iterations to `same_label_pull_weight`. Off early so a
-        fresh scorer escapes the constant-score attractor; on later so a clean track scores the
-        same in every view (dev/reports/75). start 0 = the weight from step 0."""
-        if iteration < self.pull_start:
-            return 0.0
-        if self.pull_ramp <= 0:
-            return self.pull_target
-        return self.pull_target * min(1.0, (iteration - self.pull_start) / self.pull_ramp)
-
-    def set_pull(self) -> None:
-        """Apply this step's pull to the train and val losses; announce the switch once."""
-        weight = self.pull_weight(self.step * self.world)
-        if weight > 0 and getattr(self.loss_fn, 'same_label_pull_weight', weight) == 0 and self.is0:
-            print(f'[{self.step * self.world}] same-label pull ON (-> {self.pull_target:g} over '
-                  f'{self.pull_ramp} iterations)', flush=True)
-        for fn in (self.loss_fn, self.val_loss_fn):
-            if hasattr(fn, 'same_label_pull_weight'):
-                fn.same_label_pull_weight = weight
 
     def maybe_unfreeze(self) -> None:
         """Fire the staged encoder unfreeze at its iteration (`pose.unfreeze`, the pose loop's

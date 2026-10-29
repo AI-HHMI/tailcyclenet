@@ -97,6 +97,7 @@ class BoxDataset(IndexWeights, Dataset):
     """
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
+                 crop_pad_px=20.0, crop_pad_frac=float('inf'),
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, hflip=0.5, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
@@ -198,6 +199,7 @@ class BoxDataset(IndexWeights, Dataset):
                              + ', '.join(map(str, prediction_sessions[:5])))
         self.input_wh = tuple(input_wh) if self.tile_wh is None else self.tile_wh
         self.min_crop_dim = min_crop_dim
+        self.crop_pad_px, self.crop_pad_frac = float(crop_pad_px), float(crop_pad_frac)
         self.train = split == 'train'
         rng = np.random.default_rng(seed)
 
@@ -519,7 +521,7 @@ class BoxDataset(IndexWeights, Dataset):
                                    torch.stack([x1, y1]), torch.stack([x0, y1])])
                 pad = 0
             else:
-                src, pad = p2d[s], 20
+                src, pad = p2d[s], self.crop_pad_px
             if warp is not None:
                 src = apply_affine(src, (warp, None))
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
@@ -528,7 +530,8 @@ class BoxDataset(IndexWeights, Dataset):
             if self.box_target == 'extent':
                 box = _extent(src, cam['size'])
             else:
-                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
+                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad,
+                                          self.crop_pad_frac)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
         scale, pad = self._transform(i, cam['size'])

@@ -41,7 +41,7 @@ from .yolox import ARCHITECTURES, PRETRAINED_TRUNKS
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
 # `--boxes`' dash), so a config value means exactly what the flag meant.
 DATA_KEYS = frozenset({
-    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
+    'path', 'boxes', 'min_crop_dim', 'crop_pad_px', 'crop_pad_frac', 'input_wh', 'min_box_px', 'max_input_px',
     'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'alpha', 'balance_datasets', 'boxes_by_dataset',
@@ -254,8 +254,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
     ncd = train.get('nms_center_dist_thresh', NMS_CENTER_DIST)
     train['nms_center_dist_thresh'] = None if ncd in (None, '', []) else float(ncd)
-    for k in ('rotate_deg', 'tile_scale'):
+    for k in ('rotate_deg', 'tile_scale', 'crop_pad_px', 'crop_pad_frac'):
         data[k] = float(data[k])
+    if not (data['crop_pad_px'] >= 0 and data['crop_pad_frac'] > 0):
+        raise SystemExit(f"[data].crop_pad_px must be >= 0 and crop_pad_frac > 0 (inf = no cap), got "
+                         f"{data['crop_pad_px']} / {data['crop_pad_frac']}.")
     data['augment'] = bool(data['augment'])
     data['augment_strong'] = bool(data['augment_strong'])
     data['reduce'] = bool(data['reduce'])

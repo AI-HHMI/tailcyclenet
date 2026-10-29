@@ -235,6 +235,13 @@ def load_deploy_detector(args, device, ds_name, cfg):
                 f'{args.detector}: trained at min_crop_dim={det_mcd}, but this run\'s '
                 f'[data].min_crop_dim is {cfg.min_crop_dim}. The detector reproduces the crop '
                 'rule; two floors are two rules.')
+        det_pad = (loaded.crop_pad_px, loaded.crop_pad_frac)
+        if det_pad != (cfg.crop_pad_px, cfg.crop_pad_frac):
+            raise SystemExit(
+                f'{args.detector}: trained with crop pad {det_pad[0]:g} px capped at '
+                f'{det_pad[1]:g} x side, but this pose run trained with {cfg.crop_pad_px:g} px / '
+                f'{cfg.crop_pad_frac:g} ([data].crop_pad_px / crop_pad_frac; absent = the legacy '
+                '20 px / inf). The detector reproduces the crop rule; two pads are two rules.')
         if (det_boxsrc or 'keypoints') != cfg.box_source:
             print(f'WARNING: detector boxes are {det_boxsrc!r} but this run was trained on '
                   f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '

@@ -18,7 +18,10 @@ flip_2d_prob = 0.0
 flip_2d_modes = ["horizontal"]
 crop_jitter = 0.3           # measured: tight crops cut the detector-crop penalty and improve base accuracy, because a tight box teaches the model the animal always fills the frame, which no detector delivers
 crop_jitter_scale = 0.3
-min_crop_dim = 64
+# THE crop rule (data/crop.py), owner 2026-10-29: floor 32, pad 5 px capped at 5% of the extent's longer side; the legacy rule is 64 / 20.0 / inf.
+min_crop_dim = 32
+crop_pad_px = 5.0
+crop_pad_frac = 0.05
 crop_inflate = [0.9, 1.5]   # wide-crop regime (reports 27/33): a RANGE, not the fixed 1.5 the first generation ran
 prompt_dropout = 0.5        # fraction of steps run fully query-free -> no-query tokens
 prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cube_scale), so one setting means the same visual displacement on any rig; ship WITH the dropout -- dropout alone is significantly worse

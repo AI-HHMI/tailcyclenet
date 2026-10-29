@@ -58,12 +58,21 @@ _CONSENSUS_MIN_INLIERS = 2
 _MIN_STORE_BYTES = 512 << 20
 
 
+def _pad_rule(cfg):
+    """The run's pad rule as the crop functions' keyword arguments."""
+    return {'pad': cfg.crop_pad_px, 'pad_frac': cfg.crop_pad_frac}
+
+
 @dataclass
 class InferConfig:
     n_frames: int = 24
     overlap: int = 4
     image_size: int = 256
+    # THE crop rule the POSE RUN trained under (data/crop.py); defaults are the LEGACY rule, which
+    # is what a saved run that names none of them means -- resolve.py reads the run's own values.
     min_crop_dim: int = 64
+    crop_pad_px: float = 20.0
+    crop_pad_frac: float = float('inf')
     anchor: str = 'carry'
     # 0 -> every animal the box source offers
     max_animals: int = 0
@@ -492,7 +501,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     continue
                 use = cam_ix
                 cgroup, boxes = boxes_from_points(pts, [window_cams[i] for i in cam_ix],
-                                                  cfg.min_crop_dim, mode)
+                                                  cfg.min_crop_dim, mode, **_pad_rule(cfg))
                 if cgroup is None:
                     outcome[a, wl] = OUTCOMES.index('crop failed')
                     continue
@@ -735,14 +744,14 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             others = [carried[b][0] for b in range(S) if b != a and carried[b] is not None
                       and int(carried[b][1]) >= int(frames[0])]
             if carry_duplicate(c[0], others, window_cams, cfg.min_crop_dim,
-                               cfg.refine_carry_dup_radius):
+                               cfg.refine_carry_dup_radius, **_pad_rule(cfg)):
                 return plan, {}
             new, src, agree = {}, {}, 0
             sides = [0.5 * (float(b[2] - b[0]) + float(b[3] - b[1])) for b in boxes]
             ref = float(np.median(sides)) if sides else float('nan')
             for ci in cam_ix:
                 cam = window_cams[ci]
-                cg, bx = cropmod.crop_to_points_3d([cam], pts, cfg.min_crop_dim)
+                cg, bx = cropmod.crop_to_points_3d([cam], pts, cfg.min_crop_dim, **_pad_rule(cfg))
                 cbox = bx[0] if cg is not None and in_frame(pts, cam) else None
                 if ci in use:
                     i = use.index(ci)
@@ -846,7 +855,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     cams = [ci for ci in (cam_ix if cfg.refine_all_cams else use)
                             if ci not in gone]
                     use2, b2, cg2 = refine_every_camera(pts_c, use, boxes, cams, window_cams,
-                                                        cfg.min_crop_dim, outliers=outl)
+                                                        cfg.min_crop_dim, outliers=outl,
+                                                        **_pad_rule(cfg))
                     if use2:
                         fallback = None
                 for ci in outl:
@@ -869,7 +879,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         continue
                 if cfg.refine_all_cams and mode == '3d':
                     use2, b2, cg2 = refine_every_camera(pts, use, boxes, cam_ix, window_cams,
-                                                        cfg.min_crop_dim)
+                                                        cfg.min_crop_dim, **_pad_rule(cfg))
                     if not use2:
                         refined.append(_at_image_size(plan))
                         continue
@@ -882,7 +892,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     refined.append(WindowPlan(a, use2, b2, cg2, sc2, uncropped2))
                     continue
                 cg2, b2 = boxes_from_points(pts, [window_cams[i] for i in use],
-                                            cfg.min_crop_dim, mode)
+                                            cfg.min_crop_dim, mode, **_pad_rule(cfg))
                 if cg2 is None:
                     refined.append(_at_image_size(plan))
                     continue

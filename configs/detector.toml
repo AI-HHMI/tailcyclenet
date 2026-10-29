@@ -23,8 +23,10 @@ boxes = "instances"
 # Per-root overrides of `boxes`, keyed by EXACT dataset-root folder name, e.g. { johnson-mouse-combined-aug = "keypoints" }; an unknown root name raises. Roots not named use `boxes`.
 boxes_by_dataset = {}
 
-# Must equal the pose run's [data].min_crop_dim -- same crop rule; infer.py refuses a mismatch.
-min_crop_dim = 64
+# Must equal the pose run's [data].min_crop_dim / crop_pad_px / crop_pad_frac -- same crop rule; infer.py refuses a mismatch.
+min_crop_dim = 32
+crop_pad_px = 5.0
+crop_pad_frac = 0.05
 
 # "extent" (shipped 2026-10-02, unmeasured): regress the TIGHT extent and apply the crop rule (source-px pad/square/floor, invisible after a letterbox) after detection -- same crop; "crop" = the legacy target.
 box_target = "extent"

@@ -46,7 +46,12 @@ class LoaderConfig:
     crop_jitter: float = 0.3
     # box scale jitter
     crop_jitter_scale: float = 0.3
-    min_crop_dim: int = 64
+    # THE crop rule's three parameters (data/crop.py): floor, pad px, pad cap as a fraction of the
+    # extent's longer side (inf = no cap). Shipped 32 / 5 / 0.05 since 2026-10-29 (owner); the
+    # legacy rule every earlier run trained under is 64 / 20 / inf -- pin it to continue one.
+    min_crop_dim: int = 32
+    crop_pad_px: float = 5.0
+    crop_pad_frac: float = 0.05
     # What the crop rule bounds: `keypoints` (the labels) or `instances` (the `instances.pq`
     # box), for a root whose stored keypoints are too sparse to enclose the animal. INERT where
     # a root ships no table (falls back to keypoints per view).
@@ -148,6 +153,11 @@ class LoaderConfig:
         p = self.aug_rotation_prob
         if p is not None and not 0.0 <= float(p) <= 1.0:
             raise ValueError(f'aug_rotation_prob must be None or in [0, 1], got {p!r}')
+        self.crop_pad_px, self.crop_pad_frac = float(self.crop_pad_px), float(self.crop_pad_frac)
+        if not (np.isfinite(self.crop_pad_px) and self.crop_pad_px >= 0):
+            raise ValueError(f'crop_pad_px must be a finite number >= 0, got {self.crop_pad_px!r}')
+        if not self.crop_pad_frac > 0:
+            raise ValueError(f'crop_pad_frac must be > 0 (inf = no cap), got {self.crop_pad_frac!r}')
 
     # widen the crop-rule box about its centre (1.0 = inert). A float or a [low, high] pair drawn
     # per TRAIN item; val/test use the MIDPOINT so `checkpoint_best` reads one geometry

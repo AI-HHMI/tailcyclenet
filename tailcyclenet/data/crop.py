@@ -4,7 +4,16 @@ The pose model trains on crops produced by this rule and the detector is trained
 that box, so the two must never drift apart. The arithmetic is int32-exact against tracktail
 0.3.5's public `crop_box_for_points`; the local copy adds `pad` (0 for an already-padded
 stored extent) and returns None on an all-NaN input.
+
+The rule has three parameters: `pad` (px), `pad_frac` (the pad is capped at this fraction of the
+extent's LONGER side; inf = no cap) and `min_crop_dim` (the floor). The function defaults below
+are the LEGACY rule (20 px, no cap, floor 64 -- the tracktail-exact one a test pins); the rule a
+run trains under comes from its config (`[data].crop_pad_px` / `crop_pad_frac` / `min_crop_dim`,
+shipped 5 px / 0.05 / 32 since 2026-10-29, owner decision) and a saved run or checkpoint that
+names none of them is read as LEGACY -- `legacy_crop_rule()`.
 """
+import math
+
 import numpy as np
 import torch
 
@@ -13,13 +22,45 @@ from tracktail.model.cube import project_points_torch
 # What the crop rule bounds, shared by the pose loader, the detector and inference.
 BOX_SOURCES = ('keypoints', 'instances')
 
+# The rule every run trained under before 2026-10-29: what an ABSENT key in a saved run folder,
+# packaged checkpoint or detector checkpoint means. Never the default for a NEW config.
+LEGACY_PAD_PX = 20.0
+LEGACY_PAD_FRAC = math.inf
+LEGACY_MIN_CROP_DIM = 64
+# The shipped rule for new configs (owner decision 2026-10-29): 20 px was too much for small
+# animals (a 30 px mabe22 mouse got a 70 px crop).
+PAD_PX = 5.0
+PAD_FRAC = 0.05
+MIN_CROP_DIM = 32
 
-def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
+
+def legacy_crop_rule(data_cfg):
+    """(pad_px, pad_frac, min_crop_dim) a SAVED `[data]` block (or checkpoint dict) names, with
+    an absent key read as the legacy rule it was trained under -- not today's default."""
+    return (float(data_cfg.get('crop_pad_px', LEGACY_PAD_PX)),
+            float(data_cfg.get('crop_pad_frac', LEGACY_PAD_FRAC)),
+            int(data_cfg.get('min_crop_dim', LEGACY_MIN_CROP_DIM)))
+
+
+def effective_pad(lo, hi, pad, pad_frac=math.inf):
+    """The pad one box gets: `pad`, capped at `pad_frac` x the extent's longer side.
+
+    `lo`/`hi` are the extent's min/max corners (torch, (..., 2)). With `pad_frac = inf` this
+    returns `pad` itself, untouched, so the legacy rule's arithmetic is bit-identical.
+    """
+    if not math.isfinite(pad_frac):
+        return pad
+    side = (hi - lo).max(-1).values
+    return torch.clamp(side * float(pad_frac), max=float(pad))
+
+
+def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20, pad_frac=math.inf):
     """Crop box around 2D points -> int32 [x1, y1, x2, y2], or None if nothing is finite.
 
-    Non-finite entries are dropped (a point behind a camera projects to NaN). `pad = 20` is THE
-    rule; `pad = 0` lets a caller holding an already-padded stored extent re-enter the
-    floor/clamp arithmetic without padding twice. None is how the detector says "no animal here".
+    Non-finite entries are dropped (a point behind a camera projects to NaN). `pad` is padded
+    on every side, capped at `pad_frac` x the points' longer extent (`effective_pad`); `pad = 0`
+    lets a caller holding an already-padded stored extent re-enter the floor/clamp arithmetic
+    without padding twice. None is how the detector says "no animal here".
     Each axis is capped at the image dimension so the crop never exceeds image bounds: without
     the cap, a wide bbox forces min_dim > size and a negative cam['offset'] that breaks
     project_cam.
@@ -31,8 +72,10 @@ def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
 
     size = size.to(torch.float32)
     zero = torch.zeros(2)
-    low = torch.clamp(torch.min(pflat, dim=0).values - pad, zero, size).to(torch.int32)
-    high = torch.clamp(torch.max(pflat, dim=0).values + pad, zero, size).to(torch.int32)
+    mn, mx = torch.min(pflat, dim=0).values, torch.max(pflat, dim=0).values
+    pad = effective_pad(mn, mx, pad, pad_frac)
+    low = torch.clamp(mn - pad, zero, size).to(torch.int32)
+    high = torch.clamp(mx + pad, zero, size).to(torch.int32)
 
     current_width = high[0] - low[0]
     current_height = high[1] - low[1]
@@ -54,7 +97,7 @@ def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
     return torch.cat([low, high])
 
 
-def crop_boxes_from_extents(boxes, size, min_crop_dim=64, pad=20):
+def crop_boxes_from_extents(boxes, size, min_crop_dim=64, pad=20, pad_frac=math.inf):
     """(N,4) xyxy EXTENTS -> (N,4) crop-rule boxes, `crop_box_for_points` row by row, vectorised.
 
     The crop rule only reads the min/max of its points, so an extent's two corners give exactly
@@ -72,8 +115,10 @@ def crop_boxes_from_extents(boxes, size, min_crop_dim=64, pad=20):
     W, H = (float(v) for v in size)
     Wi, Hi = int(W), int(H)
     e = b[ok]
-    lo = torch.minimum(e[:, :2], e[:, 2:]) - pad
-    hi = torch.maximum(e[:, :2], e[:, 2:]) + pad
+    mn, mx = torch.minimum(e[:, :2], e[:, 2:]), torch.maximum(e[:, :2], e[:, 2:])
+    p = effective_pad(mn, mx, pad, pad_frac)
+    p = p[:, None] if torch.is_tensor(p) else p
+    lo, hi = mn - p, mx + p
     lim = torch.tensor([W, H])
     low = torch.minimum(torch.clamp(lo, min=0.0), lim).to(torch.int32)
     high = torch.minimum(torch.clamp(hi, min=0.0), lim).to(torch.int32)
@@ -129,28 +174,30 @@ def apply_crop(cam, box):
     return out
 
 
-def _crop_source(coords, crop_pts):
+def _crop_source(coords, crop_pts, pad=20):
     """(what to bound, what pad it needs). THE fallback rule for `crop_pts`, in one place.
 
     A stored `instances.pq` extent is already padded, so it enters with pad 0; an all-NaN one
-    means this view carries no stored box, so the raw points apply the usual 20 px rule.
+    means this view carries no stored box, so the raw points apply the run's pad rule.
     """
     if crop_pts is not None and torch.isfinite(crop_pts).any():
         return crop_pts, 0
-    return coords, 20
+    return coords, pad
 
 
-def crop_to_points_3d(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None, inflate=1.0):
+def crop_to_points_3d(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None, inflate=1.0,
+                      pad=20, pad_frac=math.inf):
     """Crop every camera to the projection of `coords`. Returns (cgroup, boxes).
 
     `crop_pts` bounds a stored box instead of the projection, decided per camera. `inflate`
-    widens each box about its centre after jitter; 1.0 is an exact no-op.
+    widens each box about its centre after jitter; 1.0 is an exact no-op. `pad`/`pad_frac` are
+    the run's pad rule for point-derived boxes (a stored extent always enters with pad 0).
     """
     p2d = project_points_torch(cgroup, coords)
     out, boxes = [], []
     for cnum, cam in enumerate(cgroup):
-        src, pad = _crop_source(p2d[cnum], None if crop_pts is None else crop_pts[cnum])
-        box = crop_box_for_points(src, cam['size'], min_crop_dim, pad)
+        src, p = _crop_source(p2d[cnum], None if crop_pts is None else crop_pts[cnum], pad)
+        box = crop_box_for_points(src, cam['size'], min_crop_dim, p, pad_frac)
         if box is None:
             return None, None
         if jitter is not None:
@@ -162,13 +209,14 @@ def crop_to_points_3d(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=Non
     return out, boxes
 
 
-def crop_to_points_2d(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None, inflate=1.0):
+def crop_to_points_2d(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None, inflate=1.0,
+                      pad=20, pad_frac=math.inf):
     """Single-camera pixel-space crop. Returns (cam, box, coords shifted into the crop).
 
     `inflate` widens the box about its centre after jitter; 1.0 is an exact no-op.
     """
-    src, pad = _crop_source(coords, crop_pts)
-    box = crop_box_for_points(src, cam['size'], min_crop_dim, pad)
+    src, p = _crop_source(coords, crop_pts, pad)
+    box = crop_box_for_points(src, cam['size'], min_crop_dim, p, pad_frac)
     if box is None:
         return None, None, None
     if jitter is not None:

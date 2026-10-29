@@ -754,7 +754,9 @@ class PoseDataset(Dataset):
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
-                                                         inflate=inflate)
+                                                         inflate=inflate,
+                                                         pad=self.cfg.crop_pad_px,
+                                                         pad_frac=self.cfg.crop_pad_frac)
             if cam is None:
                 return None
             cam, scale = resize_camera(cam, self.cfg.image_size)
@@ -804,7 +806,9 @@ class PoseDataset(Dataset):
             jit = self._jitter(rng)
             cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
                                                       jit, crop_pts=cp3,
-                                                      inflate=inflate)
+                                                      inflate=inflate,
+                                                      pad=self.cfg.crop_pad_px,
+                                                      pad_frac=self.cfg.crop_pad_frac)
             if cgroup is None:
                 return None
             resized = [resize_camera(c, self.cfg.image_size) for c in cgroup]

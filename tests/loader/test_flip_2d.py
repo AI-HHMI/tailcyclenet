@@ -14,8 +14,9 @@ from tests.helpers import _session_2d, _session_3d
 
 
 def _cfg(**over):
+    # the legacy crop rule: the pixel-mirroring arithmetic below assumes the crop is the whole 64x48 frame
     values = dict(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
-                  crop_jitter=0.0, crop_inflate=1.0)
+                  crop_jitter=0.0, crop_inflate=1.0, min_crop_dim=64, crop_pad_px=20.0, crop_pad_frac=float('inf'))
     values.update(over)
     return LoaderConfig(**values)
 

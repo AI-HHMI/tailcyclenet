@@ -60,7 +60,10 @@ val_cams_to_sample = 5
 prob_2d_only = 0.2
 crop_jitter = 0.3
 crop_jitter_scale = 0.3
-min_crop_dim = 64
+# THE crop rule -- must be the one the warm-start pose run trained under (legacy runs: 64 / 20.0 / inf).
+min_crop_dim = 32
+crop_pad_px = 5.0
+crop_pad_frac = 0.05
 aug_prob = 0.4
 aug_rotation_deg = 180.0
 # Train-only source-canvas flips; zero disables them, and active 2D sessions must declare `flip_pairs`.

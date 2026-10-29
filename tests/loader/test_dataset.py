@@ -708,7 +708,8 @@ def test_prompt_noise_is_in_pixels_on_both_modes(tiny_root):
 
     def mk(s, drop=0.0):
         return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
-                            prompt_dropout=drop, prompt_noise_px=s, prob_2d_only=0.0)
+                            prompt_dropout=drop, prompt_noise_px=s, prob_2d_only=0.0,
+                            min_crop_dim=64, crop_pad_px=20.0, crop_pad_frac=float('inf'))
 
     def spread(root, sigma):
         clean = _batch(PoseDataset(root, 'train', mk(0.0))).kpt_prior

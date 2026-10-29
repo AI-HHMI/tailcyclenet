@@ -16,16 +16,19 @@ def _resolve(data):
 
 def test_the_run_configs_data_block_reaches_the_infer_config():
     """A non-default `[data]` value is what inference runs at; an absent one is `LoaderConfig`'s
-    own default, so the driver restates no loader default a training change could leave behind."""
-    cfg = _resolve({'n_frames': 8, 'image_size': 128, 'min_crop_dim': 32,
-                    'box_source': 'keypoints'})
-    assert (cfg.n_frames, cfg.image_size, cfg.min_crop_dim, cfg.box_source) == \
-        (8, 128, 32, 'keypoints')
+    own default, so the driver restates no loader default a training change could leave behind --
+    EXCEPT the crop rule: an absent `min_crop_dim` / `crop_pad_px` / `crop_pad_frac` is the LEGACY
+    rule (64 / 20 / inf) every run saved before those keys trained under, not today's default."""
+    cfg = _resolve({'n_frames': 8, 'image_size': 128, 'min_crop_dim': 48, 'crop_pad_px': 3.0,
+                    'crop_pad_frac': 0.1, 'box_source': 'keypoints'})
+    assert (cfg.n_frames, cfg.image_size, cfg.min_crop_dim, cfg.crop_pad_px, cfg.crop_pad_frac,
+            cfg.box_source) == (8, 128, 48, 3.0, 0.1, 'keypoints')
     d = LoaderConfig()
-    assert (8, 128, 32, 'keypoints') != (d.n_frames, d.image_size, d.min_crop_dim, d.box_source)
+    assert (8, 128, 'keypoints') != (d.n_frames, d.image_size, d.box_source)
     cfg = _resolve({})
-    assert (cfg.n_frames, cfg.image_size, cfg.min_crop_dim, cfg.box_source) == \
-        (d.n_frames, d.image_size, d.min_crop_dim, d.box_source)
+    assert (cfg.n_frames, cfg.image_size, cfg.box_source) == (d.n_frames, d.image_size, d.box_source)
+    assert (cfg.min_crop_dim, cfg.crop_pad_px, cfg.crop_pad_frac) == (64, 20.0, float('inf'))
+    assert (d.min_crop_dim, d.crop_pad_px, d.crop_pad_frac) == (32, 5.0, 0.05)
 
 
 def test_box_corrupt_needs_a_detector_and_a_valid_spec():

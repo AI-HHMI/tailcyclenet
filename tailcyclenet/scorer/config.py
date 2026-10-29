@@ -15,7 +15,7 @@ SCORER_CONFIG_KEYS = {
     'inactive_consistency_weight', 'anchor_consistency_weight', 'selection_metric',
     'loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy',
     'two_d_sampling', 'collapse_patience', 'same_label_pull_weight',
-    'same_label_pull_start', 'same_label_pull_ramp',
+    'same_label_pull_start', 'same_label_pull_ramp', 'same_label_pull_selective',
 }
 FRAME_SELECTION_METRICS = {
     'triplet_acc', 'active_triplet_acc', 'score_gap', 'active_score_gap',

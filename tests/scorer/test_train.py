@@ -460,3 +460,17 @@ def test_the_same_label_pull_schedule_is_off_then_ramps_to_its_weight():
         [0.0, 0.0, 0.0, 0.5, 1.0, 1.0]
     loop.pull_start, loop.pull_ramp = 0, 0
     assert loop.pull_weight(0) == 1.0
+
+
+def test_the_selective_pull_acts_only_on_rows_ranked_right_in_both_views():
+    """Xuan et al. 2020's selective form: a hard row (bad not below both clean views) gets no pull."""
+    from tailcyclenet.scorer.losses import _triplet_values
+
+    labels = torch.tensor([[1.0, -1.0, 1.0], [1.0, -1.0, 1.0]])
+    prec = torch.ones(2, 3)
+    scores = torch.tensor([[0.5, -0.5, 0.1],    # easy: bad below both -> pull on
+                           [0.5, 0.2, 0.1]])    # hard: bad above the anchor view -> pull off
+    full, _, _ = _triplet_values(scores, prec, labels, pull_weight=1.0)
+    off, _, _ = _triplet_values(scores, prec, labels, pull_weight=0.0)
+    sel, _, _ = _triplet_values(scores, prec, labels, pull_weight=1.0, selective=True)
+    torch.testing.assert_close(sel, torch.stack([full[0], off[1]]))

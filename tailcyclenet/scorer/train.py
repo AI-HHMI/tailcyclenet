@@ -1,7 +1,8 @@
 """Train the track-quality scorer.
 
 Pose-shaped but not the pose loop: a triplet ranking loss, best checkpoint selected on held-out
-synthetic triplet accuracy, no staged unfreeze. Shared by import so they cannot diverge:
+synthetic triplet accuracy; a staged encoder unfreeze (`video_encoder_requires_grad = <iteration>`)
+fires through `pose.unfreeze`, as in the pose loop. Shared by import so they cannot diverge:
 `config.load_config` (layering over `configs/scorer.toml`), `pose.checkpoint.warm_start`,
 `save_run_meta(kind='scorer')` and `pose.optim.build_optimizer`.
 
@@ -34,6 +35,7 @@ from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
 from ..pose.checkpoint import warm_start
 from ..pose.optim import build_optimizer, check_resume
+from ..pose.unfreeze import apply_staged_unfreeze
 from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from .. import distributed as dist_utils
 from .config import (corruption_config, resolve_selection_metric, scorer_kwargs,
@@ -367,6 +369,9 @@ def _optimizer_and_resume(model, fresh: set, opt_cfg: dict, resume_state, resume
     if resume_state is not None:
         try:
             model.load_state_dict(resume_state['model_state'], strict=True)
+            # a staged unfreeze that already fired must be replayed so the groups match
+            apply_staged_unfreeze(model, optimizer, opt_cfg,
+                                  int(resume_state.get('iteration', 0)), fresh=fresh)
             verdict = check_resume(optimizer, resume_state['optimizer_state'])
             if not verdict:
                 raise ValueError(verdict.reason)
@@ -423,8 +428,11 @@ class ScorerLoop:
 
     def __init__(self, *, fabric, world, is0, device, config, out, registry, train_loader,
                  val_loader, raw_model, wrap, optimizer, loss_fn, val_loss_fn,
-                 output_granularity, wb, start_iter, n_target, best):
-        """Bind the run; the frequencies become per-rank local step counts."""
+                 output_granularity, wb, start_iter, n_target, best, opt_cfg=None,
+                 fresh=None):
+        """Bind the run; the frequencies become per-rank local step counts. `opt_cfg` (the
+        world-scaled optimizer config) and `fresh` route the params a staged encoder unfreeze
+        (`[model].video_encoder_requires_grad = <iteration>`) adds to the optimizer."""
         train_cfg = config['training']
         self.fabric, self.world, self.is0, self.device = fabric, world, is0, device
         self.config, self.out, self.registry, self.wb = config, out, registry, wb
@@ -448,6 +456,7 @@ class ScorerLoop:
         self.window: dict[str, list] = {}
         self.selection_metric = resolve_selection_metric(config, output_granularity)
         self.best_acc, self.best_iter, self.best_locked = best
+        self.opt_cfg, self.fresh = dict(opt_cfg or {}), set(fresh or ())
         self.collapse_patience = int(config.get('scorer', {}).get('collapse_patience', 0))
         self.last_alive = int(start_iter)
 
@@ -473,6 +482,7 @@ class ScorerLoop:
             for trip in timed(self.train_loader, self.waited):
                 if self.step >= self.local_target:
                     break
+                self.maybe_unfreeze()
                 grad_norm = self.train_step(trip)
                 if grad_norm is None:
                     continue
@@ -480,6 +490,28 @@ class ScorerLoop:
                 self.after_step(grad_norm)
             require_progress(stepped_this_epoch, self.stepped_this_run, self.step,
                              self.local_target)
+
+    def maybe_unfreeze(self) -> None:
+        """Fire the staged encoder unfreeze at its iteration (`pose.unfreeze`, the pose loop's
+        mechanism); re-wrap DDP, which registers parameters only at wrap time."""
+        iteration = self.step * self.world
+        unfroze = apply_staged_unfreeze(self.raw_model, self.optimizer, self.opt_cfg, iteration,
+                                        fresh=self.fresh)
+        if not unfroze:
+            return
+        if self.is0:
+            print(f'[{iteration}] UNFROZE the video encoder: blocks {unfroze["blocks"]} of '
+                  f'{unfroze["n_blocks"]}, norms {unfroze["norms"]}, {unfroze["n_params"]:,} '
+                  f'params (+{unfroze["muon_groups"]} muon, +{unfroze["adamw_groups"]} adamw '
+                  'group(s))', flush=True)
+            if self.wb is not None:
+                log(self.wb, {'train/encoder_unfrozen_at': iteration}, iteration)
+        if self.wrap:
+            import gc
+            self.model = None
+            gc.collect()
+            self.model = self.fabric.setup_module(self.raw_model)
+            self.model.train()
 
     def train_step(self, trip):
         """One optimizer step -> its grad norm, or None when every rank skipped it."""
@@ -727,7 +759,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         registry=registry, train_loader=train_loader, val_loader=val_loader, raw_model=model,
         wrap=fabric is not None and world > 1, optimizer=optimizer, loss_fn=loss_fn,
         val_loss_fn=val_loss_fn, output_granularity=output_granularity, wb=wb,
-        start_iter=start_iter, n_target=n_target,
+        start_iter=start_iter, n_target=n_target, opt_cfg=opt_cfg, fresh=fresh_names,
         best=_prior_best(out, config, resolve_selection_metric(config, output_granularity),
                          resuming, fabric, is0))
     loop.run_loop()

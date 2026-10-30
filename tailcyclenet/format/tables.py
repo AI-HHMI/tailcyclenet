@@ -83,13 +83,15 @@ def remap_codes(codes: np.ndarray, values: list[str], vocab: dict[str, int],
     A parquet dictionary is per FILE, not per group, so values other groups use must not be
     validated here.
     """
-    lut = np.array([vocab.get(v, -1) for v in values], dtype=np.int32)
+    known = np.array([v in vocab for v in values], dtype=bool)
+    lut = np.array([vocab.get(v, 0) for v in values], dtype=np.int32)
     codes = codes if sel is None else codes[sel]
-    out = lut[codes]
-    if (out < 0).any():
-        unknown = sorted({values[c] for c in np.unique(codes[out < 0])})
+    bad = ~known[codes]
+    if bad.any():
+        # NOT `lut < 0`: `unlabeled` and `absent`-style codes are legitimately negative (-1).
+        unknown = sorted({values[c] for c in np.unique(codes[bad])})
         raise FormatError(f'{where}: unknown {what} {unknown[0]!r}')
-    return out
+    return lut[codes]
 
 
 def column_floats(table: pa.Table, col: str, n: int) -> np.ndarray:

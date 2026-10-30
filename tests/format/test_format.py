@@ -384,6 +384,41 @@ def test_prediction_points3d_missing_status_may_keep_coordinates(tmp_path):
                    fmt.validate_session(fmt.Session.load(path), check_images=False))
 
 
+def test_an_unlabeled_row_reads_as_unlabeled(tmp_path):
+    """`unlabeled` is a spec status whose code is -1; the reader once used -1 as its own
+    "unknown status" sentinel and refused every file holding an `unlabeled` row."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_3d(path)
+    table_path = path / 'points3d.pq'
+    t = pq.read_table(table_path)
+    status = t.column('status').cast(pa.string()).to_pylist()
+    row = status.index('visible')
+    status[row] = 'unlabeled'
+    t = t.set_column(t.column_names.index('status'), 'status',
+                     pa.array(status).dictionary_encode())
+    for c in ('x', 'y', 'z'):
+        col = t.column(c).to_pylist()
+        col[row] = None
+        t = t.set_column(t.column_names.index(c), c, pa.array(col, t.schema.field(c).type))
+    pq.write_table(t, table_path)
+    sess = fmt.Session.load(path)
+    assert not fmt.validate_session(sess, check_images=False)
+    lab = sess.labels(next(iter(sess.groups)))
+    assert (lab.vis3d == fmt.UNLABELED).sum() >= 1
+    assert np.isnan(lab.points3d).any()
+    t = pq.read_table(table_path)
+    t = t.set_column(t.column_names.index('status'), 'status',
+                     pa.array(['bogus'] * len(t)).dictionary_encode())
+    pq.write_table(t, table_path)
+    with pytest.raises(fmt.FormatError, match="unknown status 'bogus'"):
+        sess = fmt.Session.load(path)
+        sess.labels(next(iter(sess.groups)))
+
+
 def test_rule_6_no_label_table_is_required(tmp_path):
     """Boxes alone are a detection session; no label table at all is an unlabelled clip."""
     path = tmp_path / 'ds' / 'train' / 'a'

@@ -55,26 +55,49 @@ SPECIES = {
 }
 
 
-def n_video_frames(path: Path) -> int:
-    """Decoded frame count (PyAV frame table, the reader the loader uses)."""
+def frame_table(path: Path) -> np.ndarray:
+    """Sorted packet pts of the first video stream (the PyAV frame table the loader seeks with)."""
     import av
     with av.open(str(path)) as c:
         st = c.streams.video[0]
-        return sum(1 for p in c.demux(st) if p.size)
+        return np.sort([p.pts for p in c.demux(st) if p.size])
+
+
+def n_video_frames(path: Path) -> int:
+    """Decoded frame count (PyAV frame table, the reader the loader uses)."""
+    return len(frame_table(path))
 
 
 def encode(src: Path, dst: Path, n_expected: int) -> None:
-    """Re-encode the rawvideo to H.264 keeping every frame; refuse a frame-count mismatch."""
-    if dst.exists() and n_video_frames(dst) == n_expected:
-        return
+    """Re-encode the source to H.264 keeping every frame, with regenerated strictly increasing timestamps.
+
+    A few sources carry a DUPLICATED timestamp (zebrafish_10_2 and _10_3: one each); passed through, it makes two frames
+    share one pts, so the loader's seek cannot reach one of them ("frames [15139] did not decode"), and neither
+    `setpts` nor an exact track timescale removed it. So every decoded frame is piped as RAW video into a second ffmpeg,
+    whose input timestamps are i / rate by construction. An existing output is kept only if its frame count matches AND
+    its pts are strictly increasing; a frame-count / pts failure after encoding is refused."""
+    if dst.exists():
+        tab = frame_table(dst)
+        if len(tab) == n_expected and (np.diff(tab) > 0).all():
+            return
+    import av
+    with av.open(str(src)) as c:
+        st = c.streams.video[0]
+        rate, (w, h) = st.average_rate, (st.codec_context.width, st.codec_context.height)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix('.tmp.mp4')
-    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(src), '-map', '0:v:0', '-fps_mode', 'passthrough',
+    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', str(src), '-map', '0:v:0', '-fps_mode', 'passthrough',
+                            '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], stdout=subprocess.PIPE)
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'gray', '-s', f'{w}x{h}',
+                    '-r', f'{rate.numerator}/{rate.denominator}', '-i', '-',
                     '-c:v', 'libx264', '-preset', 'medium', '-crf', '12', '-pix_fmt', 'gray', '-g', '50',
-                    str(tmp)], check=True)
-    n = n_video_frames(tmp)
-    if n != n_expected:
-        raise RuntimeError(f'{tmp}: {n} frames after encoding, expected {n_expected}')
+                    str(tmp)], stdin=dec.stdout, check=True)
+    dec.stdout.close()
+    if dec.wait() != 0:
+        raise RuntimeError(f'{src}: decoding failed')
+    tab = frame_table(tmp)
+    if len(tab) != n_expected or not (np.diff(tab) > 0).all():
+        raise RuntimeError(f'{tmp}: {len(tab)} frames / non-increasing pts after encoding, expected {n_expected}')
     tmp.rename(dst)
 
 

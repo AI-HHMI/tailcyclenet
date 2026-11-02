@@ -14,7 +14,8 @@ whose sessions carry the SAME `centroid` rows (those converters' `video_labels` 
 - UDMT: only the annotated frames (1 / 150-600) have identities, so only they get boxes. Background = median of 50 evenly
   spaced frames; mask (darker / brighter / |diff| closed 5x5, all opened 3x3) and level are tuned per video on its own
   annotated frames (`udmt_boxes`; a sole blob counts only at 0.5-2x the annotators' box side). Matching and the square
-  are as above, with the ownership test 0.5 x the median blob side (the clicked point is not the blob centroid).
+  are as above, with the ownership test 0.5 x the median blob side (the clicked point is not the blob centroid). TRAIN /
+  VAL checkpoints are carried +-6 frames along each clean individual's own blob (`propagate`; tracker rows, not clicks).
 A camera-frame where every animal has a position and box is `labeled`; any other is `present`. Boxes are clipped to the
 image. Pixels are LINKED: idtracker to the eval root's H.264 (`<root>/test/<video>/groups/g0/cam0.mp4`, must exist),
 UDMT to the raw mp4. The split and box statistics go to the root's README.md (+ box_stats.json). No unit tests
@@ -58,6 +59,8 @@ IDT_OWN_BL = 0.25
 UDMT_OWN_SIDE = 0.5
 UDMT_LEVELS = (8, 12, 16, 20, 25, 30, 40, 50, 60, 80, 100, 120)
 SIZE_BAND = (0.5, 2.0)
+UDMT_EXTEND = 6
+UDMT_STEP_SIDE = 0.25
 
 
 def gray_frames(path: Path, keep=None):
@@ -206,18 +209,22 @@ def idtracker_boxes(v: dict):
     return out, kind, st
 
 
-def udmt_boxes(v: dict):
+def udmt_boxes(v: dict, extend: int = 0):
     """Background-subtract + threshold a UDMT video's annotated frames (level tuned per video) and box each animal.
 
     The score of a (mask, level) is the share of annotated animals that solely own an ANIMAL-SIZED blob (a dark spot on a
     white mouse is a sole owner too, and is not a box). Of the best mask, the LOWEST level within 0.01 of the best score
-    is kept: a higher level erodes the blob to its core."""
+    is kept: a higher level erodes the blob to its core.
+
+    `extend` > 0 also returns `ext` {frame: (N, 2)} -- each clean individual's checkpoint carried up to `extend` frames
+    each way by `propagate`; NaN where it stopped. Otherwise `ext` is None."""
     lab_ = v['lab']
     frames = v['frames']
     T = v['group'].n_frames
     pts = lab_.points2d[:, frames, 0, 0, :].transpose(1, 0, 2).astype(np.float64)
     gt_side = float(np.nanmedian(lab_.boxes[:, frames, 0, 2] - lab_.boxes[:, frames, 0, 0]))
-    idx = np.unique(np.concatenate([np.linspace(0, T - 1, 50, dtype=int), frames]))
+    near = (frames[:, None] + np.arange(-extend, extend + 1)[None]).ravel()
+    idx = np.unique(np.concatenate([np.linspace(0, T - 1, 50, dtype=int), near[(near >= 0) & (near < T)]]))
     got = dict(gray_frames(v['video'], idx))
     bkg = np.median(np.stack([got[i] for i in np.linspace(0, T - 1, 50, dtype=int)]), 0).astype(np.int16)
     imgs = [got[int(f)].astype(np.int16) for f in frames]
@@ -263,7 +270,50 @@ def udmt_boxes(v: dict):
     out, kind, st = finalize(pts, box, area, count, dist, own_tol, W, H)
     st.update({'mask': mode, 'level': level, 'sized_sole_owner_frac': score,
                'gt_box_px': gt_side})
-    return out, kind, st
+    ext = None
+    if extend > 0:
+        seg = {f: blobs(mask(im.astype(np.int16), mode, level), 15, np.inf) for f, im in got.items()}
+        ext = propagate(seg, frames, pts, kind, extend, UDMT_STEP_SIDE * st['square_side_px'], st['median_blob_area_px'], T)
+        n = sum(int(np.isfinite(p).all(-1).sum()) for p in ext.values())
+        st.update({'extend': extend, 'propagated_rows': n,
+                   'propagated_per_checkpoint_animal': n / max(int((kind == 1).sum()), 1)})
+    return out, kind, st, ext
+
+
+def propagate(seg: dict, frames, pts, kind, extend: int, step_tol: float, med_area: float, T: int) -> dict:
+    """Carry each clean individual's annotated point up to `extend` frames each way along its own blob.
+
+    At a checkpoint an animal with a `blob` box (kind 1) keeps offset = clicked point - blob centroid. Each step takes the
+    ONE blob whose centroid is within `step_tol` (0.25 median blob side) of the previous centroid, with area within 0.5-2x the video's median
+    individual-blob area and claimed by no other animal at that frame; the label is that centroid + the offset. Zero or
+    several candidates, a shared blob or a size jump stops that animal in that direction (a merge ends the carry).
+    Inputs: seg {frame: `blobs` output}; frames (F,) checkpoints; pts (F, N, 2); kind (F, N). Returns {frame: (N, 2)}."""
+    out = {}
+    for i, f in enumerate(frames):
+        lab0, cen0, _, _ = seg[int(f)]
+        if not len(cen0):
+            continue
+        own, _, _ = match(pts[i], lab0, cen0, step_tol)
+        for d in (-1, 1):
+            prev = {a: cen0[own[a]] for a in range(len(own)) if kind[i, a] == 1 and own[a] >= 0}
+            off = {a: pts[i, a] - prev[a] for a in prev}
+            for k in range(1, extend + 1):
+                t = int(f) + d * k
+                if t < 0 or t >= T or not prev:
+                    break
+                _, cen, _, ar = seg[t]
+                pick = {}
+                for a, p in prev.items():
+                    c = np.flatnonzero((np.linalg.norm(cen - p, axis=1) <= step_tol)
+                                       & (ar >= 0.5 * med_area) & (ar <= MAX_AREA_X * med_area)) if len(cen) else []
+                    if len(c) == 1:
+                        pick[a] = int(c[0])
+                taken = [j for j in pick.values()]
+                prev = {a: cen[j] for a, j in pick.items() if taken.count(j) == 1}
+                row = out.setdefault(t, np.full(pts.shape[1:], np.nan))
+                for a, c in prev.items():
+                    row[a] = c + off[a]
+    return out
 
 
 def build(dataset: str, split: str, name: str, out: Path, dry: bool) -> dict:
@@ -278,8 +328,12 @@ def build(dataset: str, split: str, name: str, out: Path, dry: bool) -> dict:
         frames = np.arange(v['group'].n_frames)
     else:
         v = udmt.session_labels(name)
-        boxes, kind, st = udmt_boxes(v)
+        boxes, kind, st, ext = udmt_boxes(v, UDMT_EXTEND if split in ('train', 'val') else 0)
         pixels, frames = v['video'], v['frames']
+        for t, row in (ext or {}).items():
+            ok = np.isfinite(row).all(-1) & (v['lab'].vis2d[:, t, 0, 0] == fmt.UNLABELED)
+            v['lab'].points2d[ok, t, 0, 0] = row[ok]
+            v['lab'].vis2d[ok, t, 0, 0] = fmt.PROJECTED
     lab = v['lab']
     N = len(lab.animal_ids)
     lab.boxes = np.full((N, v['group'].n_frames, 1, 4), np.nan, np.float32)
@@ -316,7 +370,13 @@ def write_readme(dataset: str, out: Path, stats: list[dict]) -> None:
             + '\n\n## Boxes (per video)\n\n`blob` = the re-segmented blob box of a clean individual; `square` = a '
             'fixed square (the video\'s median individual-blob side) on the identity centroid (merged / crossing '
             'blob, or no blob).\n\n| split | video | N | frames boxed | blob | square | square side px | '
-            'incomplete frames |\n|---|---|---|---|---|---|---|---|\n' + rows + '\n')
+            'incomplete frames |\n|---|---|---|---|---|---|---|---|\n' + rows + '\n'
+            + ('' if dataset in SPECIES else
+               f'\n## Train / val label extension\n\nUDMT annotates 1 frame in 150-600, and one keypoint at one frame cannot '
+               f'train (a window needs >= 2 finite coordinates). Each train / val checkpoint is therefore carried '
+               f'+-{UDMT_EXTEND} frames along the clean individual\'s own blob (`propagate`): blob centroid + the '
+               f'checkpoint\'s clicked-point offset, stopping at any merge or ambiguity. Those rows are tracker-derived, '
+               f'not human clicks. TEST sessions keep the human checkpoints only.\n'))
     (out / 'README.md').write_text(text)
     (out / 'box_stats.json').write_text(json.dumps(stats, indent=1))
 

@@ -224,3 +224,32 @@ def test_select_is_deterministic_given_idx_rng_and_shape(seam_root):
     _same(a.coords, b.coords, 'coords')
     assert a.cam_names == b.cam_names and a.cam_ix == b.cam_ix
     assert a.animal == b.animal and a.inflate == b.inflate
+
+
+def test_a_window_with_one_finite_coordinate_is_kept(tmp_path):
+    """A 1-keypoint skeleton labelled on ONE frame of the window still builds (owner, 2026-11-02).
+
+    Sparse single-keypoint roots (a centroid per checkpoint, 1 label per 150-600 frames) give
+    every window exactly one finite coordinate; the old `< 2` gate refused all of them. The
+    keypoint must survive at its array position with its one finite target."""
+    from tailcyclenet import format as fmt
+    from tests.helpers import _rig, _write_frames
+
+    W, H, T = 64, 48, 4
+    lab = fmt.empty_labels(1, T, 1, 1, mode3d=False, animal_ids=['a01'])
+    lab.points2d[:] = np.nan
+    lab.vis2d[:] = fmt.UNLABELED
+    lab.points2d[0, 1, 0, 0] = [30.0, 20.0]
+    lab.vis2d[0, 1, 0, 0] = fmt.VISIBLE
+    groups = {'g000': fmt.Group('g000', T, fps=40.0, source_video='movie.avi')}
+    path = tmp_path / 'centroid' / 'train' / 'sess'
+    fmt.write_session(path, mode='2d', units='px', label_source='annotated', names=['centroid'],
+                      rig=_rig([('cam0', W, H, False, False, 0)]), groups=groups,
+                      labels={'g000': lab}, provenance={'source': 'synthetic'})
+    _write_frames(path / 'groups' / 'g000', 'cam0', T, (W, H))
+
+    ds = PoseDataset(tmp_path / 'centroid', 'train', _CASES['plain'], train=True)
+    sel = ds.select(0, np.random.default_rng(0), ds.shape(np.random.default_rng(1)))
+    assert sel is not None, 'a window with one finite coordinate was refused'
+    assert sel.n_keypoints == 1
+    assert int(torch.isfinite(sel.coords).all(-1).sum()) == 1

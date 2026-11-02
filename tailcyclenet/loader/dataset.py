@@ -598,7 +598,10 @@ class PoseDataset(Dataset):
                 rng -- the item's RNG stream.
                 shape -- a pre-drawn cost-determining shape dict (see `shape`).
         Outputs: the `Selection`, or None (an index that resolves to no labelled frames, or a
-        track with fewer than 2 finite coordinates).
+        track with no finite coordinate at all). A window with ONE finite coordinate is kept (a
+        1-keypoint skeleton with sparse labels, e.g. one centroid per checkpoint): the losses mask
+        per (frame, keypoint), and the library's <2-valid-frames keypoint drop lives in
+        `TracktailDataset`, which this path never calls (gotcha 4).
 
         Consumes the shape/cell draw, the camera-count and single-view draws, the crop-inflate
         draw, the swap-animal neighbour draw and the frame draw -- everything whose value is a
@@ -678,7 +681,7 @@ class PoseDataset(Dataset):
             else:
                 vis = vis_2d = None
 
-        if torch.isfinite(coords).all(-1).sum() < 2:
+        if torch.isfinite(coords).all(-1).sum() < 1:
             return None
 
         return Selection(item=item, sess=sess, group=group, lab=lab, frames=frames, animal=a,

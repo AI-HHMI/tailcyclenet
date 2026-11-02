@@ -61,11 +61,12 @@ def probe(path: Path) -> tuple[int, float, int, int]:
         return n, float(st.average_rate), st.codec_context.width, st.codec_context.height
 
 
-def convert(sid: str, out: Path, dry: bool) -> None:
-    """Write one UDMT session: labeled boxes + `centroid` rows on the annotated frames, and link the video.
+def session_labels(sid: str) -> dict:
+    """Build one UDMT session's labels (source 65 px boxes + box-centre `centroid` on the annotated frames).
 
-    Inputs: the session id (key of SESSIONS), the output root, `dry` (report only). Annotations past the last video frame
-    are dropped and listed in the group notes. Side effects: writes `<out>/test/<sid>/`.
+    Inputs: the session id (key of SESSIONS). Annotations past the last video frame are dropped and listed in the group
+    notes. Outputs: a dict with `lab`, `group`, `rig`, `provenance`, `video` (source mp4 path), `frames` (the annotated
+    video frames, sorted). Side effects: prints the per-session counts. Shared by `convert` and `blob_split.py`.
     """
     seq, video, step, species = SESSIONS[sid]
     gt = pd.read_csv(RAW / 'Annotation' / seq / 'gt' / 'gt.txt', header=None)
@@ -83,8 +84,6 @@ def convert(sid: str, out: Path, dry: bool) -> None:
     dropped = sorted(set(gt[0][~keep]))
     print(f'{sid}: T={T} fps={fps:.2f} {W}x{H} N={N} annotated={gt[0].nunique()} step={step} '
           f'dropped(past end)={dropped} box={sorted(set(gt[4]) | set(gt[5]))}')
-    if dry:
-        return
     gt, frames = gt[keep], frames[keep]
     lab = fmt.empty_labels(N, T, 1, 1, mode3d=False, animal_ids=[f'id{int(i):02d}' for i in ids])
     lab.boxes = np.full((N, T, 1, 4), np.nan, np.float32)
@@ -96,18 +95,30 @@ def convert(sid: str, out: Path, dry: bool) -> None:
     lab.instance[s, frames, 0] = fmt.INST_LABELED
     lab.points2d[s, frames, 0, 0] = np.stack([x0 + w / 2, y0 + h / 2], -1)
     lab.vis2d[s, frames, 0, 0] = fmt.PROJECTED
-    sess = out / 'test' / sid
     notes = (f'species={species}; sparse GT every {step} frames; box_px={int(w[0])}'
              + (f'; dropped annotation index {dropped} (past the last video frame)' if dropped else ''))
     g = fmt.Group('g0', T, fps=fps, source_video=video, notes=notes)
-    fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'],
-                      rig=fmt.nominal_rig('cam0', (W, H)), groups={'g0': g}, labels={'g0': lab}, flip_pairs=[],
-                      provenance={'source': f'UDMT (Zenodo 14580256 video {video}; Zenodo 20355567 Annotation/{seq})',
-                                  'annotator': '', 'annotator_tool': 'manual MOT boxes (UDMT authors)',
-                                  'converter': 'scripts/convert/udmt.py', 'created': date.today().isoformat(),
-                                  'licence': 'CC BY 4.0'})
+    prov = {'source': f'UDMT (Zenodo 14580256 video {video}; Zenodo 20355567 Annotation/{seq})',
+            'annotator': '', 'annotator_tool': 'manual MOT boxes (UDMT authors)',
+            'converter': 'scripts/convert/udmt.py', 'created': date.today().isoformat(), 'licence': 'CC BY 4.0'}
+    return {'lab': lab, 'group': g, 'rig': fmt.nominal_rig('cam0', (W, H)), 'provenance': prov, 'video': vid,
+            'frames': np.unique(frames)}
+
+
+def convert(sid: str, out: Path, dry: bool) -> None:
+    """Write one UDMT session: labeled boxes + `centroid` rows on the annotated frames, and link the video.
+
+    Inputs: the session id (key of SESSIONS), the output root, `dry` (report only). Side effects: writes
+    `<out>/test/<sid>/`.
+    """
+    v = session_labels(sid)
+    if dry:
+        return
+    sess = out / 'test' / sid
+    fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'], rig=v['rig'],
+                      groups={'g0': v['group']}, labels={'g0': v['lab']}, flip_pairs=[], provenance=v['provenance'])
     (sess / 'groups' / 'g0').mkdir(parents=True, exist_ok=True)
-    fmt.link(sess / 'groups' / 'g0' / 'cam0.mp4', vid)
+    fmt.link(sess / 'groups' / 'g0' / 'cam0.mp4', v['video'])
 
 
 def main() -> int:

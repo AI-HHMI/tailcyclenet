@@ -1,0 +1,356 @@
+#!/usr/bin/env python
+"""Split roots (train / val / test by WHOLE VIDEO) with re-segmented blob boxes, for the idtracker.ai and UDMT benchmarks.
+
+The eval-only roots of `idtrackerai.py` / `udmt.py` (every video under `test/`) are untouched; this writes `<name>-split`,
+whose sessions carry the SAME `centroid` rows (those converters' `video_labels` / `session_labels`) plus `instances.pq`:
+- idtracker.ai: every frame is re-segmented with the session's own idtracker.ai v5.2.5 parameters (session.json
+  `intensity_ths`, `area_ths`, `resolution_reduction`, `roi_list`, `use_bkg` = median of `number_of_frames_for_background`
+  evenly spaced frames; `segmentation.py::process_frame`, incl. 5.2.5's "(0, v) with a background means (v, 255)" rule).
+  Each validated centroid (`validated.npy`) takes the blob containing it, else the nearest blob centroid within 0.5 BL.
+  A blob owned by exactly one animal, with its centroid within 0.25 BL of that animal's, area <= 2x and longer side
+  >= 0.5x the video's median individual blob, gives its bounding box (`blob`). Every other animal-frame (merged /
+  crossing blob, no blob) gets a SQUARE of the video's median individual-blob side on the validated centroid (inside
+  crossings that centroid is idtracker's interpolation: a placement, not a measurement).
+- UDMT: only the annotated frames (1 / 150-600) have identities, so only they get boxes. Background = median of 50 evenly
+  spaced frames; mask (darker / brighter / |diff| closed 5x5, all opened 3x3) and level are tuned per video on its own
+  annotated frames (`udmt_boxes`; a sole blob counts only at 0.5-2x the annotators' box side). Matching and the square
+  are as above, with the ownership test 0.5 x the median blob side (the clicked point is not the blob centroid).
+A camera-frame where every animal has a position and box is `labeled`; any other is `present`. Boxes are clipped to the
+image. Pixels are LINKED: idtracker to the eval root's H.264 (`<root>/test/<video>/groups/g0/cam0.mp4`, must exist),
+UDMT to the raw mp4. The split and box statistics go to the root's README.md (+ box_stats.json). No unit tests
+(converter rule); check with --validate, scripts/dataset_tools/check_status.py and a render.
+
+Usage:
+  pixi run python scripts/convert/blob_split.py --dataset idtrackerai-mice --validate
+  pixi run python scripts/convert/blob_split.py --dataset udmt-multianimal --only mice7 --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from tailcyclenet import format as fmt
+from _common import validate_root
+import idtrackerai
+import udmt
+
+OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets')
+SPLITS = {
+    'idtrackerai-mice': {'train': ['mice_2_1', 'mice_2_2', 'mice_4_1'], 'val': ['mice_2_3'],
+                         'test': ['mice_2_4', 'mice_4_2']},
+    'idtrackerai-zebrafish': {'train': ['zebrafish_2', 'zebrafish_5', 'zebrafish_7', 'zebrafish_10_1', 'zebrafish_10_4'],
+                              'val': ['zebrafish_10_2'], 'test': ['zebrafish_8', 'zebrafish_20', 'zebrafish_10_3']},
+    'udmt-multianimal': {'train': ['mice3', 'mice5_94hz', 'whitemice5', 'rat1mice2', 'flies12', 'flies17', 'flies18_illum'],
+                         'val': ['mice7', 'flies23'], 'test': ['mice5', 'mice10', 'flies18']},
+}
+SPECIES = {'idtrackerai-mice': 'mice', 'idtrackerai-zebrafish': 'zebrafish'}
+MAX_AREA_X = 2.0
+MIN_SIDE_X = 0.5
+NEAR_BL = 0.5
+IDT_OWN_BL = 0.25
+UDMT_OWN_SIDE = 0.5
+UDMT_LEVELS = (8, 12, 16, 20, 25, 30, 40, 50, 60, 80, 100, 120)
+SIZE_BAND = (0.5, 2.0)
+
+
+def gray_frames(path: Path, keep=None):
+    """Yield (index, uint8 gray frame) in decode order, as OpenCV's BGR -> GRAY would produce it (idtracker reads with
+    OpenCV). `keep`: an optional sorted index array -- only those frames are converted, decoding stops after the last."""
+    import av
+    last = None if keep is None else int(keep[-1])
+    want = None if keep is None else set(int(k) for k in keep)
+    with av.open(str(path)) as c:
+        st = c.streams.video[0]
+        st.thread_type = 'AUTO'
+        for i, f in enumerate(c.decode(st)):
+            if want is None or i in want:
+                yield i, cv2.cvtColor(f.to_ndarray(format='bgr24'), cv2.COLOR_BGR2GRAY)
+            if last is not None and i >= last:
+                return
+
+
+def roi_mask(sj: dict) -> np.ndarray | None:
+    """idtracker.ai's `build_ROI_mask_from_list` (5.2.5): polygons / ellipses at the reduced resolution, or None."""
+    rl, rr = sj.get('roi_list'), float(sj['resolution_reduction'])
+    if rl is None:
+        return None
+    m = np.zeros((int(sj['original_height'] * rr + 0.5), int(sj['original_width'] * rr + 0.5)), np.uint8)
+    for line in ([rl] if isinstance(rl, str) else rl):
+        data = json.loads(line[10:].replace("'", '"'))
+        if line[2:9] == 'Polygon':
+            v = np.asarray(data)
+        elif line[2:9] == 'Ellipse':
+            v = np.asarray(cv2.ellipse2Poly(data['center'], data['axes'], data['angle'], 0, 360, 2))
+        else:
+            raise TypeError(line)
+        cv2.fillPoly(m, ((v * rr + 0.5).astype(np.int32),), color=255 if line[0] == '+' else 0)
+    return m
+
+
+def blobs(seg: np.ndarray, amin: float, amax: float):
+    """External contours of a binary mask with amin <= contourArea <= amax (idtracker's filter).
+
+    Returns (label image int32 with blob i filled as i+1, centroids (B, 2), boxes (B, 4) x0 y0 x1 y1, areas (B,)),
+    all in the mask's pixels."""
+    cs = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)[0]
+    lab = np.zeros(seg.shape, np.int32)
+    cen, box, area = [], [], []
+    for cn in cs:
+        a = cv2.contourArea(cn)
+        if not (amin <= a <= amax) or a <= 0:
+            continue
+        m = cv2.moments(cn)
+        x, y, w, h = cv2.boundingRect(cn)
+        cv2.drawContours(lab, [cn], -1, len(cen) + 1, thickness=-1)
+        cen.append((m['m10'] / m['m00'], m['m01'] / m['m00']))
+        box.append((x, y, x + w, y + h))
+        area.append(a)
+    return lab, np.asarray(cen, np.float64).reshape(-1, 2), np.asarray(box, np.float64).reshape(-1, 4), np.asarray(area)
+
+
+def match(points: np.ndarray, lab: np.ndarray, cen: np.ndarray, near: float):
+    """Each animal's blob: the one containing its point, else the nearest centroid within `near` (mask px); -1 if none.
+
+    Returns (owner (N,), number of animals sharing the owner blob (N,), point -> owner-centroid distance (N,))."""
+    N = len(points)
+    own = np.full(N, -1)
+    H, W = lab.shape
+    for a, p in enumerate(points):
+        if not np.isfinite(p).all():
+            continue
+        x, y = int(round(p[0])), int(round(p[1]))
+        j = lab[y, x] - 1 if (0 <= x < W and 0 <= y < H) else -1
+        if j < 0 and len(cen):
+            d = np.linalg.norm(cen - p, axis=1)
+            j = int(np.argmin(d)) if d.min() <= near else -1
+        own[a] = j
+    count = np.array([(own == j).sum() if j >= 0 else 0 for j in own])
+    dist = np.array([np.linalg.norm(cen[j] - points[a]) if j >= 0 else np.inf for a, j in enumerate(own)])
+    return own, count, dist
+
+
+def finalize(pos, box, area, count, dist, own_tol, W, H):
+    """Per animal-frame boxes from the matched blobs: blob box for a clean individual, else the median-side square.
+
+    Inputs: pos (F, N, 2) full-res centroids; box (F, N, 4) owner blob boxes (full-res, NaN if none); area (F, N) owner
+    blob areas; count / dist (F, N) from `match` (dist in full-res px); own_tol (full-res px). Returns (boxes (F, N, 4),
+    kind (F, N) 0 = no position, 1 = blob, 2 = square, stats dict)."""
+    single = (count == 1) & (dist <= own_tol)
+    med_area = float(np.median(area[single])) if single.any() else np.inf
+    allside = np.maximum(box[..., 2] - box[..., 0], box[..., 3] - box[..., 1])
+    indiv = single & (area <= MAX_AREA_X * med_area)
+    side = float(np.median(allside[indiv])) if indiv.any() else float('nan')
+    indiv &= allside >= MIN_SIDE_X * side
+    out = np.full(box.shape, np.nan, np.float32)
+    out[indiv] = box[indiv]
+    fin = np.isfinite(pos).all(-1)
+    sq = fin & ~indiv
+    c = pos[sq]
+    out[sq] = np.concatenate([c - side / 2, c + side / 2], -1)
+    out[..., [0, 2]] = np.clip(out[..., [0, 2]], 0, W)
+    out[..., [1, 3]] = np.clip(out[..., [1, 3]], 0, H)
+    kind = np.where(indiv & fin, 1, np.where(sq, 2, 0))
+    return out, kind, {'median_blob_area_px': med_area, 'square_side_px': side,
+                       'blob_frac': float((kind == 1).sum() / max(fin.sum(), 1)),
+                       'square_frac': float((kind == 2).sum() / max(fin.sum(), 1))}
+
+
+def idtracker_boxes(v: dict):
+    """Re-segment every frame of an idtracker.ai video with its own session parameters and box each animal."""
+    sj, traj, bl = v['session'], v['traj'], v['body_length']
+    rr = float(sj['resolution_reduction'])
+    T, N, _ = traj.shape
+    W, H = int(sj['original_width']), int(sj['original_height'])
+    ith, (amin, amax) = sj['intensity_ths'], sj['area_ths']
+    roi = roi_mask(sj)
+    bkg = None
+    if sj['use_bkg']:
+        idx = np.linspace(0, T - 1, int(sj['number_of_frames_for_background']), dtype=int)
+        stack = np.stack([f for _, f in gray_frames(v['avi'], idx)])
+        stat = {'median': np.median, 'mean': np.mean, 'max': np.max, 'min': np.min}[sj['background_subtraction_stat']]
+        bkg = stat(stack, axis=0).astype(np.uint8)
+        if rr != 1:
+            bkg = cv2.resize(bkg, None, fx=rr, fy=rr, interpolation=cv2.INTER_AREA)
+        if ith[0] == 0:
+            ith = (ith[1], 255)
+    box = np.full((T, N, 4), np.nan)
+    area = np.full((T, N), np.nan)
+    count = np.zeros((T, N), int)
+    dist = np.full((T, N), np.inf)
+    n_blobs = np.zeros(T, int)
+    for t, fr in gray_frames(v['avi']):
+        if rr != 1:
+            fr = cv2.resize(fr, None, fx=rr, fy=rr, interpolation=cv2.INTER_AREA)
+        seg = cv2.inRange(fr, *ith) if bkg is None else (cv2.absdiff(bkg, fr) > ith[0]).astype(np.uint8)
+        if roi is not None:
+            cv2.bitwise_and(seg, roi, seg)
+        lab, cen, bx, ar = blobs(seg, amin, amax)
+        n_blobs[t] = len(cen)
+        own, cnt, dd = match(traj[t] * rr, lab, cen, NEAR_BL * bl * rr)
+        ok = own >= 0
+        box[t, ok] = bx[own[ok]] / rr
+        area[t, ok] = ar[own[ok]]
+        count[t], dist[t] = cnt, dd / rr
+    if t != T - 1:
+        raise RuntimeError(f'{v["avi"]}: decoded {t + 1} frames, expected {T}')
+    out, kind, st = finalize(traj, box, area, count, dist, IDT_OWN_BL * bl, W, H)
+    st['frames_with_N_blobs'] = float((n_blobs == N).mean())
+    st['own_dist_median_px'] = float(np.median(dist[count == 1])) if (count == 1).any() else float('nan')
+    return out, kind, st
+
+
+def udmt_boxes(v: dict):
+    """Background-subtract + threshold a UDMT video's annotated frames (level tuned per video) and box each animal.
+
+    The score of a (mask, level) is the share of annotated animals that solely own an ANIMAL-SIZED blob (a dark spot on a
+    white mouse is a sole owner too, and is not a box). Of the best mask, the LOWEST level within 0.01 of the best score
+    is kept: a higher level erodes the blob to its core."""
+    lab_ = v['lab']
+    frames = v['frames']
+    T = v['group'].n_frames
+    pts = lab_.points2d[:, frames, 0, 0, :].transpose(1, 0, 2).astype(np.float64)
+    gt_side = float(np.nanmedian(lab_.boxes[:, frames, 0, 2] - lab_.boxes[:, frames, 0, 0]))
+    idx = np.unique(np.concatenate([np.linspace(0, T - 1, 50, dtype=int), frames]))
+    got = dict(gray_frames(v['video'], idx))
+    bkg = np.median(np.stack([got[i] for i in np.linspace(0, T - 1, 50, dtype=int)]), 0).astype(np.int16)
+    imgs = [got[int(f)].astype(np.int16) for f in frames]
+    H, W = imgs[0].shape
+    k3, k5 = np.ones((3, 3), np.uint8), np.ones((5, 5), np.uint8)
+
+    def mask(im, mode, level):
+        """Binary foreground of one frame for a mask mode and level."""
+        if mode == 'absdiff+close':
+            seg = cv2.morphologyEx((np.abs(im - bkg) > level).astype(np.uint8), cv2.MORPH_OPEN, k3)
+            return cv2.morphologyEx(seg, cv2.MORPH_CLOSE, k5)
+        sign = -1 if mode == 'darker' else 1
+        return cv2.morphologyEx(((sign * (im - bkg)) > level).astype(np.uint8), cv2.MORPH_OPEN, k3)
+
+    def run(mode, level):
+        """Match every annotated frame's animals to the blobs of one (mode, level): (box, area, count, dist)."""
+        box = np.full(pts.shape[:2] + (4,), np.nan)
+        area = np.full(pts.shape[:2], np.nan)
+        count = np.zeros(pts.shape[:2], int)
+        dist = np.full(pts.shape[:2], np.inf)
+        for i, im in enumerate(imgs):
+            lab, cen, bx, ar = blobs(mask(im, mode, level), 15, np.inf)
+            own, cnt, dd = match(pts[i], lab, cen, NEAR_BL * gt_side)
+            ok = own >= 0
+            box[i, ok], area[i, ok] = bx[own[ok]], ar[own[ok]]
+            count[i], dist[i] = cnt, dd
+        return box, area, count, dist
+
+    tried = []
+    for mode in ('darker', 'brighter', 'absdiff+close'):
+        for level in UDMT_LEVELS:
+            r = run(mode, level)
+            side = np.maximum(r[0][..., 2] - r[0][..., 0], r[0][..., 3] - r[0][..., 1])
+            score = float(((r[2] == 1) & (side >= SIZE_BAND[0] * gt_side) & (side <= SIZE_BAND[1] * gt_side)).mean())
+            tried.append((score, mode, level, r))
+    top = max(t[0] for t in tried)
+    best_mode = max(tried, key=lambda t: t[0])[1]
+    score, mode, level, (box, area, count, dist) = min(
+        (t for t in tried if t[1] == best_mode and t[0] >= top - 0.01), key=lambda t: t[2])
+    single = count == 1
+    sides = np.maximum(box[..., 2] - box[..., 0], box[..., 3] - box[..., 1])[single]
+    own_tol = UDMT_OWN_SIDE * float(np.median(sides)) if sides.size else 0.0
+    out, kind, st = finalize(pts, box, area, count, dist, own_tol, W, H)
+    st.update({'mask': mode, 'level': level, 'sized_sole_owner_frac': score,
+               'gt_box_px': gt_side})
+    return out, kind, st
+
+
+def build(dataset: str, split: str, name: str, out: Path, dry: bool) -> dict:
+    """Convert one video into `<out>/<split>/<name>/` with boxes; returns its box statistics."""
+    if dataset in SPECIES:
+        raw, eval_root, _ = idtrackerai.SPECIES[SPECIES[dataset]]
+        v = idtrackerai.video_labels(raw, name)
+        boxes, kind, st = idtracker_boxes(v)
+        pixels = eval_root / 'test' / name / 'groups' / 'g0' / 'cam0.mp4'
+        if not pixels.exists():
+            raise FileNotFoundError(f'{pixels}: run idtrackerai.py --species {SPECIES[dataset]} first')
+        frames = np.arange(v['group'].n_frames)
+    else:
+        v = udmt.session_labels(name)
+        boxes, kind, st = udmt_boxes(v)
+        pixels, frames = v['video'], v['frames']
+    lab = v['lab']
+    N = len(lab.animal_ids)
+    lab.boxes = np.full((N, v['group'].n_frames, 1, 4), np.nan, np.float32)
+    lab.instance = np.full((N, v['group'].n_frames, 1), fmt.INST_NONE, np.int8)
+    lab.boxes[:, frames, 0] = boxes.transpose(1, 0, 2)
+    complete = (kind > 0).all(1)
+    lab.instance[:, frames, 0] = np.where(complete, fmt.INST_LABELED, fmt.INST_PRESENT)[None, :]
+    st.update({'video': name, 'split': split, 'frames_boxed': int(len(frames)),
+               'frames_incomplete': int((~complete).sum()), 'n_animals': N})
+    print(f'{dataset}/{split}/{name}: ' + ' '.join(f'{k}={x:.4g}' if isinstance(x, float) else f'{k}={x}'
+                                                    for k, x in st.items()), flush=True)
+    if dry:
+        return st
+    v['group'].notes += (f'; boxes=blob-resegmented (blob {st["blob_frac"]:.3f} / square {st["square_frac"]:.3f}, '
+                         f'square side {st["square_side_px"]:.1f}px)')
+    prov = dict(v['provenance'], converter=v['provenance']['converter'] + ' + scripts/convert/blob_split.py')
+    sess = out / split / name
+    fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'], rig=v['rig'],
+                      groups={'g0': v['group']}, labels={'g0': lab}, flip_pairs=[], provenance=prov)
+    (sess / 'groups' / 'g0').mkdir(parents=True, exist_ok=True)
+    fmt.link(sess / 'groups' / 'g0' / 'cam0.mp4', pixels)
+    return st
+
+
+def write_readme(dataset: str, out: Path, stats: list[dict]) -> None:
+    """The split, the box rule and the per-video box statistics, as the root's README.md."""
+    rows = '\n'.join(f'| {s["split"]} | {s["video"]} | {s["n_animals"]} | {s["frames_boxed"]} | {s["blob_frac"]:.3f} | '
+                     f'{s["square_frac"]:.3f} | {s["square_side_px"]:.1f} | {s["frames_incomplete"]} |' for s in stats)
+    sp = SPLITS[dataset]
+    text = (f'# {dataset}-split\n\nThe `{dataset}` benchmark split by WHOLE VIDEO (every val/test video unseen in '
+            f'training), with detector boxes in `instances.pq`. Written by `scripts/convert/blob_split.py` (see its '
+            f'docstring for the box rule); keypoint rows are identical to the eval-only root `{dataset}` (one '
+            f'`centroid` keypoint).\n\n## Split\n\n' + '\n'.join(f'- **{k}**: {", ".join(sp[k])}' for k in sp)
+            + '\n\n## Boxes (per video)\n\n`blob` = the re-segmented blob box of a clean individual; `square` = a '
+            'fixed square (the video\'s median individual-blob side) on the identity centroid (merged / crossing '
+            'blob, or no blob).\n\n| split | video | N | frames boxed | blob | square | square side px | '
+            'incomplete frames |\n|---|---|---|---|---|---|---|---|\n' + rows + '\n')
+    (out / 'README.md').write_text(text)
+    (out / 'box_stats.json').write_text(json.dumps(stats, indent=1))
+
+
+def _one(args):
+    """`build` on one argument tuple (a picklable ProcessPoolExecutor target)."""
+    return build(*args)
+
+
+def main() -> int:
+    """Parse the CLI, convert the requested videos in parallel, write the README, optionally validate."""
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--dataset', choices=sorted(SPLITS), required=True)
+    ap.add_argument('--only', nargs='*', help='subset of video names')
+    ap.add_argument('--out', type=Path, default=None, help='default: tailcycle-datasets/<dataset>-split')
+    ap.add_argument('--clean', action='store_true', help='remove the output first')
+    ap.add_argument('--dry-run', action='store_true', help='report, write nothing')
+    ap.add_argument('--jobs', type=int, default=8)
+    ap.add_argument('--validate', action='store_true')
+    ap.add_argument('--no-image-check', action='store_true')
+    a = ap.parse_args()
+    out = a.out or OUT / f'{a.dataset}-split'
+    if a.clean and out.exists() and not a.dry_run:
+        shutil.rmtree(out)
+    todo = [(a.dataset, sp, n, out, a.dry_run) for sp, names in SPLITS[a.dataset].items() for n in names
+            if not a.only or n in a.only]
+    with ProcessPoolExecutor(max(1, min(a.jobs, len(todo)))) as ex:
+        stats = list(ex.map(_one, todo))
+    if not a.dry_run and not a.only:
+        write_readme(a.dataset, out, stats)
+    if a.validate and not a.dry_run:
+        return 1 if validate_root(out, check_images=not a.no_image_check) else 0
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

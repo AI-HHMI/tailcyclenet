@@ -78,12 +78,14 @@ def encode(src: Path, dst: Path, n_expected: int) -> None:
     tmp.rename(dst)
 
 
-def convert_video(raw: Path, out: Path, name: str, dry: bool) -> None:
-    """Write one video's 2D session: `centroid` rows on individual-blob frames only, plus the re-encoded pixels.
+def video_labels(raw: Path, name: str) -> dict:
+    """Build one video's `centroid` labels (individual-blob frames only) without writing anything.
 
-    Inputs: the raw species folder, the output root, the video name, and `dry` (report only).
-    `validated.npy` trajectories are (T, N, 2) px. A fragment whose groundtruth identity and the validated trajectory
-    disagree about who it is gets no rows (counted). Side effects: writes `<out>/test/<name>/` and its mp4.
+    Inputs: the raw species folder and the video name. `validated.npy` trajectories are (T, N, 2) px. A fragment whose
+    groundtruth identity and the validated trajectory disagree about who it is gets no rows (counted).
+    Outputs: a dict with `lab` (fmt.Labels), `group` (fmt.Group), `rig`, `provenance`, `avi` (source video path),
+    `traj` ((T, N, 2) validated trajectories, every frame), `session` (session.json), `body_length`.
+    Side effects: prints the per-video counts. Shared by `convert_video` and `blob_split.py` (the split roots).
     """
     src = raw / name
     d = np.load(src / 'validated.npy', allow_pickle=True).item()
@@ -121,9 +123,6 @@ def convert_video(raw: Path, out: Path, name: str, dry: bool) -> None:
           f'crossing/unlabelled={1 - finite.mean():.4f} fragments corrected by the Validator={n_corr} '
           f'fragment starts moved >2px by validation={n_off} '
           f'DISAGREEING fragments dropped={n_dis} ({dis_frames} animal-frames)')
-    if dry:
-        return
-    sess = out / 'test' / name
     rig = fmt.nominal_rig('cam0', (W, H))
     ids = [f'id{int(v):02d}' for v in d['identities_labels']]
     lab = fmt.empty_labels(N, T, 1, 1, mode3d=False, animal_ids=ids)
@@ -131,14 +130,28 @@ def convert_video(raw: Path, out: Path, name: str, dry: bool) -> None:
     lab.vis2d[:, :, 0, 0] = np.where(finite.T, fmt.PROJECTED, fmt.UNLABELED)
     lab.points2d[lab.vis2d == fmt.UNLABELED] = np.nan
     g = fmt.Group('g0', T, fps=fps, source_video=f'{name}.avi', notes=f'body_length_px={bl:.2f}; crossing_frac={1 - finite.mean():.4f}; no rows inside crossings; dropped_disagreeing_animal_frames={dis_frames}')
-    fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'], rig=rig,
-                      groups={'g0': g}, labels={'g0': lab}, flip_pairs=[],
-                      provenance={'source': f'idtracker.ai 2026 benchmark ({name}); validated.npy (idtracker.ai v{d["version"]} '
-                                            'trajectories, fully human-validated with the idtracker.ai Validator)',
-                                  'annotator': '', 'annotator_tool': 'idtracker.ai Validator',
-                                  'converter': 'scripts/convert/idtrackerai.py',
-                                  'created': date.today().isoformat(), 'licence': 'none stated (academic use)'})
-    encode(avi, sess / 'groups' / 'g0' / 'cam0.mp4', T)
+    prov = {'source': f'idtracker.ai 2026 benchmark ({name}); validated.npy (idtracker.ai v{d["version"]} '
+                      'trajectories, fully human-validated with the idtracker.ai Validator)',
+            'annotator': '', 'annotator_tool': 'idtracker.ai Validator',
+            'converter': 'scripts/convert/idtrackerai.py',
+            'created': date.today().isoformat(), 'licence': 'none stated (academic use)'}
+    return {'lab': lab, 'group': g, 'rig': rig, 'provenance': prov, 'avi': avi, 'traj': traj, 'session': sj,
+            'body_length': bl}
+
+
+def convert_video(raw: Path, out: Path, name: str, dry: bool) -> None:
+    """Write one video's 2D session: `centroid` rows on individual-blob frames only, plus the re-encoded pixels.
+
+    Inputs: the raw species folder, the output root, the video name, and `dry` (report only).
+    Side effects: writes `<out>/test/<name>/` and its mp4.
+    """
+    v = video_labels(raw, name)
+    if dry:
+        return
+    sess = out / 'test' / name
+    fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'], rig=v['rig'],
+                      groups={'g0': v['group']}, labels={'g0': v['lab']}, flip_pairs=[], provenance=v['provenance'])
+    encode(v['avi'], sess / 'groups' / 'g0' / 'cam0.mp4', v['group'].n_frames)
 
 
 def main() -> int:

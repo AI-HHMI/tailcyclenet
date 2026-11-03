@@ -11,6 +11,9 @@ whose sessions carry the SAME `centroid` rows (those converters' `video_labels` 
   >= 0.5x the video's median individual blob, gives its bounding box (`blob`). Every other animal-frame (merged /
   crossing blob, no blob) gets a SQUARE of the video's median individual-blob side on the validated centroid (inside
   crossings that centroid is idtracker's interpolation: a placement, not a measurement).
+- A `name@start-end` entry is source frames [start, end) of that video: labels are re-indexed to the clip and the clip is
+  written losslessly (H.264 qp 0, same yuv420p planes; `trim_video` asserts decode equality) as the group's own pixels, so
+  one video can feed two splits (udmt-celegans: train / val are two time ranges of celegans6, test the other video).
 - UDMT: only the annotated frames (1 / 150-600) have identities, so only they get boxes. Background = median of 50 evenly
   spaced frames; mask (darker / brighter / |diff| closed 5x5, all opened 3x3) and level are tuned per video on its own
   annotated frames (`udmt_boxes`; a sole blob counts only at 0.5-2x the annotators' box side). Matching and the square
@@ -31,6 +34,7 @@ import argparse
 import json
 import shutil
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -50,6 +54,9 @@ SPLITS = {
                               'val': ['zebrafish_10_2'], 'test': ['zebrafish_8', 'zebrafish_20', 'zebrafish_10_3']},
     'udmt-multianimal': {'train': ['mice3', 'mice5_94hz', 'whitemice5', 'rat1mice2', 'flies12', 'flies17', 'flies18_illum'],
                          'val': ['mice7', 'flies23'], 'test': ['mice5', 'mice10', 'flies18']},
+    # two videos: test = the whole unseen celegans7; celegans6 is cut in time (`name@start-end`, half-open source frames)
+    # into train (annotations 1-79) and val (80-98), each clip re-encoded losslessly as its own group-local video.
+    'udmt-celegans': {'train': ['celegans6@0-11850'], 'val': ['celegans6@11850-14569'], 'test': ['celegans7']},
 }
 SPECIES = {'idtrackerai-mice': 'mice', 'idtrackerai-zebrafish': 'zebrafish'}
 MAX_AREA_X = 2.0
@@ -61,6 +68,71 @@ UDMT_LEVELS = (8, 12, 16, 20, 25, 30, 40, 50, 60, 80, 100, 120)
 SIZE_BAND = (0.5, 2.0)
 UDMT_EXTEND = 6
 UDMT_STEP_SIDE = 0.25
+
+
+def parse_entry(entry: str) -> tuple[str, tuple[int, int] | None]:
+    """`name` -> (name, None); `name@start-end` -> (name, (start, end)) source frames, half-open."""
+    if '@' not in entry:
+        return entry, None
+    name, rng = entry.split('@')
+    a, b = (int(x) for x in rng.split('-'))
+    return name, (a, b)
+
+
+def session_name(entry: str) -> str:
+    """The session directory of a SPLITS entry (`celegans6@0-11850` -> `celegans6_000000-011850`)."""
+    name, rng = parse_entry(entry)
+    return name if rng is None else f'{name}_{rng[0]:06d}-{rng[1]:06d}'
+
+
+def trim_video(src: Path, dst: Path, a: int, b: int) -> None:
+    """Write source frames [a, b) of `src` to `dst` losslessly (libx264 qp 0, the decoded yuv420p planes re-encoded).
+
+    Asserts the frame count and that every 500th written frame decodes to the same planes as the source."""
+    import av
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    kept = {}
+    with av.open(str(src)) as ci, av.open(str(dst), 'w') as co:
+        si = ci.streams.video[0]
+        so = co.add_stream('libx264', rate=si.average_rate)
+        so.width, so.height, so.pix_fmt = si.codec_context.width, si.codec_context.height, 'yuv420p'
+        so.options = {'qp': '0', 'preset': 'medium'}
+        for i, f in enumerate(ci.decode(si)):
+            if i >= b:
+                break
+            if i < a:
+                continue
+            if f.format.name != 'yuv420p':
+                raise RuntimeError(f'{src}: pixel format {f.format.name}, expected yuv420p')
+            if (i - a) % 500 == 0:
+                kept[i - a] = f.to_ndarray()
+            f.pts, f.time_base = i - a, 1 / si.average_rate
+            for pk in so.encode(f):
+                co.mux(pk)
+        for pk in so.encode():
+            co.mux(pk)
+    with av.open(str(dst)) as c:
+        n = 0
+        for j, f in enumerate(c.decode(video=0)):
+            if j in kept and not np.array_equal(f.to_ndarray(), kept[j]):
+                raise RuntimeError(f'{dst}: frame {j} differs from source frame {a + j}')
+            n += 1
+    if n != b - a:
+        raise RuntimeError(f'{dst}: {n} frames written, expected {b - a}')
+
+
+def clip_labels(v: dict, a: int, b: int, video: Path) -> dict:
+    """`udmt.session_labels` output restricted to source frames [a, b), re-indexed to the clip at `video`."""
+    lab = v['lab']
+    for k in ('points2d', 'vis2d', 'boxes', 'instance'):
+        x = getattr(lab, k)
+        if x is not None:
+            setattr(lab, k, x[:, a:b].copy())
+    f = v['frames']
+    g = v['group']
+    g.n_frames, g.source_frame_start = b - a, a
+    g.notes += f'; source frames [{a}, {b}) of {g.source_video}, re-encoded lossless (H.264 qp 0)'
+    return dict(v, lab=lab, video=video, frames=f[(f >= a) & (f < b)] - a)
 
 
 def gray_frames(path: Path, keep=None):
@@ -327,7 +399,15 @@ def build(dataset: str, split: str, name: str, out: Path, dry: bool) -> dict:
             raise FileNotFoundError(f'{pixels}: run idtrackerai.py --species {SPECIES[dataset]} first')
         frames = np.arange(v['group'].n_frames)
     else:
+        name, rng = parse_entry(name)
         v = udmt.session_labels(name)
+        if rng is not None:
+            clip = out / split / session_name(f'{name}@{rng[0]}-{rng[1]}') / 'groups' / 'g0' / 'cam0.mp4'
+            if dry:
+                clip = Path(tempfile.mkdtemp()) / 'cam0.mp4'
+            trim_video(v['video'], clip, *rng)
+            v = clip_labels(v, *rng, clip)
+            name = session_name(f'{name}@{rng[0]}-{rng[1]}')
         boxes, kind, st, ext = udmt_boxes(v, UDMT_EXTEND if split in ('train', 'val') else 0)
         pixels, frames = v['video'], v['frames']
         for t, row in (ext or {}).items():
@@ -354,7 +434,8 @@ def build(dataset: str, split: str, name: str, out: Path, dry: bool) -> dict:
     fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'], rig=v['rig'],
                       groups={'g0': v['group']}, labels={'g0': lab}, flip_pairs=[], provenance=prov)
     (sess / 'groups' / 'g0').mkdir(parents=True, exist_ok=True)
-    fmt.link(sess / 'groups' / 'g0' / 'cam0.mp4', pixels)
+    if pixels != sess / 'groups' / 'g0' / 'cam0.mp4':
+        fmt.link(sess / 'groups' / 'g0' / 'cam0.mp4', pixels)
     return st
 
 
@@ -363,8 +444,10 @@ def write_readme(dataset: str, out: Path, stats: list[dict]) -> None:
     rows = '\n'.join(f'| {s["split"]} | {s["video"]} | {s["n_animals"]} | {s["frames_boxed"]} | {s["blob_frac"]:.3f} | '
                      f'{s["square_frac"]:.3f} | {s["square_side_px"]:.1f} | {s["frames_incomplete"]} |' for s in stats)
     sp = SPLITS[dataset]
-    text = (f'# {dataset}-split\n\nThe `{dataset}` benchmark split by WHOLE VIDEO (every val/test video unseen in '
-            f'training), with detector boxes in `instances.pq`. Written by `scripts/convert/blob_split.py` (see its '
+    clipped = any('@' in n for names in sp.values() for n in names)
+    text = (f'# {dataset}-split\n\nThe `{dataset}` benchmark split by WHOLE VIDEO (every test video unseen in '
+            f'training' + ('; an `@start-end` entry is a half-open source-frame range of one video, so train and val may '
+                           'be two time ranges of the same recording' if clipped else '; val videos unseen too') + '), with detector boxes in `instances.pq`. Written by `scripts/convert/blob_split.py` (see its '
             f'docstring for the box rule); keypoint rows are identical to the eval-only root `{dataset}` (one '
             f'`centroid` keypoint).\n\n## Split\n\n' + '\n'.join(f'- **{k}**: {", ".join(sp[k])}' for k in sp)
             + '\n\n## Boxes (per video)\n\n`blob` = the re-segmented blob box of a clean individual; `square` = a '
@@ -402,7 +485,7 @@ def main() -> int:
     if a.clean and out.exists() and not a.dry_run:
         shutil.rmtree(out)
     todo = [(a.dataset, sp, n, out, a.dry_run) for sp, names in SPLITS[a.dataset].items() for n in names
-            if not a.only or n in a.only]
+            if not a.only or n in a.only or parse_entry(n)[0] in a.only]
     with ProcessPoolExecutor(max(1, min(a.jobs, len(todo)))) as ex:
         stats = list(ex.map(_one, todo))
     if not a.dry_run and not a.only:

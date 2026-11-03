@@ -136,3 +136,36 @@ def test_scale_agrees_is_a_factor_either_way_and_off_at_zero():
     assert not scale_agrees(box, 49.0, 2.0) and not scale_agrees(box, 201.0, 2.0)
     assert scale_agrees(box, 10.0, 0.0)
     assert scale_agrees(box, float('nan'), 2.0)
+
+
+def test_floor_box_side_grows_about_the_centre_and_stays_inside_the_image():
+    """A box already wide enough is unchanged; a small one grows to `side` about its centre;
+    at an odd-sized image edge it is shifted back inside; `side` past the image caps at it."""
+    from tailcyclenet.infer.crops import floor_box_side
+
+    big = torch.tensor([10, 10, 110, 120], dtype=torch.int32)
+    assert torch.equal(floor_box_side(big, (895, 557), 100.0), big)
+    b = floor_box_side(torch.tensor([200, 300, 232, 332]), (895, 557), 100.0)
+    assert int(b[2] - b[0]) == 100 and int(b[3] - b[1]) == 100
+    assert abs((int(b[0]) + int(b[2])) // 2 - 216) <= 1
+    e = floor_box_side(torch.tensor([880, 540, 895, 557]), (895, 557), 100.0)
+    assert int(e[2]) == 895 and int(e[3]) == 557 and int(e[2] - e[0]) == 100
+    c = floor_box_side(torch.tensor([0, 0, 32, 32]), (64, 48), 500.0)
+    assert c.tolist() == [0, 0, 64, 48]
+
+
+def test_refine_pass_two_does_not_zoom_past_the_pass_one_box():
+    """A 1-keypoint skeleton's pass-2 crop collapses to `min_crop_dim`; it is floored at the
+    de-inflated pass-1 side. A pass-2 box from a spread skeleton is returned untouched (the fix
+    is inert where the keypoints span the animal)."""
+    from tailcyclenet.data import crop as cropmod
+    from tailcyclenet.infer.crops import floor_refine_box
+
+    size = (895, 557)
+    pass1 = torch.tensor([300, 200, 500, 400], dtype=torch.int32)      # 200 px, inflate 1.5
+    centroid = cropmod.crop_box_for_points(torch.tensor([[400.0, 300.0]] * 12), torch.tensor(size), 32)
+    nb, changed = floor_refine_box(centroid, pass1, size, 1.5)
+    assert changed and int(nb[2] - nb[0]) >= 0.5 * 200 / 1.5
+    spread = torch.tensor([340, 240, 460, 360], dtype=torch.int32)    # 120 px >= 0.5 x 133
+    nb, changed = floor_refine_box(spread, pass1, size, 1.5)
+    assert not changed and torch.equal(nb, spread)

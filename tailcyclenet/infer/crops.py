@@ -64,6 +64,46 @@ def overlaps(a, b):
     return bool(min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1]))
 
 
+def floor_box_side(box, size, side):
+    """Grow an xyxy box about its centre until both sides are >= `side` (each capped at the
+    image), shifted back inside the image. int32; a box already at least `side` on both axes (or
+    a non-finite `side`) comes back unchanged."""
+    b = torch.as_tensor(box).to(torch.int32).clone()
+    if not np.isfinite(side):
+        return b
+    W, H = (int(v) for v in size)
+    for ax, lim in ((0, W), (1, H)):
+        want = min(int(np.ceil(side)), lim)
+        if int(b[ax + 2] - b[ax]) >= want:
+            continue
+        c = (int(b[ax]) + int(b[ax + 2])) // 2
+        lo = min(max(c - want // 2, 0), lim - want)
+        b[ax], b[ax + 2] = lo, lo + want
+    return b
+
+
+def floor_refine_box(box2, box1, size, crop_inflate):
+    """`--refine` pass 2 must not zoom past the animal's own (de-inflated) pass-1 box.
+
+    Pass 2 crops from pass 1's KEYPOINTS. Where the run's training crop was not keypoint-derived
+    (`box_source = "instances"` with a skeleton that does not span the animal -- a 1-keypoint
+    centroid root is the extreme: its extent is ~0 and the rule floors at `min_crop_dim`), that
+    crop is many times smaller than anything the model trained on and pass 2 returns noise of
+    the order of the crop half-width. When the pass-2 box is under half the de-inflated pass-1
+    side (the same 2x scale gate as `scale_agrees`), grow it about its centre to that side;
+    otherwise return it unchanged (int32). Returns (box, changed). The refine path applies it only
+    when the run's `box_source` is not `keypoints` (a keypoint-trained run's pass-2 crop IS its
+    training crop)."""
+    b2 = torch.as_tensor(box2).to(torch.int32)
+    b1 = np.asarray(box1, np.float64)
+    side = max(b1[2] - b1[0], b1[3] - b1[1]) / max(float(crop_inflate), 1.0)
+    s2 = float(max(b2[2] - b2[0], b2[3] - b2[1]))
+    if not np.isfinite(side) or s2 >= 0.5 * side:
+        return b2, False
+    nb = floor_box_side(b2, size, side)
+    return nb, not torch.equal(nb, b2)
+
+
 def fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
     """Distance from the predicted centroid to each crop box's centre, in units of one box side.
 

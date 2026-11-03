@@ -24,7 +24,8 @@ from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
 from .crops import (adaptive_inflation, box_disagrees, boxes_from_points, camera_consensus,
-                    carry_duplicate, crop_views, fill_box_agreement, in_frame, overlaps,
+                    carry_duplicate, crop_views, fill_box_agreement, floor_refine_box, in_frame,
+                    overlaps,
                     refine_every_camera, scale_agrees, to_device, union_box)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
@@ -897,6 +898,12 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 if any(not overlaps(b2[i], boxes[i]) for i in range(len(use))):
                     refined.append(_at_image_size(plan))
                     continue
+                for i, ci in enumerate(use if cfg.box_source != 'keypoints' else ()):
+                    nb, changed = floor_refine_box(b2[i], boxes[i], window_cams[ci]['size'],
+                                                   cfg.crop_inflate)
+                    if changed:
+                        b2[i] = nb
+                        cg2[i] = cropmod.apply_crop(window_cams[ci], nb)
                 uncropped2, sc2 = list(cg2), []
                 for i, cam in enumerate(cg2):
                     cg2[i], s = resize_camera(cam, cfg.image_size)

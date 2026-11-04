@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from .corruption import build_corruptors_for
+from .curriculum import parse_curriculum, scale_corruptors
 from .triplet import make_triplet, triplet_collate
 
 GETITEM_MAX_RETRIES = 8
@@ -28,15 +29,53 @@ class ScorerDataset(torch.utils.data.Dataset):
     rejects. Exhausting the retries returns None, which the training loop skips.
     """
 
-    def __init__(self, base, corruption_cfg):
+    def __init__(self, base, corruption_cfg, iterations_per_step=1):
         """Inputs: base -- a built `PoseDataset`; corruption_cfg -- the `[scorer.corruption]`
-        block, including `min_valid_frames` and the `mag_3d`/`mag_2d` magnitude dicts.
+        block, including `min_valid_frames`, the `mag_3d`/`mag_2d` magnitude dicts and the
+        optional `curriculum` table; iterations_per_step -- headline iterations per sampler
+        ordinal (the world size: one DDP step is `world` iterations).
         Outputs: none. Side effects: builds the dense/sparse corruptor pairs once, so they are
         forked into every worker rather than rebuilt per item.
         """
         self.base = base
         self.cfg = dict(corruption_cfg)
+        self.curriculum = parse_curriculum(self.cfg)
+        self.cfg.pop('curriculum', None)
         self.corruptors = build_corruptors_for(self.cfg)
+        self.iterations_per_step = int(iterations_per_step)
+        self._scaled = {}
+
+    def corruption_scale(self, ordinal=None) -> float:
+        """The magnitude multiplier for an item: the curriculum's at the item's iteration.
+
+        Train: `curriculum.scale(ordinal * iterations_per_step)`, a pure function of the step
+        ordinal `StepSampler` hands the item, so every worker, every rank and a resume agree.
+        Val/test: the fixed `val_scale`. Default off: 1.0 everywhere.
+
+        Inputs: ordinal -- the item's sampler step, or None.
+        Outputs: a float multiplier.
+        Side effects: none, or raises RuntimeError for a scheduled train item without an ordinal.
+        """
+        if not self.base.train:
+            return float(self.curriculum.val_scale)
+        if not self.curriculum.enabled:
+            return 1.0
+        if ordinal is None:
+            raise RuntimeError(
+                'a corruption curriculum needs the step ordinal; the train loader must use '
+                'StepSampler (scorer.train._loaders does whenever a curriculum is configured)')
+        return self.curriculum.scale(int(ordinal) * self.iterations_per_step)
+
+    def corruptors_at(self, scale: float):
+        """The corruptor quadruple at `scale` (1.0 = the unchanged objects), cached per value."""
+        if float(scale) == 1.0:
+            return self.corruptors
+        got = self._scaled.get(float(scale))
+        if got is None:
+            if len(self._scaled) > 64:
+                self._scaled.clear()
+            got = self._scaled[float(scale)] = scale_corruptors(self.corruptors, scale)
+        return got
 
     def mix(self):
         """Requested-versus-natural (source, mode) share, from the base loader.
@@ -107,6 +146,8 @@ class ScorerDataset(torch.utils.data.Dataset):
         then be scored twice.
         """
         ordinal, base_idx = (idx if isinstance(idx, tuple) else (None, idx))
+        scale = self.corruption_scale(ordinal)
+        corruptors = self.corruptors_at(scale)
         rejected_draws = 0
         last_reason = 'no_selection'
         for attempt in range(GETITEM_MAX_RETRIES):
@@ -115,12 +156,13 @@ class ScorerDataset(torch.utils.data.Dataset):
             sel = self.base.select(base_idx, rng, shape)
             if sel is not None:
                 try:
-                    trip = make_triplet(self.base, sel, rng, self.cfg, self.corruptors)
+                    trip = make_triplet(self.base, sel, rng, self.cfg, corruptors)
                 except (AssertionError, IndexError, KeyError, RuntimeError, ValueError):
                     trip = None
                     last_reason = 'build_failed'
                 if trip is not None:
                     trip['retry_count'] = int(attempt)
+                    trip['corruption_scale'] = float(scale)
                     trip['rejected_draws'] = int(rejected_draws)
                     trip['rejection_reason'] = last_reason if rejected_draws else ''
                     return trip

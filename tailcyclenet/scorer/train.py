@@ -103,7 +103,7 @@ def build_datasets(config: dict, registry_base: Registry | None, *, rank: int = 
     train_base = PoseDataset(data_cfg['path'], 'train', lc, registry_base=registry_base,
                              rank=rank, world_size=world_size)
     registry = train_base.registry
-    train_ds = ScorerDataset(train_base, corr)
+    train_ds = ScorerDataset(train_base, corr, iterations_per_step=world_size)
     print(f'train: {len(train_ds)} windows, {registry.n_keypoints} keypoints')
     print('train: mix ' + '  '.join(f'{k}={v:.1%}' for k, v in train_base.mix().items()))
 
@@ -115,7 +115,7 @@ def build_datasets(config: dict, registry_base: Registry | None, *, rank: int = 
     val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
     val_base = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry,
                            rank=rank, world_size=world_size)
-    return train_ds, ScorerDataset(val_base, corr), registry
+    return train_ds, ScorerDataset(val_base, corr, iterations_per_step=world_size), registry
 
 
 def scorer_worker_init(worker_id: int, *, cv_threads: int = 2):
@@ -138,13 +138,18 @@ def scorer_worker_init(worker_id: int, *, cv_threads: int = 2):
 
 def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
              rank: int = 0, num_samples: int | None = None,
-             val_indices: list[int] | None = None):
+             val_indices: list[int] | None = None, start: int = 0):
     """Build rank-local loaders; one triplet (batch=1) is the per-rank batch.
 
     Distributed training uses independent rank-seeded replacement streams, giving the world-size
     batch without replaying a shuffle permutation. Validation receives a deterministic strided
     shard; callers gather its sufficient metrics before selecting a checkpoint. Train and
     validation worker counts are separate because validation is small but should remain asynchronous.
+
+    A corruption curriculum (`train_ds.curriculum.enabled`) needs every train item's step, so it
+    always takes `StepSampler`, even on one rank, starting at `start` (the first LOCAL step: a
+    resume continues the ordinal, hence the curriculum scale, where it stopped) on an index
+    stream keyed on `(seed, rank, start)`. Without a curriculum the loaders are unchanged.
     """
     data_cfg = config['data']
     nw = int(data_cfg.get('num_workers', 2))
@@ -161,7 +166,13 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
     kwargs = dict(batch_size=1, collate_fn=scorer_collate, num_workers=nw,
                   prefetch_factor=prefetch if nw else None, persistent_workers=bool(nw),
                   pin_memory=(world == 1), worker_init_fn=worker_init)
-    if world > 1:
+    curriculum = bool(getattr(getattr(train_ds, 'curriculum', None), 'enabled', False))
+    if curriculum:
+        gen = torch.Generator().manual_seed(
+            (int(seed) + int(rank) + 1000003 * int(start)) % (2 ** 63))
+        kwargs['sampler'] = StepSampler(len(train_ds), int(num_samples), generator=gen,
+                                        start=int(start))
+    elif world > 1:
         gen = torch.Generator().manual_seed(int(seed) + int(rank))
         kwargs['sampler'] = StepSampler(len(train_ds), int(num_samples), generator=gen)
     else:
@@ -282,6 +293,19 @@ def _probe_checkpoint(ckpt_path, config: dict,
     return checkpoint_contract_mismatch, checkpoint_mode_mismatch, may_resume, source_kind
 
 
+def _checkpoint_iteration(ckpt_path) -> int:
+    """The `iteration` recorded in a start checkpoint (a file or run folder), 0 when none."""
+    if not ckpt_path:
+        return 0
+    probe = Path(ckpt_path)
+    if probe.is_dir():
+        from ..checkpoints import resolve_checkpoint
+        probe = resolve_checkpoint(probe / 'checkpoints')
+    if not probe.exists():
+        return 0
+    return int(torch.load(probe, map_location='cpu', weights_only=False).get('iteration', 0))
+
+
 def warn_untrained_keypoints(registry, base_reg, source) -> list[str]:
     """Name the keypoints a POSE warm start leaves without a trained identity row.
 
@@ -303,8 +327,11 @@ def warn_untrained_keypoints(registry, base_reg, source) -> list[str]:
 
 
 def _started_loaders(train_ds, val_ds, config: dict, seed: int, n_target: int, fabric, world: int,
-                     is0: bool):
-    """(train, val) loaders, with their workers started before the model allocates CUDA memory."""
+                     is0: bool, start_iter: int = 0):
+    """(train, val) loaders, with their workers started before the model allocates CUDA memory.
+
+    `start_iter` (the resume iteration) is read only under a corruption curriculum, whose sampler
+    yields the remaining local steps from `ceil(start_iter / world)` on."""
     val_batches = int(config['training'].get('val_batches', 20))
     val_indices = None
     if val_ds is not None:
@@ -312,9 +339,13 @@ def _started_loaders(train_ds, val_ds, config: dict, seed: int, n_target: int, f
         val_indices = ([int(i) for i in np.unique(
             np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
                        if n_val else [])
+    num_samples, start = dist_utils.ceil_div(n_target, world), 0
+    if train_ds.curriculum.enabled:
+        start = dist_utils.ceil_div(int(start_iter), world)
+        num_samples = max(num_samples - start, 0)
     train_loader, val_loader = _loaders(
         train_ds, val_ds, config, seed, world=world, rank=(fabric.global_rank if fabric else 0),
-        num_samples=dist_utils.ceil_div(n_target, world), val_indices=val_indices)
+        num_samples=num_samples, val_indices=val_indices, start=start)
     if train_loader.num_workers or (val_loader is not None and val_loader.num_workers):
         iter(train_loader)
         if val_loader is not None and val_loader.num_workers:
@@ -459,6 +490,8 @@ class ScorerLoop:
         self.opt_cfg, self.fresh = dict(opt_cfg or {}), set(fresh or ())
         self.collapse_patience = int(config.get('scorer', {}).get('collapse_patience', 0))
         self.last_alive = int(start_iter)
+        self.curriculum = getattr(train_loader.dataset, 'curriculum', None)
+        self.scales: list[float] = []
 
     def selected_value(self, values: dict) -> float | None:
         """Read the explicitly configured validation metric, never infer it from the loss."""
@@ -521,6 +554,8 @@ class ScorerLoop:
             self.skipped += 1
             self.step += 1
             return None
+        if 'corruption_scale' in trip:
+            self.scales.append(float(trip['corruption_scale']))
         trip = triplet_to_device(trip, self.device)
         if self.wrap:
             scores, precision, labels = self.model(trip)
@@ -641,7 +676,10 @@ class ScorerLoop:
                 'the warm start. Checkpoints are kept.')
 
     def report(self, values: dict, iteration: int, grad_norm) -> None:
-        """The print-interval line and W&B payload; then reset the interval clocks."""
+        """The print-interval line and W&B payload; then reset the interval clocks.
+
+        Under a curriculum, `train/corruption_scale` is the mean scale the ITEMS carried (proof it
+        reached the workers) and `train/corruption_scale_schedule` the schedule's own value."""
         step = self.step
         wall = time.time() - self.t0
         elapsed = max(wall - self.evalled[0] - self.ckpted[0], 1e-9)
@@ -665,10 +703,17 @@ class ScorerLoop:
                                values.get('train/triplet_acc', float('nan')))
         train_gap = values.get('train/active_score_gap',
                                values.get('train/score_gap', float('nan')))
+        scale_note = ''
+        if self.curriculum is not None and self.curriculum.enabled:
+            scale = float(np.mean(self.scales)) if self.scales else float('nan')
+            values['train/corruption_scale'] = scale
+            values['train/corruption_scale_schedule'] = self.curriculum.scale(iteration)
+            scale_note = f' scale={scale:.4f}'
+        self.scales.clear()
         if self.is0:
             print(f'[{iteration}] last {self.print_freq} steps: '
                   f'loss={values.get("train/scorer_loss", float("nan")):.4g} '
-                  f'acc={train_acc:.3f} gap={train_gap:.4g} '
+                  f'acc={train_acc:.3f} gap={train_gap:.4g}{scale_note} '
                   f'({dt:.2f}s/it wait {wait_frac:.0%} eval {eval_frac:.0%})')
             if self.wb is not None:
                 log(self.wb, values, iteration)
@@ -716,8 +761,16 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     if ckpt_path and not may_resume and source_kind == 'pose':
         warn_untrained_keypoints(registry, base_reg, ckpt_path)
     n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
+    planned_start = (_checkpoint_iteration(ckpt_path)
+                     if may_resume and train_ds.curriculum.enabled else 0)
+    if train_ds.curriculum.enabled and is0:
+        cur = train_ds.curriculum
+        print(f'corruption curriculum: {cur.schedule} x{cur.start_scale:g} -> x{cur.end_scale:g} '
+              f'over iterations [{cur.warmup_iters}, {cur.warmup_iters + cur.ramp_iters}], '
+              f'val x{cur.val_scale:g}; scale at iteration {planned_start}: '
+              f'{cur.scale(planned_start):.4f}')
     train_loader, val_loader = _started_loaders(train_ds, val_ds, config, seed, n_target,
-                                                fabric, world, is0)
+                                                fabric, world, is0, start_iter=planned_start)
 
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
                          registry.n_keypoints, **scorer_kwargs(config)).to(device)
@@ -752,6 +805,10 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         fabric.barrier()
     wb = None if no_wandb or not is0 else init_wandb(config, out)
     start_iter = int(resume_state.get('iteration', 0)) if resume_state else 0
+    if train_ds.curriculum.enabled and start_iter != planned_start:
+        print(f'corruption curriculum: start {planned_start} -> {start_iter}; rebuilding loaders')
+        train_loader, val_loader = _started_loaders(train_ds, val_ds, config, seed, n_target,
+                                                    fabric, world, is0, start_iter=start_iter)
     n_iter = max(0, n_target - start_iter)
     resuming = (out / 'checkpoints' / 'checkpoint_last.pth').exists() and not fresh
     loop = ScorerLoop(

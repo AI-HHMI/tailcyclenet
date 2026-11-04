@@ -141,7 +141,14 @@ def scorer_contract(config: dict | None) -> dict:
             'no_active_slot_policy': corr.get('no_active_slot_policy', 'retry'),
             'out_of_view_policy': corr.get('out_of_view_policy', 'exclude'),
         }
+    extra = {}
+    if isinstance(corr, dict) and corr.get('curriculum'):
+        from .curriculum import parse_curriculum
+        cur = parse_curriculum(corr)
+        if cur.enabled or cur.val_scale != 1.0:
+            extra['corruption_curriculum'] = cur.contract()
     return {
+        **extra,
         'output_granularity': mode,
         'loss_schema': loss_schema,
         'corruption_mask_semantics': mask_semantics,

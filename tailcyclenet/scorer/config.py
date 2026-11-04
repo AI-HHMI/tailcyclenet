@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .contract import SCORER_OUTPUT_GRANULARITIES, scorer_output_granularity
 from .corruption import SEGMENT_TYPES
+from .curriculum import parse_curriculum
 
 SCORER_HEAD_KEYS = ('pool_num_heads', 'score_hidden', 'use_precision', 'output_granularity')
 
@@ -138,6 +139,7 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         'segment_prob', 'segment_count', 'segment_len_frames', 'full_window_share',
         'segment_types', 'no_active_slot_policy',
         'out_of_view_policy', 'output_granularity', 'source_frame_duplicate_policy',
+        'curriculum',
     }
     if 'min_valid_frames' in corr:
         raise SystemExit(
@@ -148,6 +150,7 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         raise SystemExit(
             f'[scorer.corruption]: unknown key(s) {sorted(unknown_corr)}. Known keys: '
             f'{sorted(known_corr)}')
+    parse_curriculum(corr)
     segment_prob = float(corr.get('segment_prob', 0.0))
     if not 0.0 <= segment_prob <= 1.0:
         raise SystemExit('[scorer.corruption].segment_prob must be in [0, 1]')

@@ -54,11 +54,18 @@ SPLITS = {
                               'val': ['zebrafish_10_2'], 'test': ['zebrafish_8', 'zebrafish_20', 'zebrafish_10_3']},
     'udmt-multianimal': {'train': ['mice3', 'mice5_94hz', 'whitemice5', 'rat1mice2', 'flies12', 'flies17', 'flies18_illum'],
                          'val': ['mice7', 'flies23'], 'test': ['mice5', 'mice10', 'flies18']},
+    # 60_3 / 80_1 / 100_3 are RESERVED (owner, 2026-11-04): in the eval-only root only, in no split. Train covers both rigs.
+    'idtrackerai-zebrafish-large': {'train': ['zebrafish_60_1', 'zebrafish_80_3'], 'val': ['zebrafish_60_2'],
+                                    'test': ['zebrafish_80_2', 'zebrafish_100_2']},
+    # test 6 (804^2) and 59 (2432^2) are rigs unseen in train; 72 shares 38's rig.
+    'idtrackerai-drosophila': {'train': ['drosophila_8', 'drosophila_38', 'drosophila_100_1'], 'val': ['drosophila_10'],
+                               'test': ['drosophila_6', 'drosophila_59', 'drosophila_72', 'drosophila_100_3']},
     # two videos: test = the whole unseen celegans7; celegans6 is cut in time (`name@start-end`, half-open source frames)
     # into train (annotations 1-79) and val (80-98), each clip re-encoded losslessly as its own group-local video.
     'udmt-celegans': {'train': ['celegans6@0-11850'], 'val': ['celegans6@11850-14569'], 'test': ['celegans7']},
 }
-SPECIES = {'idtrackerai-mice': 'mice', 'idtrackerai-zebrafish': 'zebrafish'}
+SPECIES = {'idtrackerai-mice': 'mice', 'idtrackerai-zebrafish': 'zebrafish',
+           'idtrackerai-zebrafish-large': 'zebrafish-large', 'idtrackerai-drosophila': 'drosophila'}
 MAX_AREA_X = 2.0
 MIN_SIDE_X = 0.5
 NEAR_BL = 0.5
@@ -97,6 +104,8 @@ def trim_video(src: Path, dst: Path, a: int, b: int) -> None:
         so = co.add_stream('libx264', rate=si.average_rate)
         so.width, so.height, so.pix_fmt = si.codec_context.width, si.codec_context.height, 'yuv420p'
         so.options = {'qp': '0', 'preset': 'medium'}
+        so.thread_count = _THREADS
+        si.thread_count = _THREADS
         for i, f in enumerate(ci.decode(si)):
             if i >= b:
                 break
@@ -144,6 +153,7 @@ def gray_frames(path: Path, keep=None):
     with av.open(str(path)) as c:
         st = c.streams.video[0]
         st.thread_type = 'AUTO'
+        st.thread_count = _THREADS
         for i, f in enumerate(c.decode(st)):
             if want is None or i in want:
                 yield i, cv2.cvtColor(f.to_ndarray(format='bgr24'), cv2.COLOR_BGR2GRAY)
@@ -464,6 +474,17 @@ def write_readme(dataset: str, out: Path, stats: list[dict]) -> None:
     (out / 'box_stats.json').write_text(json.dumps(stats, indent=1))
 
 
+_THREADS = 1
+
+
+def _init(threads: int) -> None:
+    """Pool-worker initializer (sets the module-level `_THREADS`): cap PyAV codec threads and OpenCV's pool at `threads` (their defaults are every core on
+    the node, so `--jobs` workers would each spawn a node-sized pool)."""
+    global _THREADS
+    _THREADS = max(1, threads)
+    cv2.setNumThreads(_THREADS)
+
+
 def _one(args):
     """`build` on one argument tuple (a picklable ProcessPoolExecutor target)."""
     return build(*args)
@@ -478,6 +499,8 @@ def main() -> int:
     ap.add_argument('--clean', action='store_true', help='remove the output first')
     ap.add_argument('--dry-run', action='store_true', help='report, write nothing')
     ap.add_argument('--jobs', type=int, default=8)
+    ap.add_argument('--threads', type=int, default=1,
+                    help='codec + OpenCV threads per worker; total cores ~ jobs x threads (default 1)')
     ap.add_argument('--validate', action='store_true')
     ap.add_argument('--no-image-check', action='store_true')
     a = ap.parse_args()
@@ -486,7 +509,7 @@ def main() -> int:
         shutil.rmtree(out)
     todo = [(a.dataset, sp, n, out, a.dry_run) for sp, names in SPLITS[a.dataset].items() for n in names
             if not a.only or n in a.only or parse_entry(n)[0] in a.only]
-    with ProcessPoolExecutor(max(1, min(a.jobs, len(todo)))) as ex:
+    with ProcessPoolExecutor(max(1, min(a.jobs, len(todo))), initializer=_init, initargs=(a.threads,)) as ex:
         stats = list(ex.map(_one, todo))
     if not a.dry_run and not a.only:
         write_readme(a.dataset, out, stats)

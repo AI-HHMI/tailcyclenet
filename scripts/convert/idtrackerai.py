@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 """Convert the idtracker.ai 2026 benchmark (human-validated trajectories) to tailcycle 2D roots.
 
-Source (raw store): animal-datasets/mouse/idtrackerai-mice/<video>/ and animal-datasets/fish/idtrackerai-zebrafish/<video>/,
-each holding `<video>.avi` (rawvideo) + `validated.npy` (idtracker.ai v5.2.5 trajectories after full human validation with the
-idtracker.ai Validator; Torrents et al., eLife 2026). See the raw folders' README.md.
+Source (raw store): animal-datasets/{mouse/idtrackerai-mice, fish/idtrackerai-zebrafish, fish/idtrackerai-zebrafish-large,
+fly/idtrackerai-drosophila}/<video>/, each holding `<video>.avi` + `validated.npy`. What "validated" means (eLife 2026
+methods): idtracker.ai v5 output reviewed and manually corrected with the idtracker.ai Validator; the authors use it as
+ground truth (position, identity and individual/crossing class of every animal in every frame). The release's
+`*_expert_ranges.csv` are tracking-PARAMETER ranges (intensity thresholds), not verified frame ranges. See the raw README.md.
 
 Output: one 2D session per video under `<out>/test/<video>/`, one group `g0` = the whole recording.
-- Pixels: the rawvideo .avi (10-16 GB) is re-encoded ONCE to H.264 gray (`groups/g0/cam0.mp4`, crf 12; the sources are grayscale palette video and some have odd heights, which 4:2:0 cannot encode; every frame kept,
+- Pixels: the rawvideo .avi (10-16 GB) is re-encoded ONCE to H.264 gray (`groups/g0/cam0.mp4`, crf 12, GOP 24; the sources are grayscale palette video and some have odd heights, which 4:2:0 cannot encode; every frame kept,
   frame count asserted against the source and against the trajectory length). This is a transform, so it is a file, not a link.
 - Labels: ONE keypoint, `centroid` (the idtracker.ai blob centroid, validated identity), written `projected` (a centroid is
   a position, not a landmark anyone judged visible) ONLY on frames where the animal is an INDIVIDUAL blob: frames covered by
@@ -25,9 +27,7 @@ Output: one 2D session per video under `<out>/test/<video>/`, one group `g0` = t
 - `groups.pq` notes carry `body_length_px=<source body_length>` (idtracker's own BL, full-resolution px) for scoring radii.
 - No unit tests (converter rule); check with --validate, scripts/dataset_tools/check_status.py and a render.
 
-Usage:
-  pixi run python scripts/convert/idtrackerai.py --species mice --validate
-  pixi run python scripts/convert/idtrackerai.py --species zebrafish --validate
+Usage: pixi run python scripts/convert/idtrackerai.py --species {mice,zebrafish,zebrafish-large,drosophila} --validate
 """
 from __future__ import annotations
 
@@ -52,7 +52,14 @@ SPECIES = {
     'zebrafish': (RAW / 'fish/idtrackerai-zebrafish', OUT / 'idtrackerai-zebrafish',
                   ['zebrafish_2', 'zebrafish_5', 'zebrafish_7', 'zebrafish_8', 'zebrafish_10_1', 'zebrafish_10_2',
                    'zebrafish_10_3', 'zebrafish_10_4', 'zebrafish_20']),
+    'zebrafish-large': (RAW / 'fish/idtrackerai-zebrafish-large', OUT / 'idtrackerai-zebrafish-large',
+                        ['zebrafish_60_1', 'zebrafish_60_2', 'zebrafish_60_3', 'zebrafish_80_1', 'zebrafish_80_2',
+                         'zebrafish_80_3', 'zebrafish_100_2', 'zebrafish_100_3']),
+    'drosophila': (RAW / 'fly/idtrackerai-drosophila', OUT / 'idtrackerai-drosophila',
+                   ['drosophila_6', 'drosophila_8', 'drosophila_10', 'drosophila_38', 'drosophila_59', 'drosophila_72',
+                    'drosophila_100_1', 'drosophila_100_3']),
 }
+GOP = 24
 
 
 def frame_table(path: Path) -> np.ndarray:
@@ -68,14 +75,18 @@ def n_video_frames(path: Path) -> int:
     return len(frame_table(path))
 
 
-def encode(src: Path, dst: Path, n_expected: int) -> None:
+def encode(src: Path, dst: Path, n_expected: int, threads: int = 4) -> None:
     """Re-encode the source to H.264 keeping every frame, with regenerated strictly increasing timestamps.
 
     A few sources carry a DUPLICATED timestamp (zebrafish_10_2 and _10_3: one each); passed through, it makes two frames
     share one pts, so the loader's seek cannot reach one of them ("frames [15139] did not decode"), and neither
     `setpts` nor an exact track timescale removed it. So every decoded frame is piped as RAW video into a second ffmpeg,
     whose input timestamps are i / rate by construction. An existing output is kept only if its frame count matches AND
-    its pts are strictly increasing; a frame-count / pts failure after encoding is refused."""
+    its pts are strictly increasing; a frame-count / pts failure after encoding is refused.
+
+    `threads` caps the ENCODER (libx264) threads; the decoder runs single-threaded. One encode therefore uses about
+    `threads + 1` cores. ffmpeg's default is every core on the node, so a caller running several encodes at once must
+    size `threads` to its own slot budget."""
     if dst.exists():
         tab = frame_table(dst)
         if len(tab) == n_expected and (np.diff(tab) > 0).all():
@@ -86,12 +97,12 @@ def encode(src: Path, dst: Path, n_expected: int) -> None:
         rate, (w, h) = st.average_rate, (st.codec_context.width, st.codec_context.height)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix('.tmp.mp4')
-    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', str(src), '-map', '0:v:0', '-fps_mode', 'passthrough',
+    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-threads', '1', '-i', str(src), '-map', '0:v:0', '-fps_mode', 'passthrough',
                             '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], stdout=subprocess.PIPE)
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'gray', '-s', f'{w}x{h}',
                     '-r', f'{rate.numerator}/{rate.denominator}', '-i', '-',
-                    '-c:v', 'libx264', '-preset', 'medium', '-crf', '12', '-pix_fmt', 'gray', '-g', '50',
-                    str(tmp)], stdin=dec.stdout, check=True)
+                    '-c:v', 'libx264', '-preset', 'medium', '-crf', '12', '-pix_fmt', 'gray', '-g', str(GOP),
+                    '-threads', str(threads), str(tmp)], stdin=dec.stdout, check=True)
     dec.stdout.close()
     if dec.wait() != 0:
         raise RuntimeError(f'{src}: decoding failed')
@@ -124,7 +135,9 @@ def video_labels(raw: Path, name: str) -> dict:
     finite = np.isfinite(traj).all(-1)
     lf = json.loads((src / 'list_of_fragments.json').read_text())['fragments']
     rr = float(sj.get('resolution_reduction', 1.0))
-    labels_ = [int(v) for v in d['identities_labels']]
+    labels_ = [int(v) if str(v).isdigit() else k + 1 for k, v in enumerate(d['identities_labels'])]
+    if sorted(labels_) != list(range(1, N + 1)):
+        raise RuntimeError(f'{name}: identities_labels {list(d["identities_labels"])} are not 1..{N} by position')
     indiv = np.zeros((T, N), bool)
     n_corr = n_off = n_dis = dis_frames = 0
     for f in lf:
@@ -147,25 +160,27 @@ def video_labels(raw: Path, name: str) -> dict:
           f'fragment starts moved >2px by validation={n_off} '
           f'DISAGREEING fragments dropped={n_dis} ({dis_frames} animal-frames)')
     rig = fmt.nominal_rig('cam0', (W, H))
-    ids = [f'id{int(v):02d}' for v in d['identities_labels']]
+    ids = [f'id{v:02d}' for v in labels_]
     lab = fmt.empty_labels(N, T, 1, 1, mode3d=False, animal_ids=ids)
     lab.points2d[:, :, 0, 0, :] = np.transpose(traj, (1, 0, 2)).astype(np.float32)
     lab.vis2d[:, :, 0, 0] = np.where(finite.T, fmt.PROJECTED, fmt.UNLABELED)
     lab.points2d[lab.vis2d == fmt.UNLABELED] = np.nan
     g = fmt.Group('g0', T, fps=fps, source_video=f'{name}.avi', notes=f'body_length_px={bl:.2f}; crossing_frac={1 - finite.mean():.4f}; no rows inside crossings; dropped_disagreeing_animal_frames={dis_frames}')
     prov = {'source': f'idtracker.ai 2026 benchmark ({name}); validated.npy (idtracker.ai v{d["version"]} '
-                      'trajectories, fully human-validated with the idtracker.ai Validator)',
+                      'output manually corrected with the idtracker.ai Validator; the authors\' ground truth)',
             'annotator': '', 'annotator_tool': 'idtracker.ai Validator',
             'converter': 'scripts/convert/idtrackerai.py',
-            'created': date.today().isoformat(), 'licence': 'none stated (academic use)'}
+            'created': date.today().isoformat(),
+            'licence': 'none stated (academic use; cite Romero-Ferrero et al. 2019 Nat Methods, Torrents et al. 2026 eLife)'}
     return {'lab': lab, 'group': g, 'rig': rig, 'provenance': prov, 'avi': avi, 'traj': traj, 'session': sj,
             'body_length': bl}
 
 
-def convert_video(raw: Path, out: Path, name: str, dry: bool) -> None:
+def convert_video(raw: Path, out: Path, name: str, dry: bool, threads: int = 4) -> None:
     """Write one video's 2D session: `centroid` rows on individual-blob frames only, plus the re-encoded pixels.
 
-    Inputs: the raw species folder, the output root, the video name, and `dry` (report only).
+    Inputs: the raw species folder, the output root, the video name, `dry` (report only), and `threads` (libx264
+    encoder threads, see `encode`).
     Side effects: writes `<out>/test/<name>/` and its mp4.
     """
     v = video_labels(raw, name)
@@ -174,7 +189,7 @@ def convert_video(raw: Path, out: Path, name: str, dry: bool) -> None:
     sess = out / 'test' / name
     fmt.write_session(sess, mode='2d', units='px', label_source='annotated', names=['centroid'], rig=v['rig'],
                       groups={'g0': v['group']}, labels={'g0': v['lab']}, flip_pairs=[], provenance=v['provenance'])
-    encode(v['avi'], sess / 'groups' / 'g0' / 'cam0.mp4', v['group'].n_frames)
+    encode(v['avi'], sess / 'groups' / 'g0' / 'cam0.mp4', v['group'].n_frames, threads)
 
 
 def main() -> int:
@@ -187,13 +202,15 @@ def main() -> int:
     ap.add_argument('--dry-run', action='store_true', help='report, write nothing')
     ap.add_argument('--validate', action='store_true', help='validate after writing')
     ap.add_argument('--no-image-check', action='store_true')
+    ap.add_argument('--threads', type=int, default=4,
+                    help='libx264 encoder threads per video (one encode uses ~threads+1 cores; default 4)')
     a = ap.parse_args()
     raw, out, names = SPECIES[a.species]
     out = a.out or out
     if a.clean and out.exists() and not a.dry_run:
         shutil.rmtree(out)
     for name in (a.only or names):
-        convert_video(raw, out, name, a.dry_run)
+        convert_video(raw, out, name, a.dry_run, a.threads)
     if a.validate and not a.dry_run:
         return 1 if validate_root(out, check_images=not a.no_image_check) else 0
     return 0

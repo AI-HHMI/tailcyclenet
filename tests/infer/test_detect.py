@@ -100,3 +100,33 @@ def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
                 assert np.array_equal(got[:, :, ci].reshape(-1, 4), want, equal_nan=True)
     finally:
         det.box_target = 'crop'
+
+
+def test_det_chunk_is_the_batch_for_small_inputs_and_splits_large_ones():
+    """`det_chunk_for` keeps the whole batch whenever it fits (every existing root stays byte-identical) and splits
+    only an input too large for the device; non-CUDA devices always forward the whole batch."""
+    from tailcyclenet.infer.detect import DET_BATCH, det_chunk, det_chunk_for
+
+    L4, A100 = 23.7e9, 80e9
+    for wh in ((416, 416), (640, 640), (1920, 1080), (1280, 1024)):
+        assert det_chunk_for(DET_BATCH, wh[0] * wh[1], L4) == DET_BATCH
+    assert det_chunk_for(DET_BATCH, 2240 * 2240, A100) == DET_BATCH
+    small = det_chunk_for(DET_BATCH, 2240 * 2240, L4)
+    assert 1 <= small < DET_BATCH
+    assert det_chunk_for(DET_BATCH, 2240 * 2240, L4) == small
+    assert det_chunk_for(DET_BATCH, 10 ** 9, L4) == 1
+    assert det_chunk(DET_BATCH, 10 ** 9, 'cpu') == DET_BATCH
+
+
+def test_chunked_detection_matches_one_forward_per_batch(det_scene):
+    """Splitting the model call into chunks leaves the detections unchanged within float tolerance. NOT bit-exact,
+    even on CPU with one thread: conv kernels are chosen per batch shape (measured ~1e-6 relative on this model), so
+    `det_chunk` keeps the whole batch whenever it fits and every existing root stays byte-identical."""
+    from tailcyclenet.infer.detect import detect_raw
+
+    det, sess, gid = det_scene
+    whole = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0)
+    for ck in (1, 3):
+        got = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0, chunk=ck)
+        np.testing.assert_allclose(got[0], whole[0], rtol=1e-4, atol=1e-3)
+        np.testing.assert_allclose(got[1], whole[1], rtol=1e-4, atol=1e-5)

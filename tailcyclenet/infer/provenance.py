@@ -42,7 +42,16 @@ def box_provenance(args, det_tile, det_red, det_boxsrc):
         'tile_scale': float(det_tile) if det_tile else 0.0,
         'reduce': bool(det_red),
         'det_box_source': str(det_boxsrc or 'keypoints') if args.detector else '',
+        'det_chunk': _det_chunk_rule(),
     }
+
+
+def _det_chunk_rule():
+    """`detect_raw`'s forward-chunk rule (`infer.detect.det_chunk`): the effective chunk is a pure function of this
+    rule, the input size and the GPU's total memory, and a chunked forward differs from one batch forward at float
+    precision, so the rule is part of the record."""
+    from .detect import DET_BYTES_PER_PX, DET_CHUNK_FRACTION, DET_FIT_FRACTION
+    return f'auto:{DET_BYTES_PER_PX}B/px,fit={DET_FIT_FRACTION},chunk={DET_CHUNK_FRACTION}'
 
 
 def identity_provenance(args):

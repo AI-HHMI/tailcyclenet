@@ -15,7 +15,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
                iou_thresh=0.5, center_dist_thresh=NMS_CENTER_DIST, trace=None,
                trace_detail=False,
-               box_source=None):
+               box_source=None, chunk=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     Inputs:
@@ -31,6 +31,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             GLOBAL `batch` BOUNDARY (aligned slices are byte-identical to one whole-clip pass).
         read -- replaces the decode with `(ci, cam_name, frames, pool) -> imgs`.
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
+        chunk -- frames per detector FORWARD (None = `det_chunk`: input size x device TOTAL memory);
+            `batch` stays the cursor unit, and a batch that fits is one forward (byte-identical).
         box_source -- this session's box source: 'instances' extents are already padded (pad 0);
             'keypoints' get the checkpoint's own `crop_pad_frac`;
             None = the checkpoint's. An `extent` head's boxes get the crop rule HERE, in source
@@ -122,6 +124,10 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     cams_flight = _memory.fits(_budget, _per_frame_cam * max(1, int(batch)) * 2, want=max(1, C))
 
     _div255 = torch.tensor(255.0, device=device)
+    _max_px = max(int(w) * int(h) for w, h in (
+        (input_wh if tile_scale is None else tiled_input_wh(session.rig.size(c_), tile_scale))
+        for c_ in session.cam_names))
+    _chunk = int(chunk) if chunk else det_chunk(batch, _max_px, device)
 
     pool = ThreadPoolExecutor(max_workers=cams_flight)
     frame_pool = ThreadPoolExecutor(max_workers=min(16, max(1, batch)))
@@ -155,7 +161,13 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             fetched = [f.result() for f in pending]
             nxt = _submit(_u + 1)
             for ci, x, metas, src in fetched:
-                obj, boxes = det(x.to(device).float().div_(_div255))
+                xs = x.to(device).float().div_(_div255)
+                if _chunk >= xs.shape[0]:
+                    obj, boxes = det(xs)
+                else:
+                    parts = [det(xs[i:i + _chunk]) for i in range(0, xs.shape[0], _chunk)]
+                    obj = torch.cat([p[0] for p in parts])
+                    boxes = torch.cat([p[1] for p in parts])
                 for j, t in enumerate(unit_ix):
                     decoded = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
                                      iou_thresh=iou_thresh,
@@ -196,6 +208,34 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 
 DET_BATCH = 16
+# Detector forward memory per INPUT pixel per frame: measured 424-427 B/px (convnext-t, no_grad, whole frames of
+# 5.0 and 7.5 MP on an L4), +6% margin. A full batch is kept while it fits in DET_FIT_FRACTION of the device's total
+# memory; otherwise the forward is split into chunks that fit in DET_CHUNK_FRACTION (room for the pose model).
+DET_BYTES_PER_PX = 450
+DET_FIT_FRACTION = 0.75
+DET_CHUNK_FRACTION = 0.5
+
+
+def det_chunk_for(batch, n_px, total_bytes):
+    """Frames per detector forward for a `batch` of `n_px`-pixel inputs on a device of `total_bytes`.
+
+    Pure and deterministic (same device type + same input = same chunks): `batch` itself whenever
+    the whole batch fits in `DET_FIT_FRACTION` of the device, else the largest chunk (>= 1) that
+    fits in `DET_CHUNK_FRACTION`.
+    """
+    per = DET_BYTES_PER_PX * int(n_px)
+    if batch * per <= DET_FIT_FRACTION * total_bytes:
+        return int(batch)
+    return max(1, min(int(batch), int(DET_CHUNK_FRACTION * total_bytes // per)))
+
+
+def det_chunk(batch, n_px, device):
+    """`det_chunk_for` on `device`'s TOTAL memory (`torch.cuda.get_device_properties`); a non-CUDA
+    device forwards the whole batch."""
+    dev = torch.device(device)
+    if dev.type != 'cuda':
+        return int(batch)
+    return det_chunk_for(batch, n_px, torch.cuda.get_device_properties(dev).total_memory)
 
 
 def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,

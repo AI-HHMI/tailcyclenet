@@ -156,6 +156,25 @@ def test_prefetch_windows_is_bit_exact(rat16):
                  ' (prefetch=3)')
 
 
+def test_run_blocks_runs_without_autograd(rat16):
+    """`run_blocks` is what `driver.run_dataset` calls directly, so IT must disable autograd, not only
+    `run_group` (a stray decorator on `vis_gate` once left every deployed forward building a graph)."""
+    import torch
+
+    from tailcyclenet.infer.window import run_blocks
+
+    model, sess, registry, name = rat16
+    seen = []
+    hook = model.register_forward_pre_hook(lambda m, a: seen.append(torch.is_grad_enabled()))
+    try:
+        torch.set_grad_enabled(True)
+        for _ in run_blocks(model, sess, 'g000', registry, name, _infer_cfg(anchor='none')):
+            pass
+    finally:
+        hook.remove()
+    assert seen and not any(seen), 'every window forward must run under no_grad'
+
+
 def test_capture_overlap_agreement_is_a_side_channel_with_an_honest_census(rat16):
     """The opt-in seam capture is off by default and never moves a prediction; when on it records
     both seam values (distance reproducible from them) and a census that agrees with its rows."""

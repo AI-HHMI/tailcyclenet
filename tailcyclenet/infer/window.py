@@ -296,8 +296,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                                    scorer=scorer, shared_scene_encoder=shared_scene_encoder))
 
 
-@torch.no_grad()
-
 def vis_gate(v2, vlogit, thresh):
     """The `--vis-thresh` gate for one (animal, window): which rows are withheld.
 
@@ -316,6 +314,8 @@ def vis_gate(v2, vlogit, thresh):
             return cam_drop.all(axis=0), cam_drop
         return ~(np.nanmedian(vlogit, axis=-1) >= thresh), None
 
+
+@torch.no_grad()
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
                scorer=None, shared_scene_encoder=False):

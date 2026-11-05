@@ -62,6 +62,7 @@ MARGIN = 15
 MIN_FRAMES = 300
 CRF = 17
 GOP = 24
+DEC_THREADS = 2
 FPS = 30000 / 1001
 
 
@@ -124,6 +125,7 @@ def write_clips(src: Path, clips: list[tuple[Path, int, int]]) -> None:
     with av.open(str(src)) as ci:
         si = ci.streams.video[0]
         si.thread_type = 'AUTO'
+        si.codec_context.thread_count = DEC_THREADS
         k, out, so, n = 0, None, None, 0
         for i, f in enumerate(ci.decode(si)):
             while k < len(clips) and i >= clips[k][2]:
@@ -215,16 +217,28 @@ def main() -> int:
     """Parse the CLI, convert the requested sessions, write the README, optionally validate; returns the exit code."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--only', nargs='*', help='subset of session names')
+    ap.add_argument('--sessions', nargs='*', metavar='SPLIT=SESSION',
+                    help='replace SPLITS (for a separate root, e.g. --out .../cmu-panoptic-8cam-dev '
+                         '--sessions val=170228_haggling_b1)')
     ap.add_argument('--out', type=Path, default=OUT)
     ap.add_argument('--clean', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--jobs', type=int, default=8, help='cameras re-encoded in parallel per session')
+    ap.add_argument('--jobs', type=int, default=4,
+                    help='cameras re-encoded in parallel per session; threads = jobs x (4 encode + DEC_THREADS decode)')
     ap.add_argument('--validate', action='store_true')
     ap.add_argument('--no-image-check', action='store_true')
     a = ap.parse_args()
     if a.clean and a.out.exists() and not a.dry_run:
         shutil.rmtree(a.out)
-    stats = [convert(sp, s, a.out, a.dry_run, a.jobs) for sp, ss in SPLITS.items() for s in ss
+    splits = SPLITS
+    if a.sessions:
+        splits = {}
+        for kv in a.sessions:
+            sp, s = kv.split('=')
+            if sp not in ('train', 'val', 'test'):
+                raise SystemExit(f'--sessions {kv}: split must be train/val/test')
+            splits.setdefault(sp, []).append(s)
+    stats = [convert(sp, s, a.out, a.dry_run, a.jobs) for sp, ss in splits.items() for s in ss
              if not a.only or s in a.only]
     if not a.dry_run and not a.only:
         rows = '\n'.join(f'| {s["split"]} | {s["session"]} | {s["groups"]} | {s["frames"]} | {s["persons_per_group"]} | '

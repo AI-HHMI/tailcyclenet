@@ -21,12 +21,22 @@ from __future__ import annotations
 
 import itertools
 
+import numpy as np
 import torch
 
 from tracktail.model.cube import project_points_torch
 
 from ..detector.boxes import centres as box_centres
 from ..detector.boxes import sides as box_sides
+
+
+ASSOC_RES_MAX_BODY = 0.15
+"""The default cross-view gate in BODY units (owner decision 2026-11-05): every association residual is a WORLD
+distance (point-to-ray, or ray-to-ray for a seeding pair) divided by the session's body size. In those units
+the true same-animal residuals agree across rigs (pair ray-distance p99 0.13-0.19 body on CMU Panoptic and
+3dpop; third-view growth p90 0.10-0.16), while in pixels the same noise spans 19x across rigs and in box sides
+6x. 0.15 = the third-view growth p90 on 3dpop + Panoptic, confirmed on 9 single-animal rigs. The legacy pixel
+gate (`assoc_res_max_px`) survives as an explicit per-session / CLI override. Report 76, '### detr3d-diag'."""
 
 
 def _triangulate(cgroup, cams, pts):
@@ -121,7 +131,7 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px, sides=None
 
 def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
               max_res_sides=None, scores_per_cam=None, score_order=False, fast=True,
-              random_drop=None):
+              random_drop=None, max_res_body=None, body_size=None):
     """Group boxes across cameras into 3D instances.
 
     Inputs:
@@ -138,6 +148,7 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             pair_score = the lower box score of the pair; False = (-support, residual).
         fast -- TR7 (`_fast_candidates`): the same groups with less work. Default False.
         random_drop -- (p, rng) or None: DIAGNOSTIC rule-14 control, drops passing groups.
+        max_res_body / body_size -- the BODY-UNIT gate (`_associate_body`); None = the pixel gate.
     Candidates rank by all-camera support count first, pair residual as tie-break (plan
     E1a/E3), never by the seeding pair's residual alone (which a phantom can always satisfy).
     Outputs:
@@ -153,6 +164,14 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         `not res_fit <= max_res_px`, so a degenerate NaN refit cannot pass.
     """
     assert min_views in (1, 2), f'min_views is 1 or 2, got {min_views}'
+    if max_res_body is not None:
+        if max_res_sides is not None or score_order:
+            raise ValueError('the body-unit gate (max_res_body) does not combine with '
+                             'max_res_sides (TR5) or score_order (TR6a): both are pixel-path levers')
+        if body_size is None or not float(body_size) > 0:
+            raise ValueError(f'max_res_body needs a positive body_size, got {body_size!r}')
+        return _associate_body(cgroup, boxes_per_cam, float(max_res_body) * float(body_size),
+                               min_views, max_instances, random_drop)
     centres = [box_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
     n_cams = len(cgroup)
 
@@ -238,6 +257,113 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
                 used.add((c, i))
     return out
 
+
+
+def _associate_body(cgroup, boxes_per_cam, gate, min_views=2, max_instances=0, random_drop=None):
+    """`associate` with every residual in WORLD units (the body-unit gate; `gate` = max_res_body x body_size).
+
+    The algorithm is the pixel path's: seed from a cross-camera pair, rank by support then the pair's residual,
+    grow one view per other camera, refit over all members, accept if the refit passes. Only the residual
+    changes: a seeding pair's is the closest approach of its two back-projected box-centre rays; support,
+    growth and refit use the point-to-ray distance of a view's ray to the (pair / refined) triangulated point.
+    In those units a box centre that is not the projection of a fixed 3D point (tall bodies, truncation at
+    the image border) no longer inflates the third-view test the way a pixel reprojection of a 2-view point
+    does (report 76: Panoptic third-view residuals p50 42-53 px, 68-74% over 30 px).
+    float64 numpy throughout; `fast` / TR5 / TR6a do not apply. Same output dicts as `associate`, with
+    `residual` the refit's median point-to-ray distance in world units.
+    """
+    from tracktail.model.cube import undistort_points
+
+    n_cams = len(cgroup)
+    mats = [(c['ext'][0] if c['ext'].ndim == 3 else c['ext']).double().numpy() for c in cgroup]
+    cen = [box_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
+    keys = [(c, i) for c in range(n_cams) for i in range(cen[c].shape[0])
+            if bool(torch.isfinite(cen[c][i]).all())]
+    out = []
+    used = set()
+    if keys:
+        rn = {k: undistort_points(cgroup[k[0]], cen[k[0]][k[1]].reshape(1, 2).double())[0].numpy()
+              for k in keys}
+        origin, direction = {}, {}
+        for k in keys:
+            m = mats[k[0]]
+            rot, tr = m[:3, :3], m[:3, 3]
+            origin[k] = -rot.T @ tr
+            d = rot.T @ np.r_[rn[k], 1.0]
+            direction[k] = d / np.linalg.norm(d)
+
+        def tri(ks):
+            """DLT over the cached undistorted rays of detections `ks`."""
+            rows = []
+            for (c, i) in ks:
+                r, m = rn[(c, i)], mats[c]
+                rows.append(r[0] * m[2] - m[0])
+                rows.append(r[1] * m[2] - m[1])
+            _, _, vh = np.linalg.svd(np.stack(rows))
+            x = vh[-1]
+            return x[:3] / x[3]
+
+        def ray_ray(a, b):
+            """Closest approach of the two detections' back-projected rays (world units)."""
+            n = np.cross(direction[a], direction[b])
+            nn = np.linalg.norm(n)
+            return float(abs(np.dot(origin[a] - origin[b], n)) / max(nn, 1e-12))
+
+        def point_ray(x, k):
+            """Distance of world point `x` from detection `k`'s back-projected ray."""
+            v = x - origin[k]
+            return float(np.linalg.norm(v - np.dot(v, direction[k]) * direction[k]))
+
+        cands = []
+        for a, b in itertools.combinations(keys, 2):
+            if a[0] == b[0]:
+                continue
+            x = tri([a, b])
+            if not np.isfinite(x).all():
+                continue
+            r = ray_ray(a, b)
+            if r > gate:
+                continue
+            support = sum(1 for c in range(n_cams) if c not in (a[0], b[0])
+                          and any(point_ray(x, k) <= gate for k in keys if k[0] == c))
+            cands.append((support, r, a, b, x))
+        cands.sort(key=lambda z: (-z[0], z[1]))
+        for _support, _r, a, b, x in cands:
+            if a in used or b in used:
+                continue
+            members = {a[0]: a, b[0]: b}
+            for c in range(n_cams):
+                if c in members:
+                    continue
+                ds = sorted((point_ray(x, k), k) for k in keys if k[0] == c and k not in used)
+                if ds and ds[0][0] <= gate:
+                    members[c] = ds[0][1]
+            if len(members) < min_views:
+                continue
+            ks = [members[c] for c in sorted(members)]
+            xr = tri(ks)
+            res_fit = float(np.median([point_ray(xr, k) for k in ks]))
+            if not res_fit <= gate:
+                continue
+            if random_drop is not None and random_drop[1].random() < random_drop[0]:
+                continue
+            out.append({'point': torch.as_tensor(xr, dtype=torch.float32), 'residual': res_fit,
+                        'boxes': {c: boxes_per_cam[c][members[c][1]] for c in sorted(members)},
+                        'members': {c: members[c][1] for c in sorted(members)}})
+            used.update(ks)
+            if max_instances and len(out) >= max_instances:
+                break
+    if min_views == 1:
+        for c in range(n_cams):
+            for i in range(cen[c].shape[0]):
+                if max_instances and len(out) >= max_instances:
+                    return out
+                if (c, i) in used or not bool(torch.isfinite(cen[c][i]).all()):
+                    continue
+                out.append({'point': torch.full((3,), float('nan')), 'residual': float('inf'),
+                            'boxes': {c: boxes_per_cam[c][i]}, 'members': {c: i}})
+                used.add((c, i))
+    return out
 
 def _candidates(cgroup, centres, used, max_res_px, sides, scores_per_cam, score_order, res):
     """`associate`'s reference candidate list: every cross-camera pair of unused detections."""
@@ -329,7 +455,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0,
                     assoc_res_max_sides=None, assoc_score_order=False,
                     track_age_decay=None, track_affinity_2d=0.0, track_camera_claims=False,
-                    assoc_fast=True, assoc_random_drop=0.0):
+                    assoc_fast=True, assoc_random_drop=0.0, assoc_res_max_body=None,
+                    body_size=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -354,6 +481,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         track_age_decay / track_affinity_2d / track_camera_claims -- T2 / TR3 / TR2 (tracker).
         assoc_fast -- `associate`'s `fast` (TR7): identical groups with less work.
         assoc_random_drop -- DIAGNOSTIC rule-14 control: drop passing groups at this rate.
+        assoc_res_max_body / body_size -- the body-unit gate; None = `session.assoc_res_max_px`.
     Outputs:
         The same pair re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -388,7 +516,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        affinity_2d=track_affinity_2d,
                                        camera_claims=track_camera_claims,
                                        fast=assoc_fast,
-                                       random_drop=assoc_random_drop)
+                                       random_drop=assoc_random_drop,
+                                       max_res_body=assoc_res_max_body,
+                                       body_size=body_size)
         state['tracker'] = tracker
     tracker = state['tracker']
 
@@ -427,7 +557,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                            score_order=assoc_score_order, fast=assoc_fast,
                            random_drop=(None if not assoc_random_drop else
                                         (assoc_random_drop, state.setdefault(
-                                            'drop_rng', np.random.default_rng(0)))))
+                                            'drop_rng', np.random.default_rng(0)))),
+                           max_res_body=assoc_res_max_body, body_size=body_size)
         if stats is not None:
             stats['association_groups'] = stats.get('association_groups', 0) + len(groups)
         for a, g in enumerate(groups[:S]):

@@ -274,14 +274,23 @@ def build_parser() -> argparse.ArgumentParser:
     ident.add_argument('--duplicate-persist', type=int, default=5,
                        help='in-band frames before the 3D --track backstop resolves a duplicate.')
     ident.add_argument('--assoc-res-max-px', type=float, default=None,
-                       help="override the session's reprojection gate (a PIXEL gate: sweep per "
-                            "rig). Default: the session's own value.")
+                       help='LEGACY: run the PIXEL cross-view gate at this reprojection residual '
+                            '(a pixel gate must be swept per rig). Default: the body-unit gate, '
+                            "unless the session's own session.toml declares assoc_res_max_px.")
+    ident.add_argument('--assoc-res-max-body', type=float, default=None,
+                       help='the cross-view gate in BODY units: every association residual is a world '
+                            'point-to-ray / ray-ray distance divided by the body size (session.toml '
+                            'body_length, else a label-free first pass over 300 frames). Default: '
+                            '0.15 (owner decision 2026-11-05; report 76 detr3d-diag: CMU Panoptic MOTA '
+                            '0.653 -> 1.000 vs 30 px, 3dpop Seq59+Seq29 within the 30-60 px band, '
+                            'social-dannce identical). Overrides a session-declared pixel gate.')
     ident.add_argument('--assoc-res-max-sides', type=float, default=None,
                        help='TR5: gate cross-view grouping on the reprojection residual in BOX '
                             "SIDES (median over views of residual / that view's box side) "
                             'instead of pixels; when set it REPLACES the pixel gate for '
                             'association only (the GT triangulation keeps assoc_res_max_px). '
-                            'Default: off (pixel gate). measured: 3dpop Seq59/Seq29 at 0.19 (= '
+                            'Pixel gate only (needs --assoc-res-max-px or a session pixel key). '
+                            'Default: off. measured: 3dpop Seq59/Seq29 at 0.19 (= '
                             '30 px at the 157 px median side): MOTA -0.0003, idsw 13->10 / '
                             '0->3, IDF1 -0.012 [-0.045, +0.009] (2026-10-19).')
     ident.add_argument('--assoc-score-order', action=argparse.BooleanOptionalAction,

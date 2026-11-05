@@ -238,6 +238,13 @@ def det_chunk(batch, n_px, device):
     return det_chunk_for(batch, n_px, torch.cuda.get_device_properties(dev).total_memory)
 
 
+def _gate_body(args):
+    """The run's body-unit gate (`infer.body.resolve_assoc_gate`, set by the driver as `args._assoc_gate`), or
+    None for the legacy pixel gate -- including a namespace the driver never resolved (a caller of its own)."""
+    g = getattr(args, '_assoc_gate', None)
+    return None if not g or g.get('mode') != 'body' else float(g['body'])
+
+
 def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
                     stats=None, box_source=None):
     """-> `boxes_for(store, lo, hi)`, detecting and associating on demand for one group.
@@ -307,6 +314,9 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                                    track_camera_claims=args.track_camera_claims,
                                    assoc_fast=args.assoc_fast,
                                    assoc_random_drop=args.assoc_random_drop,
+                                   assoc_res_max_body=_gate_body(args),
+                                   body_size=(getattr(args, '_body_size', None)
+                                              if _gate_body(args) is not None else None),
                                    frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j])

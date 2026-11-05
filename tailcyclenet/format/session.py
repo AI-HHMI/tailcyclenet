@@ -231,6 +231,13 @@ class Session:
     flip_pairs_declared: bool = False
     provenance: dict = field(default_factory=dict)
     assoc_res_max_px: float = 30.0
+    # True iff session.toml declares `assoc_res_max_px` itself: an explicit key keeps the LEGACY pixel
+    # association gate for this session (`infer.body.resolve_assoc_gate`); absent = the body-unit gate.
+    # The value above still serves the GT triangulation's default either way.
+    assoc_res_max_px_declared: bool = False
+    # The animal's body size in world (calibration) units -- the body-unit association gate's scale.
+    # None = estimated label-free at inference time (`infer.body`).
+    body_length: float | None = None
     # Prediction outputs have narrowly different coordinate/status semantics. Missing on legacy
     # annotation sessions means False; complete is optional for pre-marker sessions.
     prediction_session: bool = False
@@ -356,6 +363,8 @@ class Session:
             flip_pairs_declared='flip_pairs' in cfg,
             provenance=dict(cfg.get('provenance', {})),
             assoc_res_max_px=float(cfg.get('assoc_res_max_px', 30.0)),
+            assoc_res_max_px_declared='assoc_res_max_px' in cfg,
+            body_length=(float(cfg['body_length']) if cfg.get('body_length') is not None else None),
             prediction_session=bool(cfg.get('prediction_session', False)),
             complete=cfg.get('complete'),
         )

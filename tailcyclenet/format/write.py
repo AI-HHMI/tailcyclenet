@@ -14,7 +14,8 @@ from .tables import DICT_COLS, invert_enum, write_table
 def write_session(path: Path, *, mode: str, units: str, label_source: str, names: list[str],
                   rig: Rig, groups: dict[str, Group], labels: dict[str, Labels],
                   skeleton=(), flip_pairs=None, provenance=None,
-                  assoc_res_max_px: float | None = None) -> None:
+                  assoc_res_max_px: float | None = None,
+                  body_length: float | None = None) -> None:
     """Write session.toml, calibration.toml and the label tables. Pixels are the caller's job.
 
     A row is emitted only where a status says a determination was made, so sparse hand
@@ -48,6 +49,8 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
         cfg['flip_pairs'] = [list(p) for p in flip_pairs]
     if assoc_res_max_px is not None:
         cfg['assoc_res_max_px'] = float(assoc_res_max_px)
+    if body_length is not None:
+        cfg['body_length'] = float(body_length)
     cfg['provenance'] = dict(provenance or {})
     (path / 'session.toml').write_text(toml.dumps(cfg))
     dump_calibration(path / 'calibration.toml', rig)

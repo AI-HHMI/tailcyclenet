@@ -54,6 +54,22 @@ def _det_chunk_rule():
     return f'auto:{DET_BYTES_PER_PX}B/px,fit={DET_FIT_FRACTION},chunk={DET_CHUNK_FRACTION}'
 
 
+def _gate_provenance(args):
+    """The cross-view gate the run used (`infer.body.resolve_assoc_gate`), unconditionally: its unit, why,
+    both thresholds, and the body size with its source. A namespace the driver never resolved records an
+    empty unit (nothing was resolved, so nothing is claimed)."""
+    g = getattr(args, '_assoc_gate', None) or {}
+    body = getattr(args, '_body_size', None)
+    return {
+        'assoc_gate': str(g.get('mode', '')),
+        'assoc_gate_source': str(g.get('why', '')),
+        'assoc_res_max_px': float(g.get('px', 0.0) or 0.0) if g.get('mode') == 'px' else 0.0,
+        'assoc_res_max_body': float(g.get('body') or 0.0),
+        'body_size': float(body) if body is not None else 0.0,
+        'body_size_source': str(getattr(args, '_body_size_source', '') or ''),
+    }
+
+
 def identity_provenance(args):
     """Every lever that decides which ROW a detection lands in, recorded beside its numbers.
 
@@ -80,6 +96,7 @@ def identity_provenance(args):
         'identity_bridge': bool(args.identity_bridge),
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
+        **_gate_provenance(args),
         'assoc_res_max_sides': (float(args.assoc_res_max_sides)
                                 if args.assoc_res_max_sides is not None else 0.0),
         'assoc_score_order': bool(args.assoc_score_order),

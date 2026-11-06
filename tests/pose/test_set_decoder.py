@@ -332,3 +332,11 @@ def test_e2_routes_under_mx0e_names():
         if host in named:
             assert route_param(name, p, set(), emb) == route_param(host, named[host], set(), emb), name
     assert route_param('set_decoder.inst', named['set_decoder.inst'], set(), emb) == 'adamw_fresh'
+
+
+def test_set_decoder_only_scratch_checkpoint_is_refused():
+    """A crowd-detr set-model checkpoint (dq_* without e1.*) must not load as a box-FiLM model."""
+    from tailcyclenet.pose.checkpoint import compat_state
+    state = {k: v for k, v in _to_scratch(_model().state_dict()).items() if not k.startswith('e1.')}
+    with pytest.raises(SystemExit, match='SET-DECODER-ONLY'):
+        compat_state(state, {}, 'x')

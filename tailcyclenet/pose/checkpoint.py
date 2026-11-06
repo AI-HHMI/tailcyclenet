@@ -21,6 +21,11 @@ def compat_state(state: dict, model_cfg: dict, where) -> dict:
     crowd/moe 2026-11) is read in this repo's layout (`set_decoder.py`) and its `[model]` gains
     `set_decoder = true`; every other checkpoint passes through untouched. Mutates `model_cfg`."""
     from .set_decoder import is_scratch_layout, map_scratch_state
+    if any(k.startswith('dq_') for k in state) and not any(k.startswith('e1.') for k in state):
+        raise SystemExit(f'{where}: a scratch crowd-detr SET-DECODER-ONLY checkpoint (dq_* without '
+                         'e1.*, e.g. B1p / v7sd_*): its decoder is the set decoder, so loading it as '
+                         'a box-FiLM model would decode with the wrong expert. Not deployable here; '
+                         'use an MX0e (e1.* + dq_*) checkpoint.')
     if not is_scratch_layout(state):
         return state
     out = map_scratch_state(state)

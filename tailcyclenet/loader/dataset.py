@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -209,6 +209,11 @@ class PoseDataset(Dataset):
         self.split = split
         self.train = (split == 'train') if train is None else train
         self.datasets = load_datasets(path, split=split)
+        if cfg.set_targets:
+            three = [str(s.path) for ds in self.datasets for s in ds.all_sessions() if s.mode != '2d']
+            if three:
+                raise SystemExit('a set decoder ([model].set_decoder) trains on 2D sessions only; a '
+                                 f'3D set decoder is not built. 3D session(s): {three[:3]}')
         prediction_sessions = [s.path for ds in self.datasets for s in ds.all_sessions()
                               if s.prediction_session]
         if prediction_sessions:
@@ -595,6 +600,25 @@ class PoseDataset(Dataset):
         return self._targets(sel, view, rng)
 
     def select(self, idx, rng, shape=None) -> Selection | None:
+        """`_select_one`, plus (train, `hard_frac > 0`) the crowded-window rejection sampler and the
+        nearest-animal swap neighbour (`crowd`). `hard_frac = 0` is `_select_one` exactly."""
+        sel = self._select_one(idx, rng, shape)
+        if sel is None or not (self.train and self.cfg.hard_frac > 0):
+            return sel
+        from . import crowd
+        q = crowd.keep_probability(self.cfg.hard_frac)
+        for _ in range(crowd.HARD_TRIES):
+            if crowd.is_crowded(sel.lab, sel.animal, sel.frames) or rng.random() < q:
+                break
+            nsel = self._select_one(int(rng.integers(len(self.index))), rng, shape)
+            if nsel is not None:
+                sel = nsel
+        nb = crowd.nearest_neighbour(sel.lab, sel.animal, sel.frames)
+        if nb is not None:
+            sel = replace(sel, attempt_swap_animal=True, neighbour_row=nb)
+        return sel
+
+    def _select_one(self, idx, rng, shape=None) -> Selection | None:
         """Draw the view-independent part of a window, or None when the item cannot be built.
 
         Inputs: idx -- the index to pick.
@@ -922,6 +946,9 @@ class PoseDataset(Dataset):
                     box = bpmod.apply_jitter(box, rng, self.cfg.box_prompt_jitter,
                                              self.cfg.box_prompt_scale_jitter)
             out.append(box)
+        if self.cfg.set_targets:
+            from .crowd import set_targets
+            out.append(set_targets(self, sel, view, rng, self.train))
         return tuple(out)
 
     def _jitter(self, rng):

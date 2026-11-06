@@ -31,6 +31,7 @@ from .evaluate import (SMOOTHNESS_KEYS, TRAIN_METRIC_KEYS, TRAIN_METRIC_MODES, b
                        to_device, train_metrics)
 from .losses import PoseLoss
 from .model import build_model
+from .set_decoder import NA, set_loss
 from .optim import KNOWN_OPTIMIZER_KEYS
 from .start import build_start, plan_start
 from .unfreeze import apply_staged_unfreeze, trainable_encoder_params
@@ -110,14 +111,26 @@ def run_batch(model, loss_fn, batch, device, raw=None):
     already handles. Watch `skipped`: a rising fraction means the run is dead, not intermittent.
     `batch.vis_2d` is `vis_2d_true` (PoseLoss's own 2D term) in 2D and `vis_true_cams`
     (tracktail's per-camera term) in 3D -- the two must never mix.
+
+    A set-decoder (v7 MoE) batch carries `set_targets`: ONE forward through the wrapper runs both
+    experts on one scene encode (E2 on detached tokens), the loss is loss_E1 (the stock loss, the
+    only one reaching the encoder) + loss_E2 (`set_decoder.set_loss`), and the two parts ride
+    back in `out['loss_parts']` for the interval log. The returned `out` is E1's.
     """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
     _tune_smoothness(loss_fn, int(views[0].shape[1]), batch.sample_info.get('stride', 1))
     box = getattr(batch, 'box_prompt', None)
+    st = getattr(batch, 'set_targets', None)
+    set_inputs = None if st is None else {
+        'route': 'train', 'anchors': st['anchors'][:, :NA].to(device),
+        'anchor_prior': st['prior'][:, :NA].to(device),
+        'anchor_prompt_t': st['prior_t'][:, :NA].to(device)}
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device),
-                box_prompt=None if box is None else box.to(device))
+                box_prompt=None if box is None else box.to(device),
+                **({} if set_inputs is None else {'set_inputs': set_inputs}))
+    set_out = out.pop('set', None) if set_inputs is not None else None
     coords_true = batch.coords.to(device)
     vis_true = vis_true_cams = vis_2d_true = None
     if mode == '2d':
@@ -130,6 +143,10 @@ def run_batch(model, loss_fn, batch, device, raw=None):
             model if raw is None else raw, out, coords_true=coords_true,
             vis_true=vis_true, vis_true_cams=vis_true_cams, vis_2d_true=vis_2d_true,
             cgroup=cgroup, p2d=None if batch.p2d is None else batch.p2d.to(device), device=device)
+        if set_out is not None:
+            loss_e2 = set_loss(loss_fn, model if raw is None else raw, set_out, st, device, cgroup)
+            out['loss_parts'] = {'loss_e1': float(loss.detach()), 'loss_e2': float(loss_e2.detach())}
+            loss = loss + loss_e2
     except ValueError as e:
         if 'non-finite' not in str(e):
             raise
@@ -323,6 +340,7 @@ class StepLoop:
         self.local_metric_freq = dist_utils.per_rank(metric_freq, world) if metric_freq else 0
         self.step = dist_utils.ceil_div(start_it, world)
         self.it, self.skipped, self.t0, self.running, self.clipped = self.step * world, 0, time.time(), [], []
+        self.running_parts = {}
         self.smoothness_running, self.metrics_running = _fresh_metric_buckets()
         self.best_mpjpe, self.best_iter, self.saved_mpjpe = resumed_best(start_it, self.log_path)
         self.latest = (float('inf'), -1)
@@ -421,6 +439,8 @@ class StepLoop:
             return None
         opt.step()
         self.running.append(dist_utils.all_ranks_mean(fabric, float(loss.detach())))
+        for name, value in (out.get('loss_parts') or {}).items():
+            self.running_parts.setdefault(name, []).append(value)
         if self.local_metric_freq and self.step % self.local_metric_freq == 0:
             bucket = self.metrics_running.get(batch.sample_info['mode'])
             if bucket is not None:
@@ -451,7 +471,12 @@ class StepLoop:
                      f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
         smoothness = smoothness_log_values(self.smoothness_running, fabric)
         train_metric_values = metric_log_values(self.metrics_running, fabric)
-        log(self.wb, {'train/loss': float(np.mean(self.running)), 'train/grad_norm': float(gn),
+        parts = {f'train/{k}': dist_utils.all_ranks_mean(fabric, float(np.mean(v)))
+                 for k, v in sorted(self.running_parts.items())}
+        if parts:
+            fabric.print('         ' + '  '.join(f'{k[6:]} {v:.4f}' for k, v in parts.items()),
+                         flush=True)
+        log(self.wb, {**parts, 'train/loss': float(np.mean(self.running)), 'train/grad_norm': float(gn),
                       'train/grad_norm_muon': float(mgn),
                       'train/iteration': it,
                       'train/encoder_trainable_params': trainable_encoder_params(self.raw),
@@ -463,8 +488,10 @@ class StepLoop:
                       'train/ckpt_frac': self.ckpted[0] / wall if wall > 0 else 0.0,
                       'train/skipped_frac': self.skipped / max(self.step, 1),
                       'train/world_size': world, **smoothness, **train_metric_values}, it)
-        self.record({'iter': it, 'train': train_metric_values})
+        self.record({'iter': it, 'train': train_metric_values,
+                     **({'loss_parts': {k[6:]: v for k, v in parts.items()}} if parts else {})})
         self.smoothness_running, self.metrics_running = _fresh_metric_buckets()
+        self.running_parts = {}
         self.running, self.t0 = [], time.time()
         self.waited[0] = self.evalled[0] = self.ckpted[0] = 0.0
 
@@ -552,7 +579,8 @@ def main(argv: list[str] | None = None):
     np.random.seed(int(train_cfg.get('seed', 23)))
 
     lc = loader_config_from(data_cfg)
-    lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'))
+    lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'),
+                 set_targets=bool(config['model'].get('set_decoder', False)))
     plan = plan_start(run, train_cfg.get('checkpoint_path'),
                       revision=train_cfg.get('checkpoint_revision'), no_resume=args.no_resume,
                       no_warm_start=args.no_warm_start,

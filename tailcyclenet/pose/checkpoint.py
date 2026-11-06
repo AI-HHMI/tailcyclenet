@@ -16,6 +16,20 @@ from ..format import Registry
 from .model import build_model
 
 
+def compat_state(state: dict, model_cfg: dict, where) -> dict:
+    """The one key mapping at the pose load boundary: a scratch MX0e checkpoint (`e1.*` + `dq_*`,
+    crowd/moe 2026-11) is read in this repo's layout (`set_decoder.py`) and its `[model]` gains
+    `set_decoder = true`; every other checkpoint passes through untouched. Mutates `model_cfg`."""
+    from .set_decoder import is_scratch_layout, map_scratch_state
+    if not is_scratch_layout(state):
+        return state
+    out = map_scratch_state(state)
+    model_cfg['set_decoder'] = True
+    print(f'{where}: scratch MX0e layout (e1.* = E1, dq_* = E2) read as set_decoder.* -- '
+          f'{len(state)} tensors key-mapped, none re-saved')
+    return out
+
+
 def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None = None):
     """Load a self-contained pose checkpoint, whether packaged or copied from training."""
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -38,6 +52,7 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
     selected = ckpt.get('source_checkpoint', path.name)
     print(f'packaged pose checkpoint: {selected} from {source} '
           f'(iteration {ckpt.get("iteration", "?")})')
+    state = compat_state(state, config.setdefault('model', {}), path)
     model = build_model({**config['model'], 'video_encoder_pretrained': False},
                         n_keypoints=registry.n_keypoints)
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -73,12 +88,13 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
     path = resolve_checkpoint(run / 'checkpoints', checkpoint)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
 
-    model = build_model({**config['model'], 'video_encoder_pretrained': False},
-                        n_keypoints=registry.n_keypoints)
     state = ckpt.get('model_state_eval')
     if state is None:
         print(f'{path.name}: no model_state_eval; falling back to the raw training weights')
         state = ckpt['model_state']
+    state = compat_state(state, config.setdefault('model', {}), path)
+    model = build_model({**config['model'], 'video_encoder_pretrained': False},
+                        n_keypoints=registry.n_keypoints)
     missing, unexpected = model.load_state_dict(state, strict=False)
     report_load('load_run', missing, unexpected, [])
     model.run_provenance = prov
@@ -96,12 +112,21 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
     dropped, and a name the base lacks keeps its fresh init. Without `names` (legacy callers) a
     GROWN REGISTRY KEEPS ITS ROWS by position: the checkpoint's (n0, d) table fills the first n0
     rows. Either way the copy is refused if `base_names`'s length does not match n0, because a
-    mis-applied copy points each row at a different body part. `_interp_res_params` returns
+    mis-applied copy points each row at a different body part. A set-decoder model whose base has
+    no E2 starts E2 as a copy of the warm-started box-FiLM decoder / query encoder (MX0e's init);
+    only E2's own additions (instance/anchor/presence/GroupPose) stay fresh. `_interp_res_params` returns
     (dict, BOOL): `interpolated` is the flag, not a key list. The name-mapped table is built on the
     CPU, since the model may already be on a GPU.
     """
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
+    from .set_decoder import is_scratch_layout, map_scratch_state
+    if is_scratch_layout(state):
+        state = map_scratch_state(state)
+        if verbose:
+            print('warm start: scratch MX0e layout key-mapped (e1.* -> host, dq_* -> set_decoder.*)')
+        if getattr(model, 'set_decoder', None) is None:
+            state = {k: v for k, v in state.items() if not k.startswith('set_decoder.')}
 
     state = _convert_cross_attn(state, model)
     state, interpolated = _interp_res_params(state, model)
@@ -160,4 +185,15 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
     missing, unexpected = model.load_state_dict(state, strict=False)
     if verbose:
         report_load('warm start', missing, unexpected, dropped)
-    return set(missing) | set(dropped)
+    fresh = set(missing) | set(dropped)
+    sd = getattr(model, 'set_decoder', None)
+    if sd is not None and not any(k.startswith('set_decoder.') for k in state):
+        sd.fill_from_host(model)
+        copied = {f'set_decoder.{part}.{k}' for part in ('query_encoder', 'decoder')
+                  for k in getattr(sd, part).state_dict()}
+        fresh -= copied
+        if verbose:
+            print(f'warm start: set decoder (E2) query encoder + decoder filled from the warm-started '
+                  f'host ({len(copied)} tensors); {sum(k.startswith("set_decoder.") for k in fresh)} '
+                  'E2 tensors fresh')
+    return fresh

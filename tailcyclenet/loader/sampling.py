@@ -122,7 +122,8 @@ def pose_collate(batch):
     batch_size 1.
 
     The box prompt field exists only when a box model is training (`_item` appends a 14th field
-    then); it is absent for a plain run, so nothing downstream sees it. A batch whose every item
+    then); it is absent for a plain run, so nothing downstream sees it. A set-decoder run appends
+    a 15th, E2's all-animals target dict (`crowd.set_targets`), stacked key by key. A batch whose every item
     is None (a skipped val/test window) collates to None.
     """
     batch = [b for b in batch if b is not None]
@@ -134,4 +135,6 @@ def pose_collate(batch):
     out['prompt_t'] = torch.stack([b[12] for b in batch])
     if len(batch[0]) > 13:
         out['box_prompt'] = torch.stack([b[13] for b in batch])
+    if len(batch[0]) > 14:
+        out['set_targets'] = {k: torch.stack([b[14][k] for b in batch]) for k in batch[0][14]}
     return out

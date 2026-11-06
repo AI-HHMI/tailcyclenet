@@ -25,7 +25,8 @@ GRIDRESID_OFFSETS = ('query', 'triangulated')
 
 class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='wide',
-                 gridresid_offset='query', query_terms=None, box_prompt='none', **kwargs):
+                 gridresid_offset='query', query_terms=None, box_prompt='none', set_decoder=False,
+                 **kwargs):
         """Build the pose tracker: the stock `TrackerEncoder` with a pose-shaped query encoder.
 
         Inputs: n_keypoints -- size of the keypoint registry.
@@ -34,6 +35,8 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
                 gridresid_offset -- 'query' or 'triangulated' (see `anchor.query_anchored`).
                 query_terms -- overrides for the pair of prior terms.
                 box_prompt -- 'none', or a `BOX_MODES` box-prompt encoder ('film').
+                set_decoder -- add E2, the anchored set decoder (`set_decoder.py`; the v7 2D
+                    MoE). False builds no module at all, so the model is byte-identical.
 
         The stock query encoder is replaced with the wide one, built from the same kwargs the
         parent used so it is a drop-in either way. `_shared_scene` starts None (encode per
@@ -85,6 +88,13 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         print(f'query encoder: wide{"" if box_prompt == "none" else "+box:" + box_prompt}, '
               f'dim {self.latent_dim}, {self.query_encoder.n_fusion_terms} terms '
               f'({", ".join(self.query_encoder.term_names())})')
+        self.set_decoder = None
+        if set_decoder:
+            from .set_decoder import M, NA, SetDecoder
+            assert box_prompt != 'none', ('set_decoder needs a box model: E1, the expert the shared '
+                                          'encoder trains on, is the box-FiLM decoder')
+            self.set_decoder = SetDecoder(self)
+            print(f'set decoder (E2): {M} queries, {NA} box-anchored, on detached scene tokens')
 
     def _forward_window(self, views_norm, *args, **kwargs):
         """Route scene encodes through the local split or reuse caller-provided features."""
@@ -116,12 +126,20 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         self._kpt_cursor = k0 + n
         return super()._decode_from_scene(scene_features, views_norm, coords, *args, **kwargs)
 
-    def forward(self, views, kpt_ids, camera_group, mode, **kw):
+    def forward(self, views, kpt_ids, camera_group, mode, set_inputs=None, **kw):
         """Run `_forward` at the input's actual pixel extent: `image_size` is baked into the
         weights (a pad target, a weight shape, and the input extent), and only the third is
         wrong for a smaller input -- 0.3.5 splits it out as `input_size=`.
+
+        `set_inputs` (a model with a set decoder only) runs the two-expert forward,
+        `set_decoder.moe_forward`; None is the plain path, untouched.
         """
         px = max(int(c['size'].max()) for c in camera_group)
+        if set_inputs is not None:
+            assert self.set_decoder is not None, 'set_inputs given to a model without a set decoder'
+            from .set_decoder import moe_forward
+            return moe_forward(self, views, kpt_ids, camera_group, mode, set_inputs,
+                               input_size=px, **kw)
         return self._forward(views, kpt_ids, camera_group, mode, input_size=px, **kw)
 
     def _forward(self, views, kpt_ids, camera_group, mode, kpt_prior=None, prompt_time=None,
@@ -300,6 +318,7 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
     query_terms = {k: bool(cfg.pop(k)) for k in
                    ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
     box_prompt = cfg.pop('box_prompt', 'none')
+    set_decoder = bool(cfg.pop('set_decoder', False))
     if box_prompt == 'term':
         raise SystemExit(
             'box_prompt = "term" was removed: no shipped config selected it and `film` matched or '
@@ -325,6 +344,6 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
 
     return cls(n_keypoints=n_keypoints, query=query, query_encoder=enc,
                gridresid_offset=offset, query_terms=query_terms,
-               box_prompt=box_prompt, **cfg, **extra)
+               box_prompt=box_prompt, set_decoder=set_decoder, **cfg, **extra)
 
 

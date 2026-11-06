@@ -99,6 +99,13 @@ class LoaderConfig:
     # the prompt's geometry (`box_prompt.tight_prompt_box`): 'tight' is the only trainable value;
     # a run folder WITHOUT the key trained on the retired square box (`box_prompt.trained_geometry`)
     box_prompt_geometry: str = 'tight'
+    # Crowded-window share of the TRAIN stream, by rejection (`crowd.is_crowded`: another animal
+    # within 0.8 x this one's extent); > 0 also makes the swap neighbour the NEAREST animal, not a
+    # random one. 0 draws nothing extra (byte-identical). The v7 MoE recipe is 0.5 (configs/moe.toml).
+    hard_frac: float = 0.0
+    # DERIVED from `[model].set_decoder` by `scripts/train.py` (never a `[data]` key): append E2's
+    # all-animals targets (`crowd.set_targets`) to every item
+    set_targets: bool = False
 
     def __post_init__(self):
         """Validate the opt-in 2D reflection configuration at construction time."""
@@ -160,6 +167,8 @@ class LoaderConfig:
         p = self.aug_rotation_prob
         if p is not None and not 0.0 <= float(p) <= 1.0:
             raise ValueError(f'aug_rotation_prob must be None or in [0, 1], got {p!r}')
+        if not 0.0 <= float(self.hard_frac) < 1.0:
+            raise ValueError(f'hard_frac must be in [0, 1), got {self.hard_frac!r}')
         self.crop_pad_frac = float(self.crop_pad_frac)
         if not 0.0 <= self.crop_pad_frac < 1.0:
             raise ValueError(f'crop_pad_frac must be in [0, 1), got {self.crop_pad_frac!r}')
@@ -185,6 +194,9 @@ def loader_config_from(data_cfg: dict, *, extra=LOADER_PLUMBING) -> LoaderConfig
     Side effects: none, or raises SystemExit naming the unknown keys.
     """
     fields = LoaderConfig.__dataclass_fields__
+    if 'set_targets' in data_cfg:
+        raise SystemExit('[data].set_targets is not a config key: it is derived from '
+                         '[model].set_decoder, so the loader and the model cannot disagree.')
     known = set(fields) | set(extra)
     unknown = set(data_cfg) - known
     if unknown:

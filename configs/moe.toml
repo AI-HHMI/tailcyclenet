@@ -1,0 +1,9 @@
+# The v7 2D pose model (MX0e, report 76 crowd-moe): the box-FiLM model (E1) plus the anchored set
+# decoder (E2) on detached scene tokens, contact-routed at deploy. Layers over configs/base.toml.
+# 2D roots only (a 3D session is refused); deploy defaults: --box-prompt detector, --no-refine.
+
+[data]
+hard_frac = 0.5
+
+[model]
+set_decoder = true

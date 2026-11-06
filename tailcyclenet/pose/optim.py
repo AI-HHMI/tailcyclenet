@@ -50,10 +50,15 @@ def route_param(name: str, p, fresh: set[str], embed_ids: set[int]) -> str:
     """Which of `ROUTES` this parameter belongs to -- the single routing rule, shared by build
     time and the staged unfreeze so the two cannot drift. NEW vs the reference: fresh params
     train at `kpt_lr` -- 2D matrices on Muon, the rest (the `nn.Embedding` identity table, the
-    no-query tokens, norms, biases) on AdamW, as under AdamW-SF.
+    no-query tokens, norms, biases) on AdamW, as under AdamW-SF. A `set_decoder.*` (E2)
+    parameter routes under MX0e's own name (its decoder = decoder.*, its additions = fresh dq_*).
     """
+    is_fresh = name in fresh
+    if name.startswith('set_decoder.'):
+        from .set_decoder import route_name
+        name = route_name(name)
     is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
-    is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
+    is_fresh = is_fresh or name.startswith('query_encoder.kpt_')
     if is2d and is_fresh:
         return 'muon_fresh'
     if is_fresh:

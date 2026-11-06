@@ -109,9 +109,10 @@ def _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, d
 
     `--body-length` when given. Otherwise, when there is cross-view association to gate (a detector, a 3D
     session, >= 2 cameras), the label-free first pass: `FIRST_PASS_WINDOWS` sparse pose windows over the run's
-    own frame range of the first selected group (never outside it), no prior, association at the internal pixel
-    gate; body = the median predicted 3D extent diagonal. Nothing estimable -> a warned fallback to the internal
-    pixel gate. Without association the gate gates nothing.
+    own frame range of the first selected group (never outside it), no prior, associated at the body gate with
+    a PROVISIONAL body size from the detections; body = the median predicted 3D extent diagonal. No finite pose
+    -> the provisional (detection) body size, warned; neither -> refused. Without association the gate gates
+    nothing. No pixel gate is involved anywhere.
     """
     gate = args._assoc_gate
     if getattr(args, 'body_length', None) is not None:
@@ -124,29 +125,35 @@ def _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, d
         segs = first_pass_segments(start, stop, cfg.n_frames)
         n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
         t0 = time.time()
-        preds = []
+        preds, provisional = [], []
         for s, e in segs:
             a1, c1 = first_pass_config(args, cfg, s, e)
+            st = {}
             boxes_for = detector_boxes(det, det_wh, sess, gid, a1, device, det_red, det_tile,
-                                       args.det_top_k or n_want, n_want, stats={}, box_source=det_boxsrc)
+                                       args.det_top_k or n_want, n_want, stats=st, box_source=det_boxsrc)
             preds += [blk['pred'] for blk in run_blocks(
                 model, sess, gid, registry, ds_name, c1, box_points=boxes.get(f'{sess.session_id}/{gid}'),
                 boxes_for=boxes_for, n_rows=n_want, stats={}, scorer=scorer,
                 shared_scene_encoder=scorer_shared_encoder)]
+            if st.get('body_provisional') == st.get('body_provisional'):
+                provisional.append(float(st['body_provisional']))
         body, used = estimate_body_size(preds)
-        where = (f'{len(segs)} window(s) / {used} frames of {gid} in [{start}, {stop}), no prior, '
-                 f"internal {gate['px']:g} px gate")
-        if not (body == body and body > 0):
-            print(f'WARNING: body-unit association gate: the first pass ({where}) produced no finite pose to size '
-                  f"the animal; falling back to the internal {gate['px']:g} px gate. Pass --body-length to use "
-                  'the body gate.', flush=True)
-            args._assoc_gate = dict(mode='px', px=gate['px'], body=None,
-                                    why='body size unavailable (first pass produced no pose)')
-            args._body_size_source = f'first pass: no finite pose ({where})'
-            return
-        args._body_size = float(body)
-        args._body_size_source = f'first pass: median pose extent over {where}'
-        print(f'body size: {body:.4g} {sess.units} from {where} ({time.time() - t0:.1f}s)', flush=True)
+        prov = float(np.median(provisional)) if provisional else float('nan')
+        where = (f"{len(segs)} window(s) / {used} frames of {gid} in [{start}, {stop}), no prior, body gate "
+                 f"{gate['body']:g} at the provisional detection body {prov:.4g} {sess.units}")
+        if body == body and body > 0:
+            args._body_size = float(body)
+            args._body_size_source = f'first pass: median pose extent over {where}'
+        elif prov == prov and prov > 0:
+            print(f'WARNING: body-unit association gate: the first pass ({where}) produced no finite pose; using '
+                  'the provisional body size from the detections (box diagonal x depth / focal).', flush=True)
+            args._body_size = prov
+            args._body_size_source = f'provisional (detections only; the first pass produced no pose): {where}'
+        else:
+            raise SystemExit(f'body-unit association gate: no body size is estimable for {gid} (no 2-view '
+                             f'detection pair and no finite pose over {where}). Pass --body-length.')
+        print(f'body size: {args._body_size:.4g} {sess.units} from {where} ({time.time() - t0:.1f}s)',
+              flush=True)
     if args._body_size is not None:
         print(f"association gate: {gate['body']:g} body ({gate['why']}), body size {args._body_size:.4g} "
               f"{sess.units} ({args._body_size_source}) = {gate['body'] * args._body_size:.4g} {sess.units}")

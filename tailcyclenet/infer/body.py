@@ -1,15 +1,15 @@
 """The cross-view association gate (body units) and the body size that scales it.
 
 Association gates every residual as a WORLD distance divided by the body size, at `--assoc-res-max-body` (default
-`ASSOC_RES_MAX_BODY` = 0.15; report 76, '### detr3d-diag'). The pixel gate is internal machinery only
-(`INTERNAL_RES_MAX_PX`: the first pass below and the detector deployment score).
+`ASSOC_RES_MAX_BODY` = 0.15; report 76, '### detr3d-diag'). No pixel gate is used anywhere.
 
 The body size is `--body-length` (world units, the calibration's) when given; otherwise a label-free estimate from
 `FIRST_PASS_WINDOWS` sparse pose windows spread evenly over the run's OWN frame range ([start, stop) after
---start-frame / --end-frame / --max-frames; never outside it), run at the internal pixel gate with no prior: the
-median over (row, frame) of the predicted 3D extent diagonal. A range that holds no more than that many windows is
-used whole. If nothing is estimable (no 2-view association, no finite pose) the driver falls back to the internal
-pixel gate with a warning.
+--start-frame / --end-frame / --max-frames; never outside it), with no prior, its association gated in body units
+at a PROVISIONAL body size from the detections alone (`associate.provisional_body_size`: box diagonal x depth /
+focal over scale-free mutual-nearest pairs; x0.94-x1.36 of GT, inside the gate's flat band): the median over (row,
+frame) of the predicted 3D extent diagonal. A range that holds no more than that many windows is used whole. No
+finite pose -> the provisional (detection) body size, warned; nothing at all -> refused (pass --body-length).
 Measured against the GT extent (offline, from full 30 px deploys; nopri): 4 windows land within 4.5% on CMU Panoptic
 a1 / b1, 3dpop Seq59 / Seq29 and social-dannce soc3, 8.4% on social-dannce soc1 (6.4% with every frame); the gate
 is flat over +-20-30% body error. A pose-free box-diagonal x depth / focal estimate was 3-28% off (pigeons), so
@@ -22,18 +22,17 @@ import dataclasses
 
 import numpy as np
 
-from .associate import ASSOC_RES_MAX_BODY, INTERNAL_RES_MAX_PX
+from .associate import ASSOC_RES_MAX_BODY
 
 FIRST_PASS_WINDOWS = 4
 
 
 def resolve_assoc_gate(args):
-    """-> dict(mode='body', px=INTERNAL_RES_MAX_PX, body=float, why=str): `--assoc-res-max-body` if given, else
-    the default. Pure. (`mode` becomes 'px' only on the driver's warned fallback when no body size is estimable.)"""
+    """-> dict(mode='body', body=float, why=str): `--assoc-res-max-body` if given, else the default. Pure."""
     v = getattr(args, 'assoc_res_max_body', None)
     if v is not None:
-        return dict(mode='body', px=INTERNAL_RES_MAX_PX, body=float(v), why='--assoc-res-max-body')
-    return dict(mode='body', px=INTERNAL_RES_MAX_PX, body=float(ASSOC_RES_MAX_BODY), why='default')
+        return dict(mode='body', body=float(v), why='--assoc-res-max-body')
+    return dict(mode='body', body=float(ASSOC_RES_MAX_BODY), why='default')
 
 
 def median_extent(pred):
@@ -70,11 +69,13 @@ def run_range(cfg, n_frames):
 
 
 def first_pass_config(args, cfg, start, stop):
-    """The (args, cfg) of one first-pass segment [start, stop): association at the INTERNAL pixel gate, no prior
+    """The (args, cfg) of one first-pass segment [start, stop): the body gate at the run's value with the
+    PROVISIONAL body size (`_body_size = None` -> `associate_group` bootstraps it from the detections), no prior
     (`anchor = 'none'`), everything else as the run."""
     a = copy.copy(args)
     a.frame_start, a.frame_stop, a.max_frames = int(start), int(stop), 0
-    a._assoc_gate = dict(mode='px', px=float(INTERNAL_RES_MAX_PX), body=None, why='first pass')
+    gate = getattr(args, '_assoc_gate', None) or resolve_assoc_gate(args)
+    a._assoc_gate = dict(mode='body', body=float(gate['body']), why='first pass (provisional body)')
     a._body_size = None
     c = dataclasses.replace(cfg, frame_start=int(start), frame_stop=int(stop), max_frames=0, anchor='none')
     return a, c

@@ -239,10 +239,12 @@ def det_chunk(batch, n_px, device):
 
 
 def _gate_body(args):
-    """The run's body-unit gate (`infer.body.resolve_assoc_gate`, set by the driver as `args._assoc_gate`), or
-    None for the INTERNAL pixel gate (the first pass; a namespace the driver never resolved)."""
+    """The run's body-unit gate (`infer.body.resolve_assoc_gate`, set by the driver as `args._assoc_gate`); the
+    default for a namespace the driver never resolved."""
+    from .associate import ASSOC_RES_MAX_BODY
+
     g = getattr(args, '_assoc_gate', None)
-    return None if not g or g.get('mode') != 'body' else float(g['body'])
+    return float(g['body']) if g else ASSOC_RES_MAX_BODY
 
 
 def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
@@ -314,8 +316,7 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                                    assoc_fast=args.assoc_fast,
                                    assoc_random_drop=args.assoc_random_drop,
                                    assoc_res_max_body=_gate_body(args),
-                                   body_size=(getattr(args, '_body_size', None)
-                                              if _gate_body(args) is not None else None),
+                                   body_size=getattr(args, '_body_size', None),
                                    frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j])

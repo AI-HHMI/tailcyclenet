@@ -155,7 +155,7 @@ def write_3d(dst: Path, cfg: dict, rig, groups, labels, names, root, sid, gate) 
             groups, labels -- the source groups and their labels.
             names -- canonical keypoint names.
             root, sid -- export root and session name, for provenance.
-            gate -- max median reprojection residual (px) for a point to be written.
+            gate -- max median point-to-ray distance / body size (body units) for a point to be written.
     Outputs: {'visible': n, 'gated': n, 'missing': n} counts across all groups.
     Side effects: writes the session (tables + groups/ pixels).
     """
@@ -176,7 +176,7 @@ def write_3d(dst: Path, cfg: dict, rig, groups, labels, names, root, sid, gate) 
             'created': created_date(cfg, root),
             'converter': 'scripts/convert/annotated.py',
             'points3d_source': f'triangulated (aniposelib) from the per-camera 2D, '
-                               f'residual gate {gate:g} px',
+                               f'residual gate {gate:g} body',
         })
     return stats
 
@@ -329,7 +329,7 @@ def main() -> None:
     """Convert the anivia export into tailcycle sessions; sys.exit(0/1).
 
     Inputs: argv (via argparse): --src, --out, --val-root, --twod-root,
-            --max-reproj-px, --dry-run, --clean, --validate, --no-check,
+            --max-res-body, --dry-run, --clean, --validate, --no-check,
             --no-image-check.
     Side effects: writes sessions under --out; prints progress, round-trip,
                   anatomy, and validation reports.
@@ -341,8 +341,9 @@ def main() -> None:
     ap.add_argument('--val-root', default=VAL_ROOT, help='export root that becomes val/')
     ap.add_argument('--twod-root', default=TWOD_ROOT,
                     help='export root exported per camera as 2D (unsynced cameras)')
-    ap.add_argument('--max-reproj-px', type=float, default=20.0,
-                    help='a triangulated point over this median residual is not written')
+    ap.add_argument('--max-res-body', type=float, default=fmt.VALIDATION_RES_MAX_BODY,
+                    help='a triangulated point whose median point-to-ray distance / body size exceeds this is not '
+                         'written (body units; the pixel gate is removed, 2026-11-05)')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--clean', action='store_true', help='remove the output root first')
     ap.add_argument('--validate', action='store_true')
@@ -385,7 +386,7 @@ def main() -> None:
             dst = args.out / split / sid
             if not args.dry_run:
                 write_pixels(dst, groups, sdir / 'groups', rig.names)
-                s = write_3d(dst, cfg, rig, groups, labels, names, root, sid, args.max_reproj_px)
+                s = write_3d(dst, cfg, rig, groups, labels, names, root, sid, args.max_res_body)
                 for k, v in s.items():
                     stats[f'3d_{k}'] += v
                 print(f'   {split}/{sid}: {len(groups)} group(s), {len(rig)} cams, '

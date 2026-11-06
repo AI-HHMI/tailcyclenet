@@ -97,7 +97,7 @@ def test_gate_is_the_cli_value_else_the_default():
     from tailcyclenet.infer.body import resolve_assoc_gate
 
     g = resolve_assoc_gate(argparse.Namespace(assoc_res_max_body=None))
-    assert (g['mode'], g['body'], g['px'], g['why']) == ('body', 0.15, 30.0, 'default')
+    assert g == dict(mode='body', body=0.15, why='default')
     g = resolve_assoc_gate(argparse.Namespace(assoc_res_max_body=0.2))
     assert (g['mode'], g['body'], g['why']) == ('body', 0.2, '--assoc-res-max-body')
 
@@ -166,7 +166,8 @@ def test_first_pass_body_estimator_on_a_tiny_fixture():
                              200, 212)
     assert (a.frame_start, a.frame_stop, a.max_frames) == (200, 212, 0)
     assert (c.frame_start, c.frame_stop, c.anchor) == (200, 212, 'none')
-    assert a._assoc_gate == dict(mode='px', px=30.0, body=None, why='first pass')
+    assert a._assoc_gate == dict(mode='body', body=0.15, why='first pass (provisional body)')
+    assert a._body_size is None, 'the first pass bootstraps its body size from the detections'
 
 
 def test_cli_body_length_skips_the_first_pass(monkeypatch):
@@ -208,3 +209,65 @@ def test_associate_group_threads_the_body_gate(tmp_path):
         assert np.isfinite(b).all(), 'one animal seen in every camera is one row in every camera'
         if track:
             assert st['tracker'].max_res_body == 0.15 and st['tracker'].body_size == 1e6
+
+
+def test_provisional_body_size_from_detections_alone():
+    """Two animals of known size on the synthetic rig: boxes whose diagonal x depth / focal equals the size give
+    that size back from mutual-nearest pairs (no pose, no pixel gate); no detections -> NaN."""
+    from tailcyclenet.infer.associate import provisional_body_size
+
+    cg = _flat_rig()
+    pts = [[-200.0, 0.0, 0.0], [200.0, 0.0, 0.0]]
+    half = 40.0
+    boxes = _boxes_at(cg, pts, half=half)
+    raw_box = np.stack([np.stack([b[i].numpy() for b in boxes]) for i in range(2)])[:, None]    # D, T=1, C, 4
+    raw_sc = np.ones(raw_box.shape[:3], np.float32)
+    est, n = provisional_body_size(raw_box, raw_sc, lambda t: cg, [0])
+    # every view's box-implied size: diagonal (2 half sqrt 2 px) x that camera's depth of the point / focal 800
+    depth = [float((c['ext'][:3, :3].double().numpy() @ np.asarray(p) + c['ext'][:3, 3].double().numpy())[2])
+             for c in cg for p in pts]
+    sizes = 2 * half * np.sqrt(2) * np.asarray(depth) / 800.0
+    assert n >= 2 and sizes.min() * 0.99 <= est <= sizes.max() * 1.01
+    est, n = provisional_body_size(raw_box, np.full_like(raw_sc, np.nan), lambda t: cg, [0])
+    assert n == 0 and np.isnan(est)
+
+
+def test_associate_group_bootstraps_the_body_size_and_has_no_pixel_default(tmp_path):
+    """body_size None -> a provisional body from the detections, recorded in stats; associate itself has no
+    default pixel gate."""
+    from tailcyclenet.format import Session
+    from tailcyclenet.infer.associate import associate, associate_group
+
+    root = tmp_path / 'ds' / 'test' / 's'
+    _session_3d(root)
+    sess = Session.load(root)
+    sess.preload()
+    gid = sorted(sess.groups)[0]
+    C = len(sess.cam_names)
+    T = 3
+    boxes = np.tile(np.array([24., 16., 40., 32.], np.float32), (1, T, C, 1))
+    scores = np.ones((1, T, C), np.float32)
+    st, stats = {}, {}
+    b, _ = associate_group((boxes, scores), sess, gid, 1, state=st, stats=stats)
+    assert stats['body_provisional'] > 0 and st['tracker'].body_size == stats['body_provisional']
+    assert np.isfinite(b).all()
+    with pytest.raises(ValueError, match='no default pixel gate'):
+        associate(_flat_rig(), _boxes_at(_flat_rig(), [[0.0, 0.0, 0.0]]))
+
+
+def test_triangulate_group_gates_in_body_units(tmp_path):
+    """The GT triangulation's gate is the point-to-ray distance / the group's own body size."""
+    import tailcyclenet.format as fmt
+    from tests.format.test_format import _project_3d_labels
+
+    assert fmt.VALIDATION_RES_MAX_BODY == 0.05
+    root = tmp_path / 's'
+    _session_3d(root)
+    s = fmt.Session.load(root)
+    lab = s.labels('g000')
+    _project_3d_labels(s, lab)
+    vis, gated, _ = fmt.triangulate_group(s.rig, lab)
+    assert gated == 0 and vis > 0, 'exact projections pass the default gate'
+    lab.points2d[0, 0, 0, 1:] += 30.0                 # two of three views pulled far off
+    _, gated, _ = fmt.triangulate_group(s.rig, lab)
+    assert gated >= 1 and lab.vis3d[0, 0, 0] == fmt.UNLABELED

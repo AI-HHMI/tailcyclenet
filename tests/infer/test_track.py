@@ -254,7 +254,7 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
 
     from tailcyclenet.infer.track import CrossViewTracker
 
-    tr = CrossViewTracker(2, max_age=3)
+    tr = CrossViewTracker(2, max_res_px=30.0, max_age=3)
     tr.targets[0] = {'point': torch.full((3,), float('nan')), 'age': 0}
     assert 0 in tr.targets
 
@@ -264,7 +264,7 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
     assert 0 not in tr.targets, 'a target the matcher can never see must still be able to expire'
 
     # A target WITH a point is unaffected by this path -- it ages through the normal loop.
-    tr2 = CrossViewTracker(2, max_age=3)
+    tr2 = CrossViewTracker(2, max_res_px=30.0, max_age=3)
     tr2.targets[0] = {'point': torch.zeros(3), 'age': 0}
     tr2.step([], [], [])
     assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'

@@ -157,7 +157,7 @@ class CrossViewTracker:
     prediction session (`identity_events.pq`) is a separate step, NOT built here.
     """
 
-    def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
+    def __init__(self, n_slots, max_res_px=None, max_move=1.25, max_age=8, min_views=2,
                  duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0,
                  score_order=False, age_decay=None, affinity_2d=0.0,
                  camera_claims=False, fast=True, random_drop=0.0, max_res_body=None,
@@ -165,8 +165,7 @@ class CrossViewTracker:
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
-                max_res_px -- max reprojection residual (px) of every `associate` group,
-                    births and matches alike.
+                max_res_px -- the explicit PIXEL engine gate (tests); None with the body gate.
                 max_move -- per-frame box-centre displacement gate, in box sides; 1.25 is the
                     measured default.
                 max_age -- frames without evidence before a slot is retired; 8 is the measured
@@ -195,7 +194,7 @@ class CrossViewTracker:
         """
         self.n = int(n_slots)
         self._frame_base = int(frame_base)
-        self.max_res_px = float(max_res_px)
+        self.max_res_px = None if max_res_px is None else float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)

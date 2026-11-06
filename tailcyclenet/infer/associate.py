@@ -28,17 +28,13 @@ from tracktail.model.cube import project_points_torch
 
 from ..detector.boxes import centres as box_centres
 
-INTERNAL_RES_MAX_PX = 30.0
-"""The INTERNAL pixel gate: the label-free body-size first pass and the detector deployment score
-(`evaluation.deployment`, which has no pose for a first pass) associate at it. Not user-settable since 2026-11-05."""
-
 ASSOC_RES_MAX_BODY = 0.15
 """The default cross-view gate in BODY units (owner decision 2026-11-05): every association residual is a WORLD
 distance (point-to-ray, or ray-to-ray for a seeding pair) divided by the session's body size. In those units
 the true same-animal residuals agree across rigs (pair ray-distance p99 0.13-0.19 body on CMU Panoptic and
 3dpop; third-view growth p90 0.10-0.16), while in pixels the same noise spans 19x across rigs and in box sides
-6x. 0.15 = the third-view growth p90 on 3dpop + Panoptic, confirmed on 9 single-animal rigs. The pixel gate
-survives only as `INTERNAL_RES_MAX_PX`. Report 76, '### detr3d-diag'."""
+6x. 0.15 = the third-view growth p90 on 3dpop + Panoptic, confirmed on 9 single-animal rigs. No pixel gate
+constant remains: `associate`'s pixel engine runs only on an explicit `max_res_px`. Report 76, '### detr3d-diag'."""
 
 
 def _triangulate(cgroup, cams, pts):
@@ -114,7 +110,7 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
     return count
 
 
-def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
+def associate(cgroup, boxes_per_cam, max_res_px=None, min_views=2, max_instances=0,
               scores_per_cam=None, score_order=False, fast=True,
               random_drop=None, max_res_body=None, body_size=None):
     """Group boxes across cameras into 3D instances.
@@ -122,7 +118,8 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
     Inputs:
         cgroup -- tracktail camera dicts, one per camera, in the SOURCE frame (not cropped).
         boxes_per_cam -- list of (N_c, 4) tensors, per camera, in that camera's pixels.
-        max_res_px -- a group whose median reprojection residual exceeds this is rejected.
+        max_res_px -- the PIXEL engine's gate (explicit only; no default): a group whose median
+            reprojection residual exceeds it is rejected. Unused under `max_res_body`.
         min_views -- the floor on how many cameras an instance may be built from. 2 is the
             algorithm, not a parameter (every group starts from a cross-camera PAIR); `1`
             emits each leftover box as its own single-view instance with no triangulated point.
@@ -154,6 +151,9 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             raise ValueError(f'max_res_body needs a positive body_size, got {body_size!r}')
         return _associate_body(cgroup, boxes_per_cam, float(max_res_body) * float(body_size),
                                min_views, max_instances, random_drop, scores_per_cam, score_order)
+    if max_res_px is None:
+        raise ValueError('associate needs max_res_body + body_size (the body-unit gate) or an explicit '
+                         'max_res_px (the pixel engine); there is no default pixel gate')
     centres = [box_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
     n_cams = len(cgroup)
 
@@ -424,12 +424,71 @@ def _fast_candidates(cgroup, centres, used, max_res_px, scores_per_cam, score_or
     return cands, proj_of, (lambda cams, pts, members: tri(cams, members))
 
 
+
+def provisional_body_size(raw_box, raw_sc, cgroup_at, frames, gate=ASSOC_RES_MAX_BODY):
+    """A body size from DETECTIONS alone (no pose, no pixel gate): the bootstrap of the body-unit gate.
+
+    For each listed frame and camera pair, every pair of detections is triangulated (2-view DLT of the box
+    centres) and given a box-implied size s = mean over its two views of (box diagonal px x depth / focal);
+    a pair is kept when it is MUTUAL nearest in that camera pair under the scale-free ratio
+    (ray-ray closest approach) / s and that ratio is <= `gate`. -> (median s over kept pairs, n_kept); NaN when
+    nothing passes. Measured vs the GT extent (report 76 detr3d-diag): x0.99 CMU Panoptic, x1.09 / x1.22
+    social-dannce, x1.29 / x1.36 3dpop (box diagonals overstate pigeons), x0.94 / x1.09 single-animal
+    qdmouse4m / rat7m -- inside the body gate's flat band (+-20-30%), which is all a bootstrap needs.
+    `cgroup_at(t)` is the frame's camera group; `raw_box` (D, T, C, 4), `raw_sc` (D, T, C) as `detect_raw`.
+    """
+    from tracktail.model.cube import undistort_points
+
+    vals = []
+    for t in frames:
+        cg = cgroup_at(int(t))
+        n_cams = len(cg)
+        mats = [(c['ext'][0] if c['ext'].ndim == 3 else c['ext']).double().numpy() for c in cg]
+        focal = [float((c['mat'][0, 0] + c['mat'][1, 1]) / 2) for c in cg]
+        views = {}
+        for c in range(n_cams):
+            ok = np.isfinite(raw_sc[:, t, c]) & np.isfinite(raw_box[:, t, c]).all(-1)
+            b = np.asarray(raw_box[ok, t, c], np.float64)
+            if not len(b):
+                continue
+            cen = (b[:, :2] + b[:, 2:]) / 2
+            rn = undistort_points(cg[c], torch.as_tensor(cen, dtype=torch.float64)).numpy()
+            rot, tr = mats[c][:3, :3], mats[c][:3, 3]
+            d = (rot.T @ np.c_[rn, np.ones(len(rn))].T).T
+            views[c] = (rn, -rot.T @ tr, d / np.linalg.norm(d, axis=1, keepdims=True),
+                        np.hypot(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]))
+        for ca, cb in itertools.combinations(sorted(views), 2):
+            ra, oa, da, ga = views[ca]
+            rb, ob, db, gb = views[cb]
+            ratio = np.full((len(ra), len(rb)), np.inf)
+            size = np.full((len(ra), len(rb)), np.nan)
+            for i in range(len(ra)):
+                for j in range(len(rb)):
+                    rows = [ra[i][0] * mats[ca][2] - mats[ca][0], ra[i][1] * mats[ca][2] - mats[ca][1],
+                            rb[j][0] * mats[cb][2] - mats[cb][0], rb[j][1] * mats[cb][2] - mats[cb][1]]
+                    x = np.linalg.svd(np.stack(rows))[2][-1]
+                    x = x[:3] / x[3]
+                    za = (mats[ca][:3, :3] @ x + mats[ca][:3, 3])[2]
+                    zb = (mats[cb][:3, :3] @ x + mats[cb][:3, 3])[2]
+                    if not (za > 0 and zb > 0):
+                        continue
+                    s = (ga[i] * za / focal[ca] + gb[j] * zb / focal[cb]) / 2
+                    n = np.cross(da[i], db[j])
+                    rr = abs(np.dot(oa - ob, n)) / max(np.linalg.norm(n), 1e-12)
+                    ratio[i, j], size[i, j] = rr / s, s
+            for i in range(len(ra)):
+                j = int(np.argmin(ratio[i]))
+                if np.isfinite(ratio[i, j]) and int(np.argmin(ratio[:, j])) == i and ratio[i, j] <= gate:
+                    vals.append(size[i, j])
+    return (float(np.median(vals)) if vals else float('nan')), len(vals)
+
+
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None,
                     state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0,
                     assoc_score_order=False,
                     track_age_decay=None, track_affinity_2d=0.0, track_camera_claims=False,
-                    assoc_fast=True, assoc_random_drop=0.0, assoc_res_max_body=None,
+                    assoc_fast=True, assoc_random_drop=0.0, assoc_res_max_body=ASSOC_RES_MAX_BODY,
                     body_size=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
@@ -454,8 +513,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         track_age_decay / track_affinity_2d / track_camera_claims -- T2 / TR3 / TR2 (tracker).
         assoc_fast -- `associate`'s `fast` (TR7): identical groups with less work.
         assoc_random_drop -- DIAGNOSTIC rule-14 control: drop passing groups at this rate.
-        assoc_res_max_body / body_size -- the body-unit gate; None = the INTERNAL pixel gate
-            `INTERNAL_RES_MAX_PX` (the first pass, the detector deployment score; not user-settable).
+        assoc_res_max_body / body_size -- the body gate; body_size None = `provisional_body_size` from
+            these detections (<= 48 frames, once per `state`, `stats['body_provisional']`; none -> no rows).
     Outputs:
         The same pair re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -474,11 +533,26 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     cgroup = None if moving else session.cgroup(gid)
     if state is None:
         state = {}
+    if assoc_res_max_body is None:
+        assoc_res_max_body = ASSOC_RES_MAX_BODY
+    if C > 1 and body_size is None:
+        body_size = state.get('body_provisional')
+        if body_size is None:
+            pick = np.unique(np.linspace(0, T - 1, min(T, 48)).round().astype(int)) if T else []
+            est, n_pairs = provisional_body_size(
+                r_box, r_sc, (lambda t: session.cgroup(gid, frame_base + t)) if moving else (lambda t: cgroup),
+                pick)
+            if stats is not None:
+                stats['body_provisional'] = est
+                stats['body_provisional_pairs'] = n_pairs
+            if not est == est:
+                return out, sc
+            body_size = state['body_provisional'] = est
     if 'tracker' not in state:
         tracker = None
         if track and C > 1:
             from .track import CrossViewTracker
-            tracker = CrossViewTracker(S, max_res_px=INTERNAL_RES_MAX_PX,
+            tracker = CrossViewTracker(S,
                                        min_views=min_views,
                                        max_move=max_move, max_age=max_age,
                                        duplicate_radius=duplicate_radius,
@@ -524,7 +598,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                 cams, [p[0] for p in per_cam], [p[1] for p in per_cam])
             continue
         groups = associate(cams, [p[0] for p in per_cam],
-                           max_res_px=INTERNAL_RES_MAX_PX, max_instances=S,
+                           max_instances=S,
                            min_views=min_views,
                            scores_per_cam=[p[1] for p in per_cam],
                            score_order=assoc_score_order, fast=assoc_fast,

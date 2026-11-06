@@ -96,19 +96,19 @@ def test_triangulate_group(tmp_path):
 
     lab = fresh()
     lab.points2d[0, 0, 0, 0, 0] += 20               # nonzero reprojection residual
-    _visible, gated, _missing = fmt.triangulate_group(sess.rig, lab, gate=0.01)
+    _visible, gated, _missing = fmt.triangulate_group(sess.rig, lab, gate=1e-4)   # body units
     assert gated >= 1 and lab.vis3d[0, 0, 0] == fmt.UNLABELED
 
     lab = fresh()
     lab.points2d[0, 0, 0, 1:] = np.nan
     lab.vis2d[0, 0, 0, 1:] = fmt.MISSING
-    fmt.triangulate_group(sess.rig, lab, gate=30)
+    fmt.triangulate_group(sess.rig, lab)
     assert lab.vis3d[0, 0, 0] == fmt.UNLABELED and np.isnan(lab.points3d[0, 0, 0]).all()
 
     lab = fresh()
     lab.points2d[0, 0, 0] = np.nan
     lab.vis2d[0, 0, 0] = fmt.MISSING
-    fmt.triangulate_group(sess.rig, lab, gate=30)
+    fmt.triangulate_group(sess.rig, lab)
     assert lab.vis3d[0, 0, 0] == fmt.MISSING and np.isnan(lab.points3d[0, 0, 0]).all()
 
 

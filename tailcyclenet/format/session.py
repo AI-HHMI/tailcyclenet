@@ -105,11 +105,13 @@ def _animal_vocab(tables: list[pa.Table | None], gid: str) -> list[str]:
     return sorted(found)
 
 
-VALIDATION_RES_MAX_PX = 30.0
-"""The GT triangulation's / validation rule 12's reprojection threshold in pixels: a code constant, not data. The
-session.toml key `assoc_res_max_px` that used to carry it was removed from the format on 2026-11-05 (cross-view
-association at inference uses the body-unit gate, `infer.associate.ASSOC_RES_MAX_BODY`); every root that carried
-it carried 30.0."""
+VALIDATION_RES_MAX_BODY = 0.05
+"""The GT triangulation's / validation rule 12's gate in BODY units: a keypoint is triangulated when the median over
+its views of the point-to-ray distance, divided by the group's own GT body size (the median 3D extent diagonal of
+its ungated triangulation), is <= this. Measured (report 76 detr3d-diag) on johnson-mouse-annotated, deepfly3d-v4,
+allen-mouse-annotated-outliers, monsees-acm-mouse, johnson-fly-v8: labelled-keypoint residuals p99 <= 0.021 body;
+0.05 reproduces the old 30 px accept set on 99.95-100% of points (deepfly3d-v4 the only root that differs at all).
+Smaller than the association gate (0.15) because annotated keypoints, not box centres, are triangulated."""
 
 _WARNED_LEGACY: set = set()
 
@@ -133,20 +135,22 @@ def _refuse_removed_keys(path, cfg):
 REMOVED_SESSION_KEYS = {
     'assoc_res_max_px': 'removed from the format on 2026-11-05: cross-view association at inference uses the body-unit '
                         'gate (scripts/infer.py --assoc-res-max-body), and the GT triangulation threshold is the code '
-                        'constant format.VALIDATION_RES_MAX_PX (30 px)',
+                        'constant format.VALIDATION_RES_MAX_BODY (in body units)',
     'body_length': 'body size is not data (owner decision 2026-11-05): inference estimates it label-free, or takes '
                    'scripts/infer.py --body-length',
 }
 
 
-def triangulate_group(rig: Rig, lab: Labels, gate: float) -> tuple[int, int, int]:
+def triangulate_group(rig: Rig, lab: Labels, gate: float = VALIDATION_RES_MAX_BODY) -> tuple[int, int, int]:
     """Derive 3D labels from per-camera positions; return (visible, gated, missing).
 
     Stored 2D coordinates are in image pixels, so camera offsets are restored before
     triangulation. `visible` and `projected` both carry positions; `missing` does not.
-    A point with at least two views is accepted when its median reprojection residual is
-    within `gate`; failures and single-view points remain unlabelled. Zero-view points are
-    missing only when every camera was assessed.
+    A point with at least two views is accepted when the median over its views of the point-to-ray distance
+    (world units), divided by the group's body size, is within `gate` (body units, `VALIDATION_RES_MAX_BODY`).
+    The body size is the group's own: the median over (animal, frame) of the extent diagonal of the UNGATED
+    triangulation. Failures and single-view points remain unlabelled. Zero-view points are missing only when
+    every camera was assessed.
 
     Moving-camera rigs are refused: callers must provide frame-specific camera geometry rather
     than silently triangulating against the static calibration.
@@ -157,6 +161,7 @@ def triangulate_group(rig: Rig, lab: Labels, gate: float) -> tuple[int, int, int
         raise FormatError('cannot triangulate keypoints-only 3D session with moving cameras; '
                           'frame-specific extrinsics are required')
     import torch
+    from tracktail.model.cube import undistort_points
 
     S, T, K, C, _ = lab.points2d.shape
     off = np.asarray([rig.offset[n] for n in rig.names], dtype=np.float64)
@@ -171,11 +176,27 @@ def triangulate_group(rig: Rig, lab: Labels, gate: float) -> tuple[int, int, int
     if idx.size:
         xy = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))
         with torch.no_grad():
-            xyz = np.asarray(rig.cgroup.triangulate(xy, progress=False))
-            reproj = np.asarray(rig.cgroup.reprojection_error(xyz, xy, mean=False))
-        residual = np.linalg.norm(reproj, axis=-1)
-        seen = np.isfinite(xy).all(-1)
-        median = np.nanmedian(np.where(seen, residual, np.nan), axis=0)
+            xyz = np.asarray(rig.cgroup.triangulate(xy, progress=False), np.float64)
+        ungated = np.full((S * T * K, 3), np.nan)
+        ungated[idx] = xyz
+        ext = np.nanmax(ungated.reshape(S, T, K, 3), 2) - np.nanmin(ungated.reshape(S, T, K, 3), 2)
+        diag = np.linalg.norm(ext, axis=-1)
+        body = float(np.nanmedian(diag)) if np.isfinite(diag).any() else float('nan')
+        cams = rig.tracktail()
+        dist = np.full((C, idx.size), np.nan)
+        for c, cam in enumerate(cams):
+            seen = np.isfinite(xy[c]).all(-1)
+            if not seen.any():
+                continue
+            img = torch.as_tensor(xy[c][seen] - off[c], dtype=torch.float64)
+            rn = undistort_points(cam, img).numpy()
+            m = (cam['ext'][0] if cam['ext'].ndim == 3 else cam['ext']).double().numpy()
+            rot, tr = m[:3, :3], m[:3, 3]
+            d = (rot.T @ np.c_[rn, np.ones(len(rn))].T).T
+            d /= np.linalg.norm(d, axis=1, keepdims=True)
+            v = xyz[seen] - (-rot.T @ tr)
+            dist[c, seen] = np.linalg.norm(v - np.sum(v * d, 1)[:, None] * d, axis=1)
+        median = np.nanmedian(dist, axis=0) / body if body > 0 else np.full(idx.size, np.nan)
         good = np.isfinite(xyz).all(-1) & (median <= gate)
         flat_vis[idx[good]] = VISIBLE
         flat_p3[idx[good]] = xyz[good].astype(np.float32)
@@ -530,7 +551,7 @@ class Session:
                      vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
         if (self.mode == '3d' and not self.prediction_session and out.points3d is None
                 and out.points2d is not None):
-            triangulate_group(self.rig, out, VALIDATION_RES_MAX_PX)
+            triangulate_group(self.rig, out)
         self._label_cache[gid] = out
         return out
 

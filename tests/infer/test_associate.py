@@ -295,7 +295,7 @@ def test_default_associate_is_unchanged_by_the_new_keywords():
 
     cg, boxes = _p8_scene(80.0)
     scores = [torch.rand(len(b), generator=torch.Generator().manual_seed(1)) for b in boxes]
-    assert _p8_key(associate(cg, boxes)) == _p8_key(associate(cg, boxes, scores_per_cam=scores))
+    assert _p8_key(associate(cg, boxes, max_res_px=30.0)) == _p8_key(associate(cg, boxes, max_res_px=30.0, scores_per_cam=scores))
 
 
 def test_score_order_prefers_the_stronger_pair_over_the_lower_residual():
@@ -309,8 +309,8 @@ def test_score_order_prefers_the_stronger_pair_over_the_lower_residual():
     off = b1 + torch.tensor([6.0, 0.0, 6.0, 0.0])
     boxes = [b0, torch.cat([b1, off])]
     scores = [torch.tensor([0.9]), torch.tensor([0.1, 0.9])]
-    plain = associate(cg, boxes, scores_per_cam=scores)
-    ordered = associate(cg, boxes, scores_per_cam=scores, score_order=True)
+    plain = associate(cg, boxes, max_res_px=30.0, scores_per_cam=scores)
+    ordered = associate(cg, boxes, max_res_px=30.0, scores_per_cam=scores, score_order=True)
     assert plain[0]['members'] == {0: 0, 1: 0}
     assert ordered[0]['members'] == {0: 0, 1: 1}
 
@@ -322,7 +322,7 @@ def test_score_order_needs_scores():
 
     cg, boxes = _p8_scene(80.0)
     with pytest.raises(ValueError, match='scores_per_cam'):
-        associate(cg, boxes, score_order=True)
+        associate(cg, boxes, max_res_px=30.0, score_order=True)
 
 
 def test_fast_associate_is_identical_to_the_reference():
@@ -341,8 +341,8 @@ def test_fast_associate_is_identical_to_the_reference():
                   for b in boxes]
         for kw in ({}, {'score_order': True}, {'min_views': 1},
                    {'max_instances': 3}):
-            ref = associate(cg, boxes, scores_per_cam=scores, **kw)
-            got = associate(cg, boxes, scores_per_cam=scores, fast=True, **kw)
+            ref = associate(cg, boxes, max_res_px=30.0, scores_per_cam=scores, **kw)
+            got = associate(cg, boxes, max_res_px=30.0, scores_per_cam=scores, fast=True, **kw)
             assert len(ref) == len(got)
             for g, h in zip(ref, got):
                 assert g['members'] == h['members'] and g['residual'] == h['residual']
@@ -355,7 +355,7 @@ def test_random_drop_rejects_at_its_rate_and_zero_draws_nothing():
     from tailcyclenet.infer.associate import associate
 
     cg, boxes = _p8_scene(80.0)
-    ref = associate(cg, boxes)
-    assert len(associate(cg, boxes, random_drop=(1.0, np.random.default_rng(0)))) == 0
-    assert _p8_key(associate(cg, boxes, random_drop=(0.0, np.random.default_rng(0)))) == \
+    ref = associate(cg, boxes, max_res_px=30.0)
+    assert len(associate(cg, boxes, max_res_px=30.0, random_drop=(1.0, np.random.default_rng(0)))) == 0
+    assert _p8_key(associate(cg, boxes, max_res_px=30.0, random_drop=(0.0, np.random.default_rng(0)))) == \
         _p8_key(ref)

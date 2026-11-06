@@ -31,7 +31,7 @@ class FormatError(Exception):
 
 from .calibration import nominal_camera, nominal_rig, Rig, load_calibration, rig_from_doc, dump_calibration  # noqa: E402,F401
 from .tables import TableWriter, write_table, DICT_COLS  # noqa: E402,F401
-from .session import Labels, triangulate_group, Group, Session, video_group, VideoSession, empty_labels, VALIDATION_RES_MAX_PX, REMOVED_SESSION_KEYS  # noqa: E402,F401
+from .session import Labels, triangulate_group, Group, Session, video_group, VideoSession, empty_labels, VALIDATION_RES_MAX_BODY, REMOVED_SESSION_KEYS  # noqa: E402,F401
 from .write import write_session, link  # noqa: E402,F401
 from .discovery import Dataset, load_dataset, sessions_for, load_datasets  # noqa: E402,F401
 from .registry import Registry  # noqa: E402,F401

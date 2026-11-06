@@ -185,6 +185,27 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
                          f'({trained_px}). A reduced first pass is the lever; a larger one is a '
                          'different model.')
     model_is_box = config.get('model', {}).get('box_prompt', 'none') != 'none'
+    moe = bool(config.get('model', {}).get('set_decoder', False))
+    moe_route = None
+    if moe:
+        if sess.mode != '2d':
+            print('moe: this checkpoint carries a set decoder (E2), which is 2D only; a 3D '
+                  'session deploys E1 (the box-FiLM model) alone')
+            if args.moe_route is not None:
+                raise SystemExit('--moe-route: the set decoder is 2D only; this session is 3D.')
+        else:
+            moe_route = args.moe_route or 'contact'
+            print(f'moe: v7 2D MoE checkpoint (E1 box-FiLM + E2 set decoder), --moe-route '
+                  f'{moe_route}')
+        if args.box_prompt is None and (args.detector or args.boxes):
+            args.box_prompt = 'detector'
+            print('moe: --box-prompt defaults to detector (every window) for a set-decoder '
+                  'checkpoint, as every MX0e number was measured; pass --box-prompt to override')
+    elif args.moe_route is not None:
+        raise SystemExit(f'--moe-route {args.moe_route}: this checkpoint has no set decoder (E2); '
+                         'it deploys as the plain pose model.')
+    if args.box_prompt is None:
+        args.box_prompt = 'firstonly'
     box_prompt = args.box_prompt
     box_prompt_first_only = (box_prompt == 'firstonly')
     if box_prompt in ('auto', 'firstonly'):
@@ -221,7 +242,11 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         print("box prompt: FIRSTONLY -- given at each animal's first window, withheld once a "
               'carry is available (owner-set default, 2026-09-05; report 55).')
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
-    refine = args.refine if args.refine is not None else (True if box_on else sess.mode == '3d')
+    refine = args.refine if args.refine is not None else (
+        False if moe_route is not None else (True if box_on else sess.mode == '3d'))
+    if moe_route is not None and args.refine is None:
+        print('moe: --refine defaults OFF for the 2D MoE (the 128 px pass cost +2.7 px '
+              'non-contact on rat-city, report 76); pass --refine to turn it on')
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
     if box_on:
         from ..pose.box_prompt import BOX_PROMPT_MIN_DIM, BOX_PROMPT_PAD, trained_geometry
@@ -243,7 +268,7 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
         box_prompt=box_prompt, box_prompt_first_only=box_prompt_first_only,
-        crop_inflate=crop_inflate,
+        crop_inflate=crop_inflate, moe_route=moe_route,
         prefetch_windows=args.prefetch_windows,
         capture_window_predictions=bool(args.window_predictions),
         ovc=bool(getattr(args, 'ovc', True)),

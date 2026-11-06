@@ -206,11 +206,17 @@ def build_parser() -> argparse.ArgumentParser:
     win.add_argument('--refine-px', type=int, default=None,
                      help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
                           'cliff). No default.')
-    win.add_argument('--box-prompt', default='firstonly',
+    win.add_argument('--box-prompt', default=None,
                      choices=('auto', 'firstonly', 'none', 'labels', 'detector'),
                      help='box prompt for a box model: `auto` uses the detector/boxes file and '
                           "refuses without one; `firstonly` (default) gives it only at each "
-                          "animal's first window; `labels` is an ORACLE; `none` forces it off.")
+                          "animal's first window; `labels` is an ORACLE; `none` forces it off. "
+                          'A checkpoint carrying the set decoder (v7 MoE) defaults to `detector` '
+                          '(every window), the setting every MX0e number was measured with.')
+    win.add_argument('--moe-route', default=None, choices=('contact', 'e1', 'e2'),
+                     help='v7 2D MoE checkpoints only (a set decoder, E2): `contact` (default) '
+                          'routes each slot-frame to E2 by the contact rule with hysteresis; '
+                          '`e1` / `e2` force one expert. Refused for a checkpoint without E2.')
     win.add_argument('--crop-inflate', type=float, default=None,
                      help='inflate every crop about its centre. Default 1.5 with the box on, '
                           'else 1.0.')

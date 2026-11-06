@@ -175,6 +175,10 @@ class InferConfig:
     # smaller than the median of the animal's own boxes this window keeps its box (or stays
     # box-less): an exploded or collapsed carry is not the animal (`scale_agrees`). 0 = off.
     refine_carry_scale_max: float = 2.0
+    # The v7 2D MoE (a checkpoint carrying the set decoder, `infer/moe.py`): 'contact' routes each
+    # (slot, frame) to E2 by the contact rule with hysteresis, 'e1'/'e2' force one expert. None (a
+    # model without E2, or no detector boxes) is the plain path. 2D detector-box deploys only.
+    moe_route: str | None = None
 
 
 def window_starts(span: int, window: int, overlap: int, start: int = 0):
@@ -409,6 +413,11 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    for a in range(S)])
 
     carried = [None] * S
+    router = None
+    if (cfg.moe_route is not None and mode == '2d' and boxes_for is not None
+            and getattr(model, 'set_decoder', None) is not None):
+        from .moe import GroupRouter
+        router = GroupRouter(cfg.moe_route, K)
     ovc_chains = ovc_tail = ovc_src = None
     if cfg.ovc and cfg.overlap:
         from . import ovc as _ovc
@@ -679,6 +688,11 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if box_t is not None:
                 mkw['box_prompt'] = box_t
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
+        if router is not None and boxes_stc is not None:
+            win_b = corrupted[wi] if wi in corrupted else boxes_stc[:, frames - f0]
+            set_inputs = router.inputs(a, frames, win_b, boxes, scales, cgroup_d, dev)
+            if set_inputs is not None:
+                mkw['set_inputs'] = set_inputs
         scene_ctx = (share_scene(model, scene_features=scene_features)
                      if cfg.anchor == 'self' else nullcontext())
         with scene_ctx:
@@ -698,6 +712,8 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             p = p / np.asarray(scales[0], dtype=np.float32) + np.asarray(
                 boxes[0][:2], np.float32)
             q = p
+            if router is not None:
+                router.record(a, frames, p)
         elif cfg.carry_source == 'pred':
             q = p
         elif out.get('3d_pred_triangulate') is not None:
@@ -1243,6 +1259,10 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                                      'ovc_chains': ovc_chains,
                                                      'ovc_upto': w1 - 1})}
     finally:
+        if router is not None:
+            rs = router.stats
+            print(f'moe {session.session_id}/{gid}: route {router.route}, {rs["windows"]} slot-windows, '
+                  f'E2 on {rs["frames_e2"]} of {rs["frames"]} slot-frames', flush=True)
         if _det_pool is not None:
             _det_pool.shutdown(wait=True)
         if _prefetch_pool is not None:

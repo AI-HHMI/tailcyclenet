@@ -167,5 +167,6 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
                ('scorer_encoder_shared', bool(scorer_shared_encoder)),
                ('pose_scorer_mismatch_allowed',
                 bool(allow_pose_scorer_mismatch))]),
+            *([] if cfg.moe_route is None else [('moe_route', str(cfg.moe_route))]),
             *box_provenance(args, det_tile, det_red, det_boxsrc).items(),
             *identity_provenance(args).items()]

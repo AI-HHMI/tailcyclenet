@@ -1,11 +1,9 @@
-"""`detect_raw`: batch-aligned slices and the crop rule applied to an extent head."""
+"""`detect_raw`: batch-aligned slices and tight (never squared) boxes from an extent head."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
-import torch
 
-from tailcyclenet.data.crop import crop_boxes_from_extents
 from tests.helpers import _session_2d, _session_3d
 
 
@@ -77,29 +75,30 @@ def det_scene(tmp_path_factory):
     return YOLOXNano(version='hybrid').eval(), sess, next(iter(sess.groups))
 
 
-def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
-    """An `extent` checkpoint's boxes leave `detect_raw` as crop-rule boxes in SOURCE pixels,
-    padded by the session's own box source; a `crop` checkpoint's are untouched."""
+def test_detect_raw_returns_tight_boxes_and_refuses_a_crop_head(det_scene):
+    """An `extent` head's boxes leave `detect_raw` TIGHT -- unletterboxed source pixels, never
+    squared (no square per-frame box exists, owner 2026-11-06); a legacy `crop` head is refused."""
+    import pytest
+
     from tailcyclenet.infer.detect import detect_raw
 
     det, sess, gid = det_scene
     det.box_target = 'crop'
-    raw, sc = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
-                            score_thresh=0.0)
-    det.box_target, det.min_crop_dim = 'extent', 16
     try:
-        for source, frac in (('keypoints', 0.05), ('instances', 0.0)):
-            got, sc2 = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4,
-                                     score_thresh=0.0, box_source=source)
-            assert np.array_equal(sc, sc2, equal_nan=True)
-            assert np.isfinite(raw).any()
-            for ci, cam in enumerate(sess.cam_names):
-                size = sess.rig.size(cam)
-                want = crop_boxes_from_extents(torch.as_tensor(raw[:, :, ci].reshape(-1, 4)),
-                                               size, 16, 0.0, frac).numpy()
-                assert np.array_equal(got[:, :, ci].reshape(-1, 4), want, equal_nan=True)
+        with pytest.raises(SystemExit, match="'crop'"):
+            detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0)
     finally:
-        det.box_target = 'crop'
+        det.box_target = 'extent'
+    got, sc = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0)
+    ok = np.isfinite(got).all(-1)
+    assert ok.any() and np.array_equal(ok, np.isfinite(sc))
+    wh = got[..., 2:] - got[..., :2]
+    assert (wh[ok] > 0).all()
+    for ci, cam in enumerate(sess.cam_names):
+        W, H = sess.rig.size(cam)
+        b = got[:, :, ci][ok[:, :, ci]]
+        assert (b[:, [0, 2]] >= 0).all() and (b[:, [0, 2]] <= W).all()
+        assert (b[:, [1, 3]] >= 0).all() and (b[:, [1, 3]] <= H).all()
 
 
 def test_det_chunk_is_the_batch_for_small_inputs_and_splits_large_ones():

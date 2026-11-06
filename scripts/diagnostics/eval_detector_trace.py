@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 
-from tailcyclenet.data.crop import crop_box_for_points
+from tailcyclenet.data.crop import crop_box_for_points, crop_boxes_from_extents
 from tailcyclenet.infer.detect import detect_raw
 from tailcyclenet.detector.checkpoint import load_detector
 from tailcyclenet.detector.boxes import NMS_CENTER_DIST, box_iou
@@ -172,8 +172,15 @@ def main():
                            max_frames=min(end, group.n_frames), tile_scale=tile_scale,
                            frames=frames, iou_thresh=args.nms_iou,
                            center_dist_thresh=args.nms_center_dist,
-                           trace=trace, trace_detail=True,
-                           box_source=detector_box_source(model, ds_name, box_source))
+                           trace=trace, trace_detail=True)
+                _src = detector_box_source(model, ds_name, box_source)
+                _pad = 0.0 if _src == 'instances' else float(getattr(model, 'crop_pad_frac', 0.05))
+                for record in trace:
+                    _wh = sess.rig.size(record['camera'])
+                    for stage in STAGES:
+                        b = np.asarray(record[f'{stage}_boxes'], np.float32).reshape(-1, 4)
+                        record[f'{stage}_boxes'] = crop_boxes_from_extents(
+                            b, _wh, min_crop_dim, 0.0, _pad).numpy().tolist()
                 counts = {reason: 0 for reason in REASONS}
                 by_camera = {}
                 n_gt = 0

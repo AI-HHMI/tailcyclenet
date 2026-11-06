@@ -111,7 +111,11 @@ def test_a_camera_without_a_box_does_not_drop_the_animal(mv):
 
 
 def test_the_window_union_covers_the_window_and_stays_in_the_image(mv):
-    """The union box (deliberately NOT re-squared, +3.06 mm) spans the window and stays in the image."""
+    """The crop is the crop rule applied ONCE to the union of the window's TIGHT boxes: it
+    covers the union, is square, and stays in the image (per-frame boxes are never squared)."""
+    import torch
+
+    from tailcyclenet.data.crop import crop_box_for_points
     model, sess, registry, name = mv
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
@@ -123,8 +127,12 @@ def test_the_window_union_covers_the_window_and_stays_in_the_image(mv):
     crop = out['crop'][0, 0]                              # (C,4), the first window's box per cam
     for ci in range(C):
         x0, y0, x1, y1 = crop[ci]
-        assert (x0, y0, x1, y1) == (10.0, 12.0, 17.0, 16.0), \
-            f'cam {ci}: {crop[ci]} is not the union over t = 0..3'
+        cfg = _infer_cfg(anchor='none')
+        want = crop_box_for_points(torch.tensor([[10., 12.], [17., 16.]]), torch.tensor([w, h]),
+                                   cfg.min_crop_dim, 0.0, cfg.crop_pad_frac)
+        assert np.array_equal(crop[ci], want.numpy().astype(np.float32)), \
+            f'cam {ci}: {crop[ci]} is not the crop rule on the union over t = 0..3'
+        assert x0 <= 10 and y0 <= 12 and x1 >= 17 and y1 >= 16 and x1 - x0 == y1 - y0
         assert 0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h
 
 
@@ -504,8 +512,9 @@ def test_3d_carry_feeds_back_the_anchor_free_estimate(mv16):
 
 
 def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
-    """`box_source='instances'` boxes go through the loader's crop rule (pad 0); detector boxes keep
-    the raw union (re-squaring is measured worse)."""
+    """`box_source='instances'` boxes go through the loader's crop rule (pad 0); a detector's tight
+    boxes get the same rule ONCE on their window union -- the run's pad for a keypoint detector,
+    pad 0 for an instances one (its boxes are already the padded extent)."""
     from tailcyclenet.data import crop as cropmod
 
     model, sess, registry, name = rat
@@ -516,9 +525,17 @@ def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
                    (S, T, C, 1))
     out = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='none'), boxes_for=_boxes_for(wide), n_rows=len(wide))
     det_box = out['crop'][0, 0, 0]
-
-    assert det_box[2] - det_box[0] != det_box[3] - det_box[1], \
-        'the detector union must stay non-square, or the measured +3.06 mm result is being undone'
+    corners = torch.tensor([[10.0, 10.0], [10.0 + 0.6 * w, 10.0 + 0.2 * h]])
+    c0 = _infer_cfg(anchor='none')
+    want = cropmod.crop_box_for_points(corners, torch.tensor([int(w), int(h)]), c0.min_crop_dim,
+                                       0.0, c0.crop_pad_frac)
+    np.testing.assert_array_equal(det_box, np.asarray(want, np.float32))
+    inst_for = _boxes_for(wide)
+    inst_for.box_source = 'instances'
+    out = run_group(model, sess, 'g000', registry, name, c0, boxes_for=inst_for, n_rows=len(wide))
+    want = cropmod.crop_box_for_points(corners, torch.tensor([int(w), int(h)]), c0.min_crop_dim,
+                                       pad=0)
+    np.testing.assert_array_equal(out['crop'][0, 0, 0], np.asarray(want, np.float32))
 
     stored = sess.labels('g000').boxes
     a, t = [(i, j) for i in range(stored.shape[0]) for j in range(stored.shape[1])

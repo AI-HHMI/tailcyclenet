@@ -36,7 +36,7 @@ def _saved_detector(tmp_path, **meta):
     from tailcyclenet.detector.yolox import YOLOXNano
     path = tmp_path / 'det.pth'
     torch.save({'kind': 'detector', 'input_wh': [64, 64], 'norm': 'gn', 'yolox_version': 'hybrid',
-                'model_state': YOLOXNano(version='hybrid').state_dict(), **meta},
+                'box_target': 'extent', 'model_state': YOLOXNano(version='hybrid').state_dict(), **meta},
                path)
     return path
 
@@ -50,25 +50,26 @@ def _multi_root_detector(tmp_path):
     return root, path
 
 
-def _spy_box_source(monkeypatch, owner):
-    """Wrap `owner.detect_raw`, recording the `box_source` each call forwards."""
-    seen, real = [], owner.detect_raw
+def _spy_box_source(monkeypatch, owner, name):
+    """Wrap `owner.<name>`: record the `box_source` each `deployment_score` call forwards, or
+    what each `detector_box_source` call resolved."""
+    seen, real = [], getattr(owner, name)
 
     def spy(*args, **kwargs):
-        """Record the box source, then detect as usual."""
-        seen.append(kwargs.get('box_source'))
-        return real(*args, **kwargs)
+        """Record the box source, then run as usual."""
+        out = real(*args, **kwargs)
+        seen.append(kwargs.get('box_source') if name == 'deployment_score' else out)
+        return out
 
-    monkeypatch.setattr(owner, 'detect_raw', spy)
+    monkeypatch.setattr(owner, name, spy)
     return seen
 
 
 def test_eval_detector_deploy_uses_the_roots_own_box_source(tmp_path, monkeypatch):
-    """B10: `--deploy` called `detect_raw` without `box_source`, so a multi-root detector's
-    per-root `box_sources` entry was ignored for the checkpoint's global one."""
-    import tailcyclenet.evaluation.deployment as det_pkg
+    """B10: `--deploy` scored without `box_source`, so a multi-root detector's per-root
+    `box_sources` entry was ignored for the checkpoint's global one (it sets the union's pad)."""
     root, path = _multi_root_detector(tmp_path)
-    seen = _spy_box_source(monkeypatch, det_pkg)
+    seen = _spy_box_source(monkeypatch, eval_detector, 'deployment_score')
     monkeypatch.setattr(sys, 'argv', [
         'eval_detector.py', '--run', str(path), '--data', str(root), '--split', 'test',
         '--deploy', '--no-track', '--device', 'cpu', '--n-frames', '2', '--overlap', '0'])
@@ -79,7 +80,7 @@ def test_eval_detector_deploy_uses_the_roots_own_box_source(tmp_path, monkeypatc
 def test_eval_detector_trace_uses_the_roots_own_box_source(tmp_path, monkeypatch):
     """B10: the trace script likewise passes the root's own `box_sources` entry."""
     root, path = _multi_root_detector(tmp_path)
-    seen = _spy_box_source(monkeypatch, eval_detector_trace)
+    seen = _spy_box_source(monkeypatch, eval_detector_trace, 'detector_box_source')
     monkeypatch.setattr(sys, 'argv', [
         'eval_detector_trace.py', '--run', str(path), '--data', str(root), '--split', 'test',
         '--device', 'cpu', '--out', str(tmp_path / 'trace.json')])

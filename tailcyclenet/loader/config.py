@@ -96,6 +96,9 @@ class LoaderConfig:
     # exposure bias: the deployed box is a DETECTOR box
     box_prompt_jitter: float = 0.0
     box_prompt_scale_jitter: float = 0.0
+    # the prompt's geometry (`box_prompt.tight_prompt_box`): 'tight' is the only trainable value;
+    # a run folder WITHOUT the key trained on the retired square box (`box_prompt.trained_geometry`)
+    box_prompt_geometry: str = 'tight'
 
     def __post_init__(self):
         """Validate the opt-in 2D reflection configuration at construction time."""
@@ -129,7 +132,7 @@ class LoaderConfig:
     def _check_values(self) -> None:
         """Refuse, at construction, the values the loader would otherwise first trip over inside a
         worker at the first item -- or, for `box_prompt`, silently read as ON."""
-        from ..pose.box_prompt import BOX_PROMPT_FRAMES
+        from ..pose.box_prompt import BOX_PROMPT_FRAMES, BOX_PROMPT_GEOMETRIES
         from ..pose.query_encoder import BOX_MODES
 
         sampling = ('true-2d-hybrid-v1', 'legacy-3d-single-view')
@@ -139,6 +142,12 @@ class LoaderConfig:
         if self.box_prompt_frames not in BOX_PROMPT_FRAMES:
             raise ValueError(f'box_prompt_frames must be one of {BOX_PROMPT_FRAMES}, '
                              f'got {self.box_prompt_frames!r}')
+        if self.box_prompt_geometry not in BOX_PROMPT_GEOMETRIES:
+            raise ValueError(
+                f'box_prompt_geometry must be one of {BOX_PROMPT_GEOMETRIES}, got '
+                f'{self.box_prompt_geometry!r}: the square box prompt was retired 2026-11-06 '
+                '(owner); a run folder without the key is read as square-trained, but nothing '
+                'trains on it any more.')
         if self.box_prompt != 'none' and self.box_prompt not in BOX_MODES:
             raise ValueError(f"box_prompt must be 'none' or one of {BOX_MODES}, "
                              f'got {self.box_prompt!r}')

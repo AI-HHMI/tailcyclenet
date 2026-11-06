@@ -199,6 +199,9 @@ class YOLOXNano(nn.Module):
     head/neck switches (`Head`/`PAFPN`).
     """
     STRIDES = (8, 16, 32)
+    # What the head regresses, for `infer.detect.detect_raw` (which deploys only 'extent'): the
+    # shipped recipe's value; `load_detector` overwrites it from the checkpoint (absent = 'crop').
+    box_target = 'extent'
 
     def __init__(self, version='convnext-t', p2=False, shared_head=True, fpn_upsample='nearest'):
         """Build the box predictor for `version` (see the class docstring for arguments)."""

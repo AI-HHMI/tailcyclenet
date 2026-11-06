@@ -501,7 +501,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
-        raw -- `detect_raw`'s (boxes, scores[, extents]); session, gid, max_instances (rows S).
+        raw -- `detect_raw`'s (TIGHT boxes, scores); session, gid, max_instances (rows S).
         track -- 3D multiview default: `CrossViewTracker`, one cross-view target set carried
             across frames; `False` restores the memoryless per-frame `associate`.
         link -- tracker-less linking: 2D `link_two_stage` (link_two_stage_2d=False: `link_rows`).
@@ -533,7 +533,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     import torch
 
     r_box, r_sc = raw[0], raw[1]
-    r_ext = raw[2] if len(raw) > 2 else None
     D, T, C = r_sc.shape
     S = max_instances or 1
     out = np.full((S, T, C, 4), np.nan, np.float32)
@@ -630,7 +629,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     pre_link = int(np.isfinite(out).all(-1).sum())
     if link and tracker is None and C == 1 and link_two_stage_2d:
         rows, rsc = link_two_stage(r_box[:, :, 0], r_sc[:, :, 0], S,
-                                   extents=None if r_ext is None else r_ext[:, :, 0],
                                    max_move=max_move, max_age=max_age,
                                    state=state.setdefault('link2', {}))
         out, sc = rows[:, :, None].astype(np.float32), rsc[:, :, None].astype(np.float32)
@@ -658,20 +656,19 @@ LINK_CALIB_FRAMES = 500
 """Two-stage 2D linking: frames whose S-th-ranked score form the reference (causal: a running median until full)."""
 
 
-def link_two_stage(boxes, scores, n_rows, extents=None, max_move=1.25, max_age=8, state=None,
+def link_two_stage(boxes, scores, n_rows, max_move=1.25, max_age=8, state=None,
                    hi_frac=LINK_HI_FRAC, lo_score=LINK_LO_SCORE, top=LINK_TOP,
                    calib_frames=LINK_CALIB_FRAMES):
     """2D (one camera) score-aware two-stage linking: ranked detections -> `n_rows` rows, one animal each.
 
     Inputs:
-        boxes (D,T,4), scores (D,T) -- `detect_raw`'s ranked detections for ONE camera (crop-rule boxes).
+        boxes (D,T,4), scores (D,T) -- `detect_raw`'s ranked TIGHT detections for ONE camera (a
+            crop box's pad and floor would blur centres and sides at contact).
         n_rows -- S, the row count.
-        extents (D,T,4) -- the detector head's TIGHT boxes, which the match is computed on (a crop
-            box's pad and floor blur centres and sides at contact); None = link on `boxes`.
         max_move / max_age -- `link_rows`' gate (box sides) and patience.
         state -- dict carried across calls so blocks link exactly as one causal pass.
     Outputs:
-        (rows (S,T,4), row_scores (S,T)): the chosen detections' CROP boxes and scores; NaN = no box.
+        (rows (S,T,4), row_scores (S,T)): the chosen detections' boxes and scores; NaN = no box.
     Notes:
         Stage 1 matches live rows (last known tight box) to the top-S boxes whose score is at least
         `hi_frac` x the reference score -- the median S-th-ranked score over the first `calib_frames`
@@ -690,7 +687,7 @@ def link_two_stage(boxes, scores, n_rows, extents=None, max_move=1.25, max_age=8
     S = int(n_rows)
     D, T, _ = boxes.shape
     K = min(D, max(int(top), S))
-    ext = boxes if extents is None else extents
+    ext = boxes
     if state is None:
         state = {}
     if 'last' not in state:

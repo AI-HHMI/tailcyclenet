@@ -87,8 +87,7 @@ def test_box_prompt_column_order_matches_use():
         db = torch.as_tensor(boxes_stc[0, 0, src_ci], dtype=torch.float32)
         corners = cropmod.box_corners(db)
         cf = (corners - torch.as_tensor(origin, dtype=torch.float32)) * float(scale)
-        return cropmod.crop_box_for_points(cf, torch.as_tensor(size), bpmod.BOX_PROMPT_MIN_DIM,
-                                           bpmod.BOX_PROMPT_PAD)
+        return bpmod.tight_prompt_box(cf, torch.as_tensor(size))
 
     # column 0 (use[0] = source cam 1): its OWN box/scale/cgroup, not source cam 0's
     want0 = expected(1, [100, 100], 2.0, [32, 96])

@@ -28,12 +28,14 @@ def deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, c
     pixels, C = len(use) -- column order matches cgroup/views/use.
 
     `src_pts` names which animal: the GT points under 'labels' (an oracle), or None under
-    'detector', where boxes_stc[a] supplies per-camera boxes. 3D + labels reuses the exact
-    training-time `compute_box_prompt` on the window's cropped cgroup -- identical to what
-    `_item` computes at training time. 3D + detector boxes each camera's own box corners in its
-    crop frame: a 2D computation per camera, since the detector box is a per-camera detection
-    to begin with. 2D is the single-camera case. A camera absent from `use` is absent from the
-    output too (never a NaN at the wrong index).
+    'detector', where boxes_stc[a] supplies per-camera TIGHT detector boxes (source px). Every
+    path is THE training rule (`box_prompt.tight_prompt_box`: per-axis pad + floor, no squaring):
+    3D + labels reuses `compute_box_prompt` on the window's cropped cgroup; otherwise each
+    camera's own source (the detector box's corners, or 2D labels) is mapped into that camera's
+    crop frame and bounded there. A camera absent from `use` is absent from the output too
+    (never a NaN at the wrong index). The geometry is tight whatever the run trained on: a
+    square-trained run (no `[data].box_prompt_geometry`) read the tight prompt as inert
+    (report 76 nonsq-crop, -0.03 px).
     """
     from ..pose import box_prompt as bpmod
 
@@ -41,38 +43,24 @@ def deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, c
         pts = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)
         return bpmod.compute_box_prompt(pts, cgroup, '3d')[None].to(dev)
 
-    if mode == '3d':
-        T = len(frames)
-        C = len(use)
-        out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)
-        for i, ci in enumerate(use):
+    T = len(frames)
+    C = len(use)
+    out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)
+    for i, ci in enumerate(use):
+        if src_pts is not None:
+            source = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)
+        else:
             db = torch.as_tensor(boxes_stc[a][frames][:, ci], dtype=torch.float32)
             if not torch.isfinite(db).any():
                 continue
-            corners = cropmod.box_corners(db)
-            origin = torch.as_tensor(boxes[i][:2], dtype=torch.float32)
-            cf = (corners - origin) * torch.as_tensor(scales[i], dtype=corners.dtype)
-            size = cgroup[i]['size']
-            for t in range(T):
-                bx = cropmod.crop_box_for_points(cf[t], size,
-                                                 bpmod.BOX_PROMPT_MIN_DIM, bpmod.BOX_PROMPT_PAD)
-                if bx is not None:
-                    out[t, i] = bx.to(torch.float32)
-        return out[None].to(dev)
-
-    source = (torch.as_tensor(src_pts[a][frames], dtype=torch.float32) if src_pts is not None
-              else cropmod.box_corners(torch.as_tensor(boxes_stc[a][frames][:, use[0]],
-                                                       dtype=torch.float32)))
-    origin = torch.as_tensor(boxes[0][:2], dtype=torch.float32)
-    cf = (source - origin) * torch.as_tensor(scales[0], dtype=source.dtype)
-    size = cgroup[0]['size']
-    T = cf.shape[0]
-    out = torch.full((T, 1, 4), float('nan'), dtype=torch.float32)
-    for t in range(T):
-        bx = cropmod.crop_box_for_points(cf[t], size, bpmod.BOX_PROMPT_MIN_DIM,
-                                         bpmod.BOX_PROMPT_PAD)
-        if bx is not None:
-            out[t, 0] = bx.to(torch.float32)
+            source = cropmod.box_corners(db)
+        origin = torch.as_tensor(boxes[i][:2], dtype=torch.float32)
+        cf = (source - origin) * torch.as_tensor(scales[i], dtype=source.dtype)
+        size = cgroup[i]['size']
+        for t in range(T):
+            bx = bpmod.tight_prompt_box(cf[t], size)
+            if bx is not None:
+                out[t, i] = bx
     return out[None].to(dev)
 
 

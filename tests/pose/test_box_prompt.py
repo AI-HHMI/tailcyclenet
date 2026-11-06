@@ -40,17 +40,70 @@ def _cam(size=(256, 256)):
     return {'size': torch.tensor(size, dtype=torch.int32)}
 
 
-def test_compute_box_prompt_2d_matches_the_crop_rule():
+def test_tight_prompt_box_is_the_per_axis_rule():
+    """Pad 10 per side and floor 32 PER AXIS (about the centre), clamped -- never squared."""
+    size = torch.tensor([256, 256], dtype=torch.int32)
+    got = bpmod.tight_prompt_box(torch.tensor([[12., 20.], [50., 30.]]), size)
+    # x: 2..60 (38 >= 32 kept); y: 10..40 is 30 < 32 -> centre 25 +- 16
+    assert torch.equal(got, torch.tensor([2., 9., 60., 41.]))
+    assert got[2] - got[0] != got[3] - got[1]
+    edge = bpmod.tight_prompt_box(torch.tensor([[2., 100.], [200., 250.]]), size)
+    assert torch.equal(edge, torch.tensor([0., 90., 210., 256.]))      # clamped, not shifted
+    assert bpmod.tight_prompt_box(torch.full((3, 2), float('nan')), size) is None
+
+
+def test_compute_box_prompt_2d_is_the_tight_rule_and_prefers_the_stored_box():
     coords = torch.rand(4, 5, 2) * 200 + 20
     coords[0, 0] = float('nan')                       # a missing point must not break it
     box = bpmod.compute_box_prompt(coords, [_cam()], '2d')
     assert box.shape == (4, 1, 4)
     for t in range(4):
-        ref = cropmod.crop_box_for_points(coords[t], _cam()['size'],
-                                          bpmod.BOX_PROMPT_MIN_DIM, bpmod.BOX_PROMPT_PAD)
-        assert torch.allclose(box[t, 0], ref.float())
+        assert torch.equal(box[t, 0], bpmod.tight_prompt_box(coords[t], _cam()['size']))
+    inst = torch.full((1, 4, 4, 2), float('nan'))
+    inst[0, 1] = cropmod.box_corners(torch.tensor([30., 40., 120., 90.]))
+    got = bpmod.compute_box_prompt(coords, [_cam()], '2d', box_pts=inst)
+    assert torch.equal(got[1, 0], torch.tensor([20., 30., 130., 100.]))  # the instance box
+    assert torch.equal(got[0, 0], box[0, 0]) and torch.equal(got[2:], box[2:])  # else keypoints
     box = bpmod.compute_box_prompt(torch.full((2, 3, 2), float('nan')), [_cam()], '2d')
     assert torch.isnan(box).all()
+
+
+def test_train_and_deploy_build_the_same_prompt_from_the_same_box():
+    """The loader's prompt from a stored instance box == `deploy_box_prompt` from the detector's
+    tight box of the same value, through the same crop origin and scale (2D and per camera 3D)."""
+    from tailcyclenet.infer.prior import deploy_box_prompt
+
+    T = 3
+    src = np.array([[100., 80., 180., 120.], [104., 82., 186., 121.], [108., 84., 190., 125.]],
+                   np.float32)                                         # tight, source px
+    sizes = [torch.tensor([128, 128], dtype=torch.int32), torch.tensor([96, 128], dtype=torch.int32)]
+    origins = [np.array([70., 40.], np.float32), np.array([60., 30.], np.float32)]
+    scales = [torch.tensor([1.25, 1.25]), torch.tensor([0.75, 0.8])]
+    crop_boxes = [torch.tensor([*o, *(o + 100)]) for o in origins]
+    boxes_stc = np.tile(src[None, :, None], (1, 1, 2, 1))              # (S=1, T, C=2, 4)
+    for mode, C in (('2d', 1), ('3d', 2)):
+        cg = [dict(size=sizes[c]) for c in range(C)]
+        pts = [(cropmod.box_corners(torch.as_tensor(src)) - torch.as_tensor(origins[c])) * scales[c]
+               for c in range(C)]
+        train = bpmod.compute_box_prompt(torch.full((T, 2, 2), float('nan')), cg, '2d',
+                                         box_pts=pts) if mode == '2d' else torch.stack(
+            [bpmod.compute_box_prompt(torch.full((T, 2, 2), float('nan')), [cg[c]], '2d',
+                                      box_pts=[pts[c]])[:, 0] for c in range(C)], 1)
+        deploy = deploy_box_prompt(mode, None, boxes_stc, np.arange(T), 0, list(range(C)),
+                                   crop_boxes[:C], scales[:C], cg, 'cpu')[0]
+        assert torch.isfinite(train).all()
+        torch.testing.assert_close(deploy, train)
+
+
+def test_box_prompt_geometry_key():
+    """One key: only 'tight' trains; a run folder without it trained on the retired square box."""
+    from tailcyclenet.loader.config import LoaderConfig
+
+    assert LoaderConfig().box_prompt_geometry == 'tight'
+    with pytest.raises(ValueError, match='square box prompt was retired'):
+        LoaderConfig(box_prompt_geometry='square')
+    assert bpmod.trained_geometry({'data': {}}) == 'square'
+    assert bpmod.trained_geometry({'data': {'box_prompt_geometry': 'tight'}}) == 'tight'
 
 
 def test_frames_mode_first_holds_frame_zero_and_jitter_preserves_nan():

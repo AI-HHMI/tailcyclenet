@@ -430,15 +430,13 @@ def test_link_two_stage_low_boxes_extend_but_never_open_rows():
     assert not np.isfinite(rows[2]).any()
 
 
-def test_link_two_stage_links_on_extents_and_returns_crop_boxes():
-    """The match is computed on the tight extents (a crop box's floor hides the motion), and the
-    rows carry the CROP boxes the pose loop crops to."""
+def test_link_two_stage_links_on_and_returns_the_tight_boxes():
+    """`detect_raw` boxes are tight: the rows carry exactly the detections they linked."""
     from tailcyclenet.infer.associate import link_two_stage
 
     boxes, scores = _calib_frames(4)
-    crop = boxes + np.array([-20, -20, 20, 20], np.float32)
-    rows, _ = link_two_stage(crop, scores, 2, extents=boxes)
-    assert np.allclose(rows[:, :, :], crop[:2])
+    rows, _ = link_two_stage(boxes, scores, 2)
+    assert np.allclose(rows[:, :, :], boxes[:2])
 
 
 def test_link_two_stage_blocks_equal_one_pass():

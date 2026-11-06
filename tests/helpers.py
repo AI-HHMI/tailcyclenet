@@ -68,7 +68,7 @@ def _detector_checkpoint(model=None, **overrides):
     m = model if model is not None else YOLOXNano(version='hybrid')
     return {'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
             'yolox_version': m.version, 'p2': m.p2, 'shared_head': m.head.shared_head,
-            'fpn_upsample': m.neck.fpn_upsample, **overrides}
+            'fpn_upsample': m.neck.fpn_upsample, 'box_target': 'extent', **overrides}
 
 
 def _rig(specs):

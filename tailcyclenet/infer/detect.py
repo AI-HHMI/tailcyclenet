@@ -15,7 +15,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
                iou_thresh=0.5, center_dist_thresh=NMS_CENTER_DIST, trace=None,
                trace_detail=False,
-               box_source=None, chunk=None, extents=False):
+               chunk=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     Inputs:
@@ -33,14 +33,13 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
         chunk -- frames per detector FORWARD (None = `det_chunk`: input size x device TOTAL memory);
             `batch` stays the cursor unit, and a batch that fits is one forward (byte-identical).
-        extents -- also return the pre-crop-rule boxes (tight for an `extent` head) for 2D linking.
-        box_source -- this session's box source: 'instances' extents are already padded (pad 0);
-            'keypoints' get the checkpoint's own `crop_pad_frac`;
-            None = the checkpoint's. An `extent` head's boxes get the crop rule HERE, in source
-            px (`crop_boxes_from_extents`), so callers still receive crop-rule boxes.
     Outputs:
         (boxes (D,T,C,4), scores (D,T,C)): `d` is the d-th highest-scoring detection in that
-        camera at that frame (rows become animals in `associate_group`); + extents if asked.
+        camera at that frame (rows become animals in `associate_group`). The boxes are the
+        extent head's TIGHT boxes, unletterboxed into SOURCE px and never squared (owner,
+        2026-11-06: no square box prediction exists in the pipeline). The crop rule is applied
+        ONCE, to a window's union of them (`infer.crops.window_crop_box`); a legacy
+        `box_target = 'crop'` checkpoint regresses square boxes and is refused by name.
     Side effects:
         Decode runs one thread per camera (where the wall clock lives; the forward is serial).
         Cameras in flight are bounded, never `batch` -- a different batch is a different cuDNN
@@ -53,21 +52,14 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     from .. import memory as _memory
     from ..data.pixels import read_frames
     from ..detector.letterbox import letterbox, reduce_factor, unletterbox_boxes
-    from ..data.crop import crop_boxes_from_extents
-
-    extent = getattr(det, 'box_target', 'crop') == 'extent'
+    if getattr(det, 'box_target', 'crop') != 'extent':
+        raise SystemExit(
+            f"detector box_target = {getattr(det, 'box_target', 'crop')!r}: a legacy 'crop' "
+            "checkpoint regresses the SQUARE crop-rule box, and deployment consumes only tight "
+            "boxes since 2026-11-06 (owner). Retrain with [data].box_target = 'extent' (shipped).")
     antialias = bool(getattr(det, 'antialias', False))
     input_norm = str(getattr(det, 'input_norm', 'none'))
     from ..detector.augment import normalize_input
-    crop_pad_frac = (0.0 if (box_source or getattr(det, 'box_source', 'keypoints')) == 'instances'
-                     else float(getattr(det, 'crop_pad_frac', 0.05)))
-    crop_mcd = int(getattr(det, 'min_crop_dim', 32))
-
-    def _to_crop(bx, src):
-        """Unletterboxed (N,4) boxes -> what callers consume: crop-rule boxes for an `extent`
-        checkpoint, unchanged for a `crop` one (re-applying the rule would pad twice)."""
-        return crop_boxes_from_extents(bx, src, crop_mcd, 0.0, crop_pad_frac) if extent else bx
-
     group = session.groups[gid]
     T_clip = min(group.n_frames, max_frames or group.n_frames)
     want = np.arange(T_clip) if frames is None else np.asarray(frames, np.int64)
@@ -79,7 +71,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     D = max(1, int(top_k))
     out = np.full((D, T, C, 4), np.nan, np.float32)
     sc = np.full((D, T, C), np.nan, np.float32)
-    ext = np.full((D, T, C, 4), np.nan, np.float32) if extents else None
 
     def _fetch(job):
         """Decode, reduce and letterbox one (camera, frame) job into a uint8 batch tensor.
@@ -185,12 +176,11 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                         if trace_detail:
                             for stage, key in (('all', 'all'), ('score', 'score'),
                                                ('nms', 'nms')):
-                                bx = _to_crop(unletterbox_boxes(dt[f'{key}_boxes'].cpu(),
-                                                                *metas[j], src_wh=src), src)
+                                bx = unletterbox_boxes(dt[f'{key}_boxes'].cpu(),
+                                                       *metas[j], src_wh=src)
                                 record[f'{stage}_boxes'] = bx.numpy().tolist()
                                 record[f'{stage}_scores'] = dt[f'{key}_scores'].cpu().numpy().tolist()
-                            final_b = _to_crop(unletterbox_boxes(b.cpu(), *metas[j], src_wh=src),
-                                               src)
+                            final_b = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
                             record['final_boxes'] = final_b.numpy().tolist()
                             record['final_scores'] = s.cpu().numpy().tolist()
                         trace.append(record)
@@ -198,9 +188,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                         continue
                     n = min(D, b.shape[0])
                     unl = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
-                    out[:n, t, ci] = _to_crop(unl, src)[:n].numpy()
-                    if ext is not None:
-                        ext[:n, t, ci] = np.asarray(unl)[:n]
+                    out[:n, t, ci] = np.asarray(unl)[:n]
                     sc[:n, t, ci] = s.cpu().numpy()[:n]
             del fetched
             _memory.trim()
@@ -208,7 +196,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     finally:
         frame_pool.shutdown()
         pool.shutdown()
-    return (out, sc, ext) if extents else (out, sc)
+    return out, sc
 
 
 DET_BATCH = 16
@@ -271,6 +259,9 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
     once per group; leaving the cursor at 0 would decode every frame from 0 to `frame_start`
     into a store sized for the work.
 
+    Boxes are TIGHT (`detect_raw`); `boxes_for.box_source` names the pad the window union needs:
+    an 'instances' detector's boxes are already the padded extent the pose run cropped on (pad
+    0), a keypoint detector's get the run's `crop_pad_frac`.
     2D two-stage linking (`link_two_stage`) reads ranks past S, so detection keeps
     max(n_det, LINK_TOP) per frame; `top_k` applies after NMS, so the first n_det are unchanged.
     """
@@ -308,13 +299,12 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                              score_thresh=args.det_score, reduce=det_red,
                              iou_thresh=args.det_nms_iou,
                              center_dist_thresh=args.det_nms_center_dist,
-                             max_frames=T, tile_scale=det_tile, box_source=box_source,
+                             max_frames=T, tile_scale=det_tile,
                              frames=np.arange(cursor, end),
                              trace=(stats.setdefault('decode_trace', [])
                                     if args.det_trace else None),
                              read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
-                                 ci, cam, fr, pool=pool, reduce=reduce),
-                             extents=two_stage)
+                                 ci, cam, fr, pool=pool, reduce=reduce))
             b, s = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
                                    min_views=args.min_views, track=args.track,
                                    max_move=args.max_move,
@@ -345,4 +335,5 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
             del buf[t]
         return out
 
+    boxes_for.box_source = box_source or getattr(det, 'box_source', 'keypoints')
     return boxes_for

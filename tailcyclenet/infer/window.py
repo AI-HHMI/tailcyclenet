@@ -26,7 +26,8 @@ from ..pose.model import share_scene
 from .crops import (adaptive_inflation, box_disagrees, boxes_from_points, camera_consensus,
                     carry_duplicate, crop_views, fill_box_agreement, floor_refine_box, in_frame,
                     overlaps,
-                    refine_every_camera, scale_agrees, to_device, union_box)
+                    refine_every_camera, scale_agrees, to_device, union_box,
+                    window_crop_box)
 from .oracle import corrupt_boxes, parse_box_corrupt
 from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
@@ -426,6 +427,9 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     inflate_used = carry_cams = None
     pred2d = conf2d = None
     boxes_stc = None
+    union_pad = (0.0 if (inst_boxes is not None and boxes_for is None) or
+                 getattr(boxes_for, 'box_source', 'keypoints') == 'instances'
+                 else cfg.crop_pad_frac)
     _boxes_from = ('detector' if boxes_for is not None else
                    ('given points' if box_points is not None else
                     ('instances.pq' if inst_boxes is not None else 'labels')))
@@ -446,10 +450,10 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         shared by every animal.
 
         A row needs `min_box_frames` all-finite boxes (one finite box must not fabricate a whole
-        window's crop); with boxes, one box per camera is the UNION over the window's frames
-        (only the cameras that saw the row), NOT re-squared through `crop_box_for_points`
-        (a near-square union only grows); results are int32 and clamped. Stored (instances.pq)
-        boxes ARE squared through the rule (`pad=0`). The camera must describe the box the
+        window's crop); with boxes, one box per camera is `window_crop_box` of the UNION of the
+        window's TIGHT boxes (only the cameras that saw the row): the crop rule applied once,
+        int32 and clamped. Stored (instances.pq) boxes and an 'instances' detector's are already
+        the padded extent (pad 0); a keypoint detector's union gets the run's `crop_pad_frac`. The camera must describe the box the
         pixels were cut with: `apply_crop` sets `size`, `resize_camera` makes it `scales`,
         and `forward` divides by that -- a mismatch scales every keypoint.
 
@@ -496,19 +500,9 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     if not len(v):
                         continue
                     w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
-                    if inst_boxes is not None:
-                        corners = torch.as_tensor(
-                            np.concatenate([v[:, :2], v[:, 2:]], 0), dtype=torch.float32)
-                        box = cropmod.crop_box_for_points(
-                            corners, torch.tensor([w, h]), cfg.min_crop_dim, pad=0)
-                        if box is None:
-                            continue
-                    else:
-                        x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
-                        y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
-                        x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
-                        y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
-                        box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
+                    box = window_crop_box(v, (w, h), cfg.min_crop_dim, union_pad)
+                    if box is None:
+                        continue
                     boxes.append(box)
                     use.append(ci)
                 if not use:

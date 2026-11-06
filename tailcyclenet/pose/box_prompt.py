@@ -1,9 +1,14 @@
 """The DATA side of the box prompt: compute a per-frame animal box for the loader.
 
-The box is the target animal's crop-frame extent -- a NON-position channel, derived post hoc from
-the loader's own outputs by reusing THE crop rule. The encoder side lives in `query_encoder.py`.
-Its floor is deliberately below the crop rule's `min_crop_dim`: it is an occupancy description,
-not a crop target.
+The box is the target animal's TIGHT crop-frame box -- a NON-position channel: its own extent
+(the stored `instances.pq` box where the run's `box_source` is `instances` and one exists, else the
+keypoint extent), padded by `BOX_PROMPT_PAD` px and floored at `BOX_PROMPT_MIN_DIM` PER AXIS, never
+squared (`tight_prompt_box`, owner decision 2026-11-06). Deployment builds it from the detector's
+tight box with the same function (`infer.prior.deploy_box_prompt`), so train and deploy agree on
+one box. Runs trained before that recorded no `[data].box_prompt_geometry` and saw the SQUARE
+crop-rule box of the keypoint extent; they deploy on the tight box anyway (zero-shot tight on a
+square-trained model was inert, report 76 nonsq-crop). The encoder side lives in
+`query_encoder.py`.
 """
 from __future__ import annotations
 
@@ -11,19 +16,46 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-from ..data import crop as cropmod
-
 BOX_PROMPT_MIN_DIM = 32
 BOX_PROMPT_PAD = 10
 BOX_PROMPT_FRAMES = ('all', 'first')
+# What `[data].box_prompt_geometry` may say. Only 'tight' trains; an ABSENT key on a run folder
+# means 'square' (every run before 2026-11-06), read by `trained_geometry`.
+BOX_PROMPT_GEOMETRIES = ('tight',)
+
+
+def trained_geometry(config: dict) -> str:
+    """The prompt geometry a run TRAINED on: its `[data].box_prompt_geometry`, absent = 'square'."""
+    return str((config or {}).get('data', {}).get('box_prompt_geometry', 'square'))
+
+
+def tight_prompt_box(pts: torch.Tensor, size, min_dim: int = BOX_PROMPT_MIN_DIM,
+                     pad: float = BOX_PROMPT_PAD) -> torch.Tensor | None:
+    """THE prompt rule: (N,2) points (any finite subset; box corners or keypoints) -> float32
+    [x1, y1, x2, y2], or None when nothing is finite.
+
+    Per axis: the extent padded by `pad` on both sides, grown about its centre to `min_dim` when
+    shorter, then clamped to [0, size]. No squaring, no int rounding.
+    """
+    p = pts.reshape(-1, 2).to(torch.float32)
+    p = p[torch.isfinite(p).all(-1)]
+    if not p.shape[0]:
+        return None
+    lo, hi = p.min(0).values - float(pad), p.max(0).values + float(pad)
+    c, half = (lo + hi) / 2, torch.clamp((hi - lo) / 2, min=float(min_dim) / 2)
+    lim = torch.as_tensor(size, dtype=torch.float32).reshape(-1)[:2]
+    lo = torch.minimum(torch.clamp(c - half, min=0.0), lim)
+    hi = torch.minimum(torch.clamp(c + half, min=0.0), lim)
+    return torch.cat([lo, hi])
 
 
 def compute_box_prompt(coords: torch.Tensor, cgroup: list[dict], mode: str,
-                       min_dim: int = BOX_PROMPT_MIN_DIM, pad: int = BOX_PROMPT_PAD
-                       ) -> torch.Tensor:
+                       min_dim: int = BOX_PROMPT_MIN_DIM, pad: int = BOX_PROMPT_PAD,
+                       box_pts=None) -> torch.Tensor:
     """(T, C, 4) xyxy crop-pixel box around the target, one per (frame, camera); NaN where
     nothing was finite. `coords` is (T,K,2) crop pixels or (T,K,3) world mm through this window's
-    crop chain.
+    crop chain. `box_pts` -- optional per-camera (C, T, 4, 2) crop-pixel corners of the stored
+    instance box; a (camera, frame) with a finite one uses it instead of the keypoints.
     """
     is_2d = mode == '2d'
     if is_2d:
@@ -35,10 +67,14 @@ def compute_box_prompt(coords: torch.Tensor, cgroup: list[dict], mode: str,
     out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)
     for c in range(C):
         size = cgroup[c]['size']
+        bp = None if box_pts is None else box_pts[c]
         for t in range(T):
-            box = cropmod.crop_box_for_points(p2d[c, t], size, min_dim, pad)
+            src = p2d[c, t]
+            if bp is not None and torch.isfinite(bp[t]).all():
+                src = bp[t]
+            box = tight_prompt_box(src, size, min_dim, pad)
             if box is not None:
-                out[t, c] = box.to(torch.float32)
+                out[t, c] = box
     return out
 
 

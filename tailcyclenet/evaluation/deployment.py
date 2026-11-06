@@ -11,6 +11,7 @@ import numpy as np
 from ..detector.boxes import NMS_CENTER_DIST
 from ..detector.diagnostics import gt_crop_sides
 from ..infer.associate import associate_group
+from ..infer.crops import window_crop_box
 from ..infer.detect import detect_raw
 from ..infer.window import window_starts
 
@@ -38,14 +39,15 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
         window_miss    fraction of (row, window) with fewer than `min_box_frames` finite boxes
                        anywhere in the window -- the EXACT quantity `infer.run_group` marks
                        `no box`, using its own `window_starts` rule.
-        union_side_px  quantiles of each window's per-camera UNION box side (SOURCE px), the
+        union_side_px  quantiles of each window's per-camera crop side (SOURCE px): the crop rule
+                       on the union of its tight boxes (`infer.crops.window_crop_box`), the
                        crop-inflation number `--refine` exists to survive.
         gt_side_px     quantiles of the crop-RULE box side over this group's own labels, as an
                        UNPAIRED population comparison against `union_side_px`.
 
-    `box_source` is this session's root's effective box source (`detect_raw`'s argument; None =
-    the checkpoint's global one). Pass the per-root value deployment resolves, or a multi-root
-    `extent` detector is scored under another root's crop pad.
+    `box_source` is this session's root's effective box source (None = the checkpoint's global
+    one): it sets the union's crop pad. Pass the per-root value deployment resolves, or a
+    multi-root detector is scored under another root's crop pad.
 
     Returns a dict of floats/arrays; `n_gt` and `n_windows` say how much each rested on.
     """
@@ -54,7 +56,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     raw = detect_raw(model, input_wh, sess, gid, top_k=max(top_k, n_animals), device=device,
                      batch=batch, score_thresh=det_score, reduce=reduce, max_frames=max_frames,
                      tile_scale=tile_scale, iou_thresh=iou_thresh,
-                     center_dist_thresh=center_dist_thresh, box_source=box_source)
+                     center_dist_thresh=center_dist_thresh)
     r_box, r_sc = raw
     D, T, C = r_sc.shape
     det_fill = float(np.isfinite(r_sc[0]).mean()) if D else 0.0
@@ -64,6 +66,8 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     S, T, C = sc.shape
     slot_fill = float(np.isfinite(sc).mean())
 
+    src = box_source or getattr(model, 'box_source', 'keypoints')
+    pad_frac = 0.0 if src == 'instances' else float(getattr(model, 'crop_pad_frac', 0.05))
     starts = window_starts(T, n_frames, overlap)
     miss, union_sides = [], []
     for a in range(S):
@@ -74,11 +78,10 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
             miss.append(n_ok < min_box_frames)
             if n_ok:
                 for ci in range(C):
-                    v = bb[:, ci][np.isfinite(bb[:, ci]).all(-1)]
-                    if len(v):
-                        x0, y0 = v[:, 0].min(), v[:, 1].min()
-                        x1, y1 = v[:, 2].max(), v[:, 3].max()
-                        union_sides.append(0.5 * ((x1 - x0) + (y1 - y0)))
+                    ub = window_crop_box(bb[:, ci], sess.rig.size(sess.cam_names[ci]),
+                                         min_crop_dim, pad_frac)
+                    if ub is not None:
+                        union_sides.append(0.5 * float((ub[2] - ub[0]) + (ub[3] - ub[1])))
 
     gt_sides = gt_crop_sides(sess, gid, min_crop_dim, max_frames=max_frames)
     q = (0.5, 0.9, 0.99)

@@ -138,6 +138,24 @@ def prior_to_model_frame(p, mode, boxes, scales):
     return p
 
 
+def window_crop_box(v, size, min_crop_dim, pad_frac=0.0):
+    """THE deployment crop: (N,4) finite TIGHT boxes (one slot, one camera, one window) -> the
+    int32 crop-rule box of their union, or None when there are none.
+
+    The crop rule runs ONCE, on the union's corners: pad every side by `pad_frac` x the union's
+    longer side, square about the centre, floor at `min_crop_dim`, clamp -- exactly what training
+    does to the window's keypoints (or, `pad_frac = 0`, to its stored instance boxes). Per-frame
+    boxes are never squared first: a union of squares only grows (+3.06 mm when re-squared).
+    """
+    v = np.asarray(v, np.float64).reshape(-1, 4)
+    v = v[np.isfinite(v).all(-1)]
+    if not len(v):
+        return None
+    corners = torch.as_tensor(np.concatenate([v[:, :2], v[:, 2:]], 0), dtype=torch.float32)
+    return cropmod.crop_box_for_points(corners, torch.as_tensor(size).to(torch.float32),
+                                       min_crop_dim, 0.0, pad_frac)
+
+
 def union_box(v):
     """The xyxy union of a (T,4) per-frame box stack over its finite rows; NaN when none is."""
     v = np.asarray(v, np.float64)

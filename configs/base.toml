@@ -32,6 +32,7 @@ prompt_swap_animal = 0.05    # P(per keypoint) prior becomes the neighbour anima
 box_prompt_dropout = 0.3    # fraction of steps where the box prompt is zeroed (exposure-bias recipe)
 box_prompt_jitter = 0.1     # box centre jitter as a fraction of box side
 box_prompt_scale_jitter = 0.1 # box scale jitter as a fraction of box side
+box_prompt_geometry = "tight" # per-axis pad 10 / floor 32 around the instance box (box_source = instances) or keypoint extent, never squared; absent in a run folder = the retired square prompt (owner, 2026-11-06)
 # COUPLED to box_prompt_dropout: of the already-box-dropped items, the fraction that also get a genuinely clean pose prior instead of an independently pose-corrupted one (the coin is hoisted, not redrawn); code default stays 0.0 = bit-identical to every run on record. THE EVIDENCE CONFLICTS ACROSS SETTINGS and 0.2 is measured at NEITHER end: 0.5 is FAVOURABLE in 3D (3dpop Seq59, 64% fewer propagation switches at no accuracy cost, report 55 §6.3) but UNFAVOURABLE in 2D (the 2026-09-07 crim13 run carried it and read 12.499 px --anchor none vs 09-02's 9.791, and its carry penalty was amplified 32x -- exactly what raising prior-TRUST predicts -- though THREE keys moved together there, so only the 32x carry amplification fits this key specifically, report 57 §8.1c); 0.2 (2026-09-08) is an owner compromise that may also weaken the 3D gain -- sweep it before quoting either benefit.
 pose_only_prob = 0.2
 annot_frac = 0.6            # sampling weight for annotated vs tracked sessions

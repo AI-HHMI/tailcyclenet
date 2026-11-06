@@ -127,6 +127,9 @@ class View:
     rotation: list
     scale: list
     kpt_perm: torch.Tensor | None = None
+    # per camera, (T,4,2) stored instance-box corners in THIS view's crop pixels (None = no stored
+    # box; `box_source = 'instances'` only): what the tight box prompt bounds where finite
+    box_pts: list | None = None
 
 
 def _session_flip_permutation(sess):
@@ -764,6 +767,8 @@ class PoseDataset(Dataset):
             cam, scale = resize_camera(cam, self.cfg.image_size)
             scales = [scale]
             coords = coords * scale
+            box_pts = (None if cp is None else
+                       [(cp - box[:2].to(cp.dtype)) * scale.to(cp.dtype)])
             coords = mask_outside(coords, cam['size'])
             if vis_2d is not None:
                 vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
@@ -815,6 +820,9 @@ class PoseDataset(Dataset):
             resized = [resize_camera(c, self.cfg.image_size) for c in cgroup]
             cgroup = [c for c, _ in resized]
             scales = [s for _, s in resized]
+            box_pts = (None if cp3 is None else
+                       [(cp3[i] - boxes[i][:2].to(cp3[i].dtype)) * scales[i].to(cp3[i].dtype)
+                        for i in range(len(cgroup))])
             if self.train and world_gauge:
                 cgroup, coords, others_raw = rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
@@ -854,7 +862,7 @@ class PoseDataset(Dataset):
                     boxes=boxes, cam_names=cam_names, r=2 if true_2d else 3,
                     single_view=single_view, p2d=p2d,
                     neighbour_full=neighbour_full, rotation=rotation_info, scale=scales,
-                    kpt_perm=kpt_perm)
+                    kpt_perm=kpt_perm, box_pts=box_pts)
 
     def _targets(self, sel, view, rng):
         """Turn a realised `View` into the pose training targets and the item tuple.
@@ -901,7 +909,8 @@ class PoseDataset(Dataset):
                vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t]
         if self.cfg.box_prompt != 'none':
             from ..pose import box_prompt as bpmod
-            box = bpmod.compute_box_prompt(coords, cgroup, '2d' if R == 2 else '3d')
+            box = bpmod.compute_box_prompt(coords, cgroup, '2d' if R == 2 else '3d',
+                                           box_pts=view.box_pts)
             box = bpmod.apply_frames_mode(box, self.cfg.box_prompt_frames)
             if self.train:
                 dropped = (box_dropped_early if box_dropped_early is not None

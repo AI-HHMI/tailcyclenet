@@ -27,8 +27,8 @@ boxes_by_dataset = {}
 min_crop_dim = 32
 crop_pad_frac = 0.05
 
-# "extent" (shipped 2026-10-02, unmeasured): regress the TIGHT extent and apply the crop rule (source-px pad/square/floor, invisible after a letterbox) after detection -- same crop; "crop" = the legacy target.
-box_target = "extent"
+# "tight" (shipped; old name "extent"): regress the TIGHT box -- deployment squares only the window union; "square" (old name "crop") = the legacy crop-rule target, deployed on the pre-2026-11-06 path.
+box_target = "tight"
 
 # INTER_AREA shrinking in the letterbox/warp, train AND deployment (recorded in the checkpoint); false = bilinear, which aliases at a 4K rig's 4-6x downscale.
 antialias = true

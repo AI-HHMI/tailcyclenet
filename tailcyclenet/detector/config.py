@@ -264,9 +264,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['hflip'] = bool(data['hflip'])
     data['vflip'] = bool(data['vflip'])
     data['antialias'] = bool(data['antialias'])
-    data['box_target'] = str(data['box_target'])
-    if data['box_target'] not in ('crop', 'extent'):
-        raise SystemExit(f"[data].box_target must be 'crop' or 'extent', got "
+    from .dataset import BOX_TARGETS, canonical_box_target
+    data['box_target'] = canonical_box_target(data['box_target'], where='[data]')
+    if data['box_target'] not in BOX_TARGETS:
+        raise SystemExit(f"[data].box_target must be one of {BOX_TARGETS}, got "
                          f"{data['box_target']!r}.")
     data['grayscale_prob'] = float(data['grayscale_prob'])
     if not 0.0 <= data['grayscale_prob'] <= 1.0:

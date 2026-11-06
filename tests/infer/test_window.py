@@ -873,3 +873,19 @@ def test_refine_carry_fallback_scale_gate_keeps_a_box_less_camera_box_less(mv16,
                       _infer_cfg(anchor='carry', refine=True, refine_carry_fallback=True), **kw)
     assert (gated.pop('carry_crop') == 0).all()
     _assert_same(off, gated, ' (R4, scale gate)')
+
+
+def test_a_legacy_square_detector_keeps_the_raw_union(mv):
+    """A legacy `square` head (pre-2026-11-06 path): its square per-frame boxes' window union is
+    the crop as is, NOT re-squared (+3.06 mm when it was)."""
+    model, sess, registry, name = mv
+    C = len(sess.rig)
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    for t in range(4):
+        boxes[0, t, :] = [10 + t, 12, 14 + t, 16]
+    bf = _boxes_for(boxes)
+    bf.legacy_square = True
+    out = run_group(model, sess, 'g000', registry, name, _infer_cfg(anchor='none'), boxes_for=bf,
+                    n_rows=len(boxes))
+    for ci in range(C):
+        assert tuple(out['crop'][0, 0, ci]) == (10.0, 12.0, 17.0, 16.0)

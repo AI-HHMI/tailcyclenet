@@ -23,7 +23,7 @@ import torch
 
 
 from tailcyclenet.data.crop import crop_box_for_points, crop_boxes_from_extents
-from tailcyclenet.infer.detect import detect_raw
+from tailcyclenet.infer.detect import detect_raw, legacy_square_head
 from tailcyclenet.detector.checkpoint import load_detector
 from tailcyclenet.detector.boxes import NMS_CENTER_DIST, box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
@@ -175,7 +175,7 @@ def main():
                            trace=trace, trace_detail=True)
                 _src = detector_box_source(model, ds_name, box_source)
                 _pad = 0.0 if _src == 'instances' else float(getattr(model, 'crop_pad_frac', 0.05))
-                for record in trace:
+                for record in ([] if legacy_square_head(model) else trace):
                     _wh = sess.rig.size(record['camera'])
                     for stage in STAGES:
                         b = np.asarray(record[f'{stage}_boxes'], np.float32).reshape(-1, 4)

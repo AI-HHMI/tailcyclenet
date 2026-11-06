@@ -103,7 +103,7 @@ def _eval_dataset(args, model, wh, mcd, red):
     parts = [BoxDataset(args.data, split, input_wh=wh, box_source=args.boxes,
                         min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                         max_frames_per_group=args.frames_per_group,
-                        box_target=getattr(model, 'box_target', 'crop'),
+                        box_target=getattr(model, 'box_target', 'square'),
                         antialias=getattr(model, 'antialias', False),
                         input_norm=getattr(model, 'input_norm', 'none'))
              for split in args.split.split(',')]
@@ -255,9 +255,9 @@ def main():
             print(f'note: {args.compare} runs at {wh2[0]}x{wh2[1]} and --run at {wh[0]}x{wh[1]}. '
                   'Each is scored in its own letterbox; IoU is scale-invariant, so the columns '
                   'below are comparable.')
-        if getattr(m2, 'box_target', 'crop') != getattr(model, 'box_target', 'crop'):
-            print(f'note: {args.run} regresses {getattr(model, "box_target", "crop")!r} boxes and '
-                  f'{args.compare} {getattr(m2, "box_target", "crop")!r} ones; each is scored '
+        if getattr(m2, 'box_target', 'square') != getattr(model, 'box_target', 'square'):
+            print(f'note: {args.run} regresses {getattr(model, "box_target", "square")!r} boxes and '
+                  f'{args.compare} {getattr(m2, "box_target", "square")!r} ones; each is scored '
                   'against its own target, so IoU/r@.75 compare different boxes. Use --deploy '
                   '(crop-rule boxes for both) for a like-for-like comparison.')
         ds2 = _eval_dataset(args, m2, wh2, mcd2, red2)

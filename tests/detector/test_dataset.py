@@ -193,7 +193,7 @@ def test_extent_target_is_tight_and_gives_back_the_crop_rule(tiny_root):
     """The `extent` target is the points' own min/max (letterboxed), and the crop rule applied to
     it after unletterboxing -- what `detect_raw` does -- is the crop the `crop` target trains on."""
     kw = dict(input_wh=(128, 128), min_crop_dim=8, max_frames_per_group=2)
-    ext = BoxDataset(tiny_root / 'ratlike', 'train', box_target='extent', **kw)
+    ext = BoxDataset(tiny_root / 'ratlike', 'train', box_target='tight', **kw)
     crop = BoxDataset(tiny_root / 'ratlike', 'train', **kw)
     checked = 0
     for i in range(len(ext)):
@@ -254,7 +254,7 @@ def test_mosaic_paste_never_covers_the_items_own_boxes():
     from tailcyclenet.detector.dataset import _overlaps_any
 
     class Stub:
-        input_wh, box_target = (100, 100), 'crop'
+        input_wh, box_target = (100, 100), 'square'
         _mosaic_paste = BoxDataset._mosaic_paste
 
         def __len__(self):

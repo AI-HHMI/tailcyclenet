@@ -1,10 +1,10 @@
 """Box training data: labels -> a box target, letterboxed into the detector's input.
 
 The target is derived from the same points the pose loader crops on, so the detector reproduces
-the crop the pose model was trained on. Under `box_target='crop'` (legacy) it IS
-`tailcyclenet.crop.crop_box_for_points`; under `'extent'` (shipped) it is the tight extent and
-the crop rule -- whose pad and floor are SOURCE pixels, invisible after a letterbox -- is applied
-after detection (`detect_raw`), which yields the identical crop. An animal with no
+the crop the pose model was trained on. Under `box_target='square'` (legacy) it IS
+`tailcyclenet.crop.crop_box_for_points`; under `'tight'` (shipped) it is the tight extent and
+the crop rule -- whose pad and floor are SOURCE pixels, invisible after a letterbox -- is applied at
+deployment, once, to a window's union of the tight boxes (`infer.crops.window_crop_box`). An animal with no
 finite point in a view gets a NaN box, not a dropped frame -- objectness still has to learn "no
 animal here". `box_source='instances'` takes the extent from `instances.pq` instead, opt-in,
 for a dataset whose stored keypoints are too sparse to bound the animal.
@@ -32,13 +32,27 @@ from .letterbox import letterbox, letterbox_transform, reduce_factor, tile_trans
 from .sampling import IndexWeights
 
 
-# The smallest TIGHT-extent side (INPUT pixels) a `box_target = 'extent'` target is floored at,
+# The smallest TIGHT-extent side (INPUT pixels) a `box_target = 'tight'` target is floored at,
 # symmetrically about its centre. A one- or two-point extent is degenerate (zero area), and TAL
 # only takes anchors strictly inside a box; 8 px holds 2x2 stride-4 anchors. Resolution-free by
 # construction -- unlike `min_crop_dim`, which is SOURCE pixels and is applied after detection.
 MIN_EXTENT_PX = 8.0
 
-BOX_TARGETS = ('crop', 'extent')
+BOX_TARGETS = ('square', 'tight')
+# The pre-2026-11-06 names, READ (never written) at the config / checkpoint boundary.
+BOX_TARGET_ALIASES = {'crop': 'square', 'extent': 'tight'}
+
+
+def canonical_box_target(value, where=''):
+    """An old 'crop'/'extent' `box_target` -> its 'square'/'tight' name (one printed note when
+    `where` is given); a current name passes through."""
+    v = str(value)
+    if v in BOX_TARGET_ALIASES:
+        if where:
+            print(f'{where}: box_target {v!r} is read as {BOX_TARGET_ALIASES[v]!r} '
+                  '(renamed 2026-11-06: square / tight)', flush=True)
+        return BOX_TARGET_ALIASES[v]
+    return v
 
 
 def _drop_outside(x, bounds):
@@ -104,7 +118,7 @@ class BoxDataset(IndexWeights, Dataset):
                  augment=False, reduce=False, hflip=0.5, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
                  boxes_by_dataset=None, include_roots=None, datasets=None,
-                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0,
+                 box_target='square', antialias=False, grayscale_prob=0.0, vflip=0.0,
                  input_norm='none', scale_range=(0.8, 1.25), background_prob=0.0,
                  invert_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
@@ -122,7 +136,7 @@ class BoxDataset(IndexWeights, Dataset):
             tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
                 size; `tile_scale` is the source -> input scale and the only scale there is.
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
-            box_target -- 'crop' (legacy): `crop_box_for_points` itself. 'extent': the tight
+            box_target -- 'square' (legacy): `crop_box_for_points` itself. 'tight': the tight
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
             antialias / grayscale_prob / vflip -- area-filtered shrinking and the
                 train-augmentation probabilities.
@@ -529,7 +543,7 @@ class BoxDataset(IndexWeights, Dataset):
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
             if tile_box is not None:
                 src = drop_outside(src, tile_box)
-            if self.box_target == 'extent':
+            if self.box_target == 'tight':
                 box = _extent(src, cam['size'])
             else:
                 box = crop_box_for_points(src, cam['size'], self.min_crop_dim, 0.0, frac)
@@ -538,7 +552,7 @@ class BoxDataset(IndexWeights, Dataset):
         scale, pad = self._transform(i, cam['size'])
         boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
         boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
-        if self.box_target == 'extent':
+        if self.box_target == 'tight':
             boxes = _floor_extent(boxes, MIN_EXTENT_PX)
         return boxes
 
@@ -598,7 +612,7 @@ class BoxDataset(IndexWeights, Dataset):
             lim = torch.tensor([self.input_wh[0], self.input_wh[1]] * 2, dtype=src_boxes.dtype)
             b = torch.minimum(src_boxes[s].clamp(min=0), lim)
             region = b
-            if self.box_target == 'extent':
+            if self.box_target == 'tight':
                 m = 0.25 * float(0.5 * ((b[2] - b[0]) + (b[3] - b[1])))
                 region = torch.stack([(b[0] - m).clamp(min=0), (b[1] - m).clamp(min=0),
                                       (b[2] + m).clamp(max=self.input_wh[0]),

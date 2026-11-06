@@ -10,6 +10,14 @@ from ..detector.checkpoint import tiled_input_wh
 from ..detector.decode import decode
 
 
+def legacy_square_head(det):
+    """Is `det` a LEGACY `box_target = 'square'` (old name 'crop', or key-absent) checkpoint? Its boxes are the
+    square crop-rule box, so deployment keeps the pre-2026-11-06 path for it (owner): the crop is
+    the window union NOT re-squared (+3.06 mm when re-squared) and the box prompt is the square
+    crop-rule box of the detector box -- byte-identical to e6f4a4c."""
+    return getattr(det, 'box_target', 'square') != 'tight'
+
+
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
@@ -35,11 +43,11 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             `batch` stays the cursor unit, and a batch that fits is one forward (byte-identical).
     Outputs:
         (boxes (D,T,C,4), scores (D,T,C)): `d` is the d-th highest-scoring detection in that
-        camera at that frame (rows become animals in `associate_group`). The boxes are the
-        extent head's TIGHT boxes, unletterboxed into SOURCE px and never squared (owner,
-        2026-11-06: no square box prediction exists in the pipeline). The crop rule is applied
-        ONCE, to a window's union of them (`infer.crops.window_crop_box`); a legacy
-        `box_target = 'crop'` checkpoint regresses square boxes and is refused by name.
+        camera at that frame (rows become animals in `associate_group`). The boxes are the head's
+        own output unletterboxed into SOURCE px, never re-squared: TIGHT for a `tight` head (the
+        default since 2026-11-06; the crop rule runs once on a window's union,
+        `infer.crops.window_crop_box`), the square crop-rule box for a LEGACY `square` head
+        (`legacy_square_head`; the window loop then runs the pre-2026-11-06 path).
     Side effects:
         Decode runs one thread per camera (where the wall clock lives; the forward is serial).
         Cameras in flight are bounded, never `batch` -- a different batch is a different cuDNN
@@ -52,11 +60,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     from .. import memory as _memory
     from ..data.pixels import read_frames
     from ..detector.letterbox import letterbox, reduce_factor, unletterbox_boxes
-    if getattr(det, 'box_target', 'crop') != 'extent':
-        raise SystemExit(
-            f"detector box_target = {getattr(det, 'box_target', 'crop')!r}: a legacy 'crop' "
-            "checkpoint regresses the SQUARE crop-rule box, and deployment consumes only tight "
-            "boxes since 2026-11-06 (owner). Retrain with [data].box_target = 'extent' (shipped).")
     antialias = bool(getattr(det, 'antialias', False))
     input_norm = str(getattr(det, 'input_norm', 'none'))
     from ..detector.augment import normalize_input
@@ -259,7 +262,8 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
     once per group; leaving the cursor at 0 would decode every frame from 0 to `frame_start`
     into a store sized for the work.
 
-    Boxes are TIGHT (`detect_raw`); `boxes_for.box_source` names the pad the window union needs:
+    Boxes are TIGHT (`detect_raw`) unless `boxes_for.legacy_square` (a `square` head, the old path);
+    `boxes_for.box_source` names the pad the window union needs:
     an 'instances' detector's boxes are already the padded extent the pose run cropped on (pad
     0), a keypoint detector's get the run's `crop_pad_frac`.
     2D two-stage linking (`link_two_stage`) reads ranks past S, so detection keeps
@@ -336,4 +340,5 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
         return out
 
     boxes_for.box_source = box_source or getattr(det, 'box_source', 'keypoints')
+    boxes_for.legacy_square = legacy_square_head(det)
     return boxes_for

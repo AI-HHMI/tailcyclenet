@@ -427,6 +427,7 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     inflate_used = carry_cams = None
     pred2d = conf2d = None
     boxes_stc = None
+    legacy_square = bool(getattr(boxes_for, 'legacy_square', False))
     union_pad = (0.0 if (inst_boxes is not None and boxes_for is None) or
                  getattr(boxes_for, 'box_source', 'keypoints') == 'instances'
                  else cfg.crop_pad_frac)
@@ -453,7 +454,9 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         window's crop); with boxes, one box per camera is `window_crop_box` of the UNION of the
         window's TIGHT boxes (only the cameras that saw the row): the crop rule applied once,
         int32 and clamped. Stored (instances.pq) boxes and an 'instances' detector's are already
-        the padded extent (pad 0); a keypoint detector's union gets the run's `crop_pad_frac`. The camera must describe the box the
+        the padded extent (pad 0); a keypoint detector's union gets the run's `crop_pad_frac`.
+        A LEGACY `square` head's boxes are already square crop-rule boxes: their union is taken
+        as is, NOT re-squared (+3.06 mm when it was), the pre-2026-11-06 path. The camera must describe the box the
         pixels were cut with: `apply_crop` sets `size`, `resize_camera` makes it `scales`,
         and `forward` divides by that -- a mismatch scales every keypoint.
 
@@ -500,7 +503,14 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     if not len(v):
                         continue
                     w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
-                    box = window_crop_box(v, (w, h), cfg.min_crop_dim, union_pad)
+                    if legacy_square and boxes_stc is not None:
+                        x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
+                        y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
+                        x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
+                        y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
+                        box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
+                    else:
+                        box = window_crop_box(v, (w, h), cfg.min_crop_dim, union_pad)
                     if box is None:
                         continue
                     boxes.append(box)
@@ -654,10 +664,12 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                      '(--detector or --boxes); none were supplied.')
                 elif wi in corrupted:
                     box_t = deploy_box_prompt(mode, None, corrupted[wi], np.arange(len(frames)),
-                                              a, use, boxes, scales, cgroup, dev)
+                                              a, use, boxes, scales, cgroup, dev,
+                                              square=legacy_square)
                 else:
                     box_t = deploy_box_prompt(mode, None, boxes_stc, frames - f0,
-                                              a, use, boxes, scales, cgroup, dev)
+                                              a, use, boxes, scales, cgroup, dev,
+                                              square=legacy_square)
             if box_t is not None and prompt_off:
                 box_t = box_t.clone()
                 for i, ci in enumerate(use):

@@ -1,6 +1,6 @@
 """Box-predictor losses: objectness BCE + GIoU/CIoU over the assigned positives.
 
-The regression target is the crop rule's box (or, under `box_target = 'extent'`, the tight
+The regression target is the crop rule's box (or, under `box_target = 'tight'`, the tight
 extent the rule is applied to after detection), so the detector learns "reproduce the crop the
 pose model was trained on", not "find an animal"; only the first keeps downstream accuracy.
 """

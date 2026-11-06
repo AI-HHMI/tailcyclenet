@@ -13,8 +13,8 @@ deleted; v0.3.4 is the last release that builds or loads them (`config.DELETED_Y
 
 GroupNorm throughout, not BatchNorm -- see `conv_norm_act`. The detector reproduces the SAME crop
 box the pose pipeline uses (`tailcyclenet.data.crop.crop_box_for_points`): either by regressing it
-directly (`box_target = 'crop'`, legacy) or by regressing the tight extent the rule is a function
-of and applying the rule after detection (`'extent'`, shipped -- see `detector/dataset.py`).
+directly (`box_target = 'square'`, legacy) or by regressing the tight extent the rule is a function
+of and applying the rule after detection (`'tight'`, shipped -- see `detector/dataset.py`).
 """
 import torch
 import torch.nn as nn
@@ -199,9 +199,9 @@ class YOLOXNano(nn.Module):
     head/neck switches (`Head`/`PAFPN`).
     """
     STRIDES = (8, 16, 32)
-    # What the head regresses, for `infer.detect.detect_raw` (which deploys only 'extent'): the
-    # shipped recipe's value; `load_detector` overwrites it from the checkpoint (absent = 'crop').
-    box_target = 'extent'
+    # What the head regresses ('tight' | 'square'), read by `infer.detect.legacy_square_head`: the
+    # shipped recipe's value; `load_detector` overwrites it from the checkpoint (absent = 'square').
+    box_target = 'tight'
 
     def __init__(self, version='convnext-t', p2=False, shared_head=True, fpn_upsample='nearest'):
         """Build the box predictor for `version` (see the class docstring for arguments)."""

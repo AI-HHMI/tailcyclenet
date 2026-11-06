@@ -12,7 +12,7 @@ from ..detector.boxes import NMS_CENTER_DIST
 from ..detector.diagnostics import gt_crop_sides
 from ..infer.associate import associate_group
 from ..infer.crops import window_crop_box
-from ..infer.detect import detect_raw
+from ..infer.detect import detect_raw, legacy_square_head
 from ..infer.window import window_starts
 
 
@@ -40,7 +40,8 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                        anywhere in the window -- the EXACT quantity `infer.run_group` marks
                        `no box`, using its own `window_starts` rule.
         union_side_px  quantiles of each window's per-camera crop side (SOURCE px): the crop rule
-                       on the union of its tight boxes (`infer.crops.window_crop_box`), the
+                       on the union of its tight boxes (`infer.crops.window_crop_box`; a legacy
+                       `square` head's raw union of its square boxes), the
                        crop-inflation number `--refine` exists to survive.
         gt_side_px     quantiles of the crop-RULE box side over this group's own labels, as an
                        UNPAIRED population comparison against `union_side_px`.
@@ -66,6 +67,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     S, T, C = sc.shape
     slot_fill = float(np.isfinite(sc).mean())
 
+    legacy = legacy_square_head(model)
     src = box_source or getattr(model, 'box_source', 'keypoints')
     pad_frac = 0.0 if src == 'instances' else float(getattr(model, 'crop_pad_frac', 0.05))
     starts = window_starts(T, n_frames, overlap)
@@ -78,8 +80,13 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
             miss.append(n_ok < min_box_frames)
             if n_ok:
                 for ci in range(C):
-                    ub = window_crop_box(bb[:, ci], sess.rig.size(sess.cam_names[ci]),
-                                         min_crop_dim, pad_frac)
+                    if legacy:
+                        v = bb[:, ci][np.isfinite(bb[:, ci]).all(-1)]
+                        ub = None if not len(v) else (v[:, 0].min(), v[:, 1].min(),
+                                                      v[:, 2].max(), v[:, 3].max())
+                    else:
+                        ub = window_crop_box(bb[:, ci], sess.rig.size(sess.cam_names[ci]),
+                                             min_crop_dim, pad_frac)
                     if ub is not None:
                         union_sides.append(0.5 * float((ub[2] - ub[0]) + (ub[3] - ub[1])))
 

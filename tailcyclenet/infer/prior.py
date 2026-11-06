@@ -23,7 +23,8 @@ def give_box_this_window(cfg, carried_a, prior):
             and (not cfg.box_prompt_first_only or carried_a is None or prior is None))
 
 
-def deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, cgroup, dev):
+def deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, cgroup, dev,
+                      square=False):
     """The box-prompt tensor for one animal's window, per camera, 2D or 3D: (1,T,C,4) in crop
     pixels, C = len(use) -- column order matches cgroup/views/use.
 
@@ -35,7 +36,8 @@ def deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, c
     crop frame and bounded there. A camera absent from `use` is absent from the output too
     (never a NaN at the wrong index). The geometry is tight whatever the run trained on: a
     square-trained run (no `[data].box_prompt_geometry`) read the tight prompt as inert
-    (report 76 nonsq-crop, -0.03 px).
+    (report 76 nonsq-crop, -0.03 px). `square` -- a LEGACY `square` detector's path: the square
+    crop-rule box (`crop_box_for_points`, pad 10, floor 32) instead, byte-identical to before.
     """
     from ..pose import box_prompt as bpmod
 
@@ -58,9 +60,11 @@ def deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, c
         cf = (source - origin) * torch.as_tensor(scales[i], dtype=source.dtype)
         size = cgroup[i]['size']
         for t in range(T):
-            bx = bpmod.tight_prompt_box(cf[t], size)
+            bx = (cropmod.crop_box_for_points(cf[t], size, bpmod.BOX_PROMPT_MIN_DIM,
+                                              bpmod.BOX_PROMPT_PAD) if square else
+                  bpmod.tight_prompt_box(cf[t], size))
             if bx is not None:
-                out[t, i] = bx
+                out[t, i] = bx.to(torch.float32)
     return out[None].to(dev)
 
 

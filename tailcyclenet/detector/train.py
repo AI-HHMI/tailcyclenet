@@ -52,7 +52,7 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416,
     if min_box_px <= 0:
         return base
     ds = BoxDataset(path, 'train', input_wh=base, box_source=box_source,
-                    max_frames_per_group=4, datasets=datasets, box_target='crop')
+                    max_frames_per_group=4, datasets=datasets, box_target='square')
     ix = np.random.default_rng(0).choice(len(ds), min(300, len(ds)), replace=False)
     sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
                        for b in (ds.boxes_for(int(i)) for i in ix)])
@@ -98,7 +98,7 @@ def input_wh_for_roots(roots, box_source, boxes_by_dataset=None, min_box_px=32,
         root_boxes = {ds.name: by[ds.name]} if ds.name in by else {}
         sampled = BoxDataset(ds.root, 'train', input_wh=base, box_source=box_source,
                              boxes_by_dataset=root_boxes, max_frames_per_group=4,
-                             datasets=[ds], box_target='crop')
+                             datasets=[ds], box_target='square')
         ix = np.random.default_rng(0).choice(len(sampled), min(300, len(sampled)), replace=False)
         sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
                            for b in (sampled.boxes_for(int(i)) for i in ix)])

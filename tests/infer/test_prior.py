@@ -247,3 +247,20 @@ def test_box_corrupt_spec_is_parsed_strictly():
     for bad in ('blur:0.1', 'shift:0.2', 'drop:1.5', 'shrink:0.2:1.5', 'swap:0.1:2'):
         with pytest.raises(ValueError):
             parse_box_corrupt(bad)
+
+
+def test_the_legacy_square_prompt_is_the_old_crop_rule_box():
+    """`square=True` (a legacy `square` detector) is the pre-2026-11-06 prompt: the crop rule
+    (pad 10, floor 32) on the detector box's corners in crop pixels."""
+    from tailcyclenet.data import crop as cropmod
+    from tailcyclenet.infer.prior import deploy_box_prompt
+    from tailcyclenet.pose import box_prompt as bpmod
+
+    cg = [dict(size=torch.tensor([128, 128], dtype=torch.int32))]
+    boxes_stc = np.array([[[[40., 50., 90., 70.]]]], np.float32)        # (S, T, C, 4)
+    origin, scale = torch.tensor([20, 30, 148, 158]), torch.tensor([1.0, 1.0])
+    got = deploy_box_prompt('2d', None, boxes_stc, np.arange(1), 0, [0], [origin], [scale], cg,
+                            'cpu', square=True)[0, 0, 0]
+    cf = cropmod.box_corners(torch.tensor([40., 50., 90., 70.])) - torch.tensor([20., 30.])
+    want = cropmod.crop_box_for_points(cf, cg[0]['size'], bpmod.BOX_PROMPT_MIN_DIM, bpmod.BOX_PROMPT_PAD)
+    assert torch.equal(got, want.to(torch.float32)) and got[2] - got[0] == got[3] - got[1]

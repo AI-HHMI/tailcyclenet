@@ -36,7 +36,7 @@ def _saved_detector(tmp_path, **meta):
     from tailcyclenet.detector.yolox import YOLOXNano
     path = tmp_path / 'det.pth'
     torch.save({'kind': 'detector', 'input_wh': [64, 64], 'norm': 'gn', 'yolox_version': 'hybrid',
-                'box_target': 'extent', 'model_state': YOLOXNano(version='hybrid').state_dict(), **meta},
+                'box_target': 'tight', 'model_state': YOLOXNano(version='hybrid').state_dict(), **meta},
                path)
     return path
 

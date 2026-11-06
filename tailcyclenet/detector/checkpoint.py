@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from .dataset import canonical_box_target
 from .yolox import YOLOXNano
 from ..data.crop import crop_rule
 
@@ -97,7 +98,8 @@ def load_detector(path, device='cpu', checkpoint='latest'):
     Absent `norm` means BatchNorm, which is refused (the model is GroupNorm). `tile_scale` is
     meaningless without `tile_wh`, so it is dropped (untiled runs record 1.0).
     `box_target`/`antialias`/`input_norm` (what the head regresses, how its input was resampled
-    and normalised) ride on the model for `detect_raw`; absent = crop-rule boxes, bilinear
+    and normalised) ride on the model for `detect_raw`; absent = 'square' (crop-rule boxes; an old 'crop' /
+    'extent' reads as 'square' / 'tight'), bilinear
     shrinking, no normalisation.
     """
     p = resolve_detector_checkpoint(path, checkpoint=checkpoint)
@@ -141,7 +143,7 @@ def load_detector(path, device='cpu', checkpoint='latest'):
         trained_datasets = [ckpt.get('dataset', '')] if ckpt.get('dataset') else []
     model.trained_datasets = [str(name) for name in trained_datasets]
     model.box_sources = {str(k): str(v) for k, v in (ckpt.get('box_sources') or {}).items()}
-    model.box_target = str(ckpt.get('box_target', 'crop'))
+    model.box_target = canonical_box_target(ckpt.get('box_target', 'square'))
     model.antialias = bool(ckpt.get('antialias', False))
     model.input_norm = str(ckpt.get('input_norm', 'none'))
     pad_frac, mcd = crop_rule(ckpt)

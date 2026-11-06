@@ -200,6 +200,11 @@ def load_deploy_detector(args, device, ds_name, cfg):
                   f'q90 {det_objq.get("q90", float("nan")):.4f}. This detector is NOT saturated; '
                   'sweep --det-score per checkpoint (the 0.01 default favours recall; raising '
                   'it was measured to cost coverage).', flush=True)
+        from .detect import legacy_square_head
+        if legacy_square_head(det):
+            print('detector: LEGACY box_target = square head -- square per-frame boxes, crop = their '
+                  'window union (not re-squared), square box prompt (the pre-2026-11-06 path); a '
+                  'tight head gets the tight default', flush=True)
         trained_datasets = list(getattr(det, 'trained_datasets', []) or ([det_ds] if det_ds else []))
         det_boxsrc = detector_box_source(det, ds_name, det_boxsrc)
         trained_label = (trained_datasets[0] if len(trained_datasets) == 1 else

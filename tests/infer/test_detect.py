@@ -75,30 +75,51 @@ def det_scene(tmp_path_factory):
     return YOLOXNano(version='hybrid').eval(), sess, next(iter(sess.groups))
 
 
-def test_detect_raw_returns_tight_boxes_and_refuses_a_crop_head(det_scene):
-    """An `extent` head's boxes leave `detect_raw` TIGHT -- unletterboxed source pixels, never
-    squared (no square per-frame box exists, owner 2026-11-06); a legacy `crop` head is refused."""
-    import pytest
-
-    from tailcyclenet.infer.detect import detect_raw
+def test_detect_raw_returns_the_heads_own_boxes_for_either_target(det_scene):
+    """`detect_raw` never re-squares: a `tight` head's boxes and a legacy `square` head's leave
+    it as the same unletterboxed source-pixel boxes (the target only picks the window path)."""
+    from tailcyclenet.infer.detect import detect_raw, legacy_square_head
 
     det, sess, gid = det_scene
-    det.box_target = 'crop'
-    try:
-        with pytest.raises(SystemExit, match="'crop'"):
-            detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0)
-    finally:
-        det.box_target = 'extent'
+    assert det.box_target == 'tight' and not legacy_square_head(det)
     got, sc = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0)
+    det.box_target = 'square'
+    try:
+        assert legacy_square_head(det)
+        sq, sc2 = detect_raw(det, (64, 64), sess, gid, 3, device='cpu', batch=4, score_thresh=0.0)
+    finally:
+        det.box_target = 'tight'
+    assert np.array_equal(got, sq, equal_nan=True) and np.array_equal(sc, sc2, equal_nan=True)
     ok = np.isfinite(got).all(-1)
     assert ok.any() and np.array_equal(ok, np.isfinite(sc))
-    wh = got[..., 2:] - got[..., :2]
-    assert (wh[ok] > 0).all()
     for ci, cam in enumerate(sess.cam_names):
         W, H = sess.rig.size(cam)
         b = got[:, :, ci][ok[:, :, ci]]
+        assert (b[:, 2:] > b[:, :2]).all()
         assert (b[:, [0, 2]] >= 0).all() and (b[:, [0, 2]] <= W).all()
         assert (b[:, [1, 3]] >= 0).all() and (b[:, [1, 3]] <= H).all()
+
+
+def test_old_box_target_names_read_as_square_and_tight(tmp_path, capsys):
+    """'crop' / 'extent' (or absent) are READ as 'square' / 'tight' at the config and checkpoint
+    boundary, with a one-line note for a config; nothing raises."""
+    import torch
+
+    from tailcyclenet.detector.checkpoint import load_detector
+    from tailcyclenet.detector.dataset import canonical_box_target
+    from tests.helpers import _detector_checkpoint
+
+    assert canonical_box_target('extent', where='[data]') == 'tight'
+    assert 'read as' in capsys.readouterr().out
+    assert canonical_box_target('crop') == 'square' and canonical_box_target('tight') == 'tight'
+    for old, new in (('crop', 'square'), ('extent', 'tight'), (None, 'square')):
+        ck = _detector_checkpoint()
+        if old is None:
+            ck.pop('box_target')
+        else:
+            ck['box_target'] = old
+        torch.save(ck, tmp_path / 'd.pth')
+        assert load_detector(tmp_path / 'd.pth', 'cpu').model.box_target == new
 
 
 def test_det_chunk_is_the_batch_for_small_inputs_and_splits_large_ones():

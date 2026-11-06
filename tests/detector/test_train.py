@@ -200,7 +200,7 @@ warmup_steps = 0
     mod.main()
     ckpt = torch.load(out / 'detector_it000002.pth', map_location='cpu', weights_only=False)
     assert ckpt['model_state_is'] == 'eval' and 'model_state_train' in ckpt
-    assert ckpt['box_target'] == 'extent' and ckpt['antialias'] is True
+    assert ckpt['box_target'] == 'tight' and ckpt['antialias'] is True
     scored = seen[-1]
     for n, t in ckpt['model_state'].items():
         assert torch.equal(t, scored[n]), f'{n}: the checkpoint is not the scored weight'
@@ -209,7 +209,7 @@ warmup_steps = 0
 
     from tailcyclenet.detector.checkpoint import load_detector
     det = load_detector(out, checkpoint='detector_it000002.pth').model
-    assert det.box_target == 'extent' and det.antialias and det.min_crop_dim == 16
+    assert det.box_target == 'tight' and det.antialias and det.min_crop_dim == 16
 
 
 def _config(tmp_path, root, out):

@@ -225,9 +225,9 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
     if box_on:
         from ..pose.box_prompt import BOX_PROMPT_MIN_DIM, BOX_PROMPT_PAD, trained_geometry
-        print(f'box prompt geometry: deployed TIGHT (per-axis pad {BOX_PROMPT_PAD} px, floor '
-              f'{BOX_PROMPT_MIN_DIM} px, crop px); this run trained '
-              f'{trained_geometry(config).upper()}')
+        print(f'box prompt geometry: this run trained {trained_geometry(config).upper()}; deployed '
+              f'TIGHT (per-axis pad {BOX_PROMPT_PAD} px, floor {BOX_PROMPT_MIN_DIM} px, crop px) '
+              'from a tight detector, SQUARE from a legacy square one')
         print(f'box deployment recipe: --box-prompt {box_prompt} '
               f'--crop-inflate {crop_inflate} --refine{"" if refine else " off"} '
               f'--refine-px {refine_px}')

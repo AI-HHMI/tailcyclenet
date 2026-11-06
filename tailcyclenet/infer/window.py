@@ -428,6 +428,7 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     pred2d = conf2d = None
     boxes_stc = None
     legacy_square = bool(getattr(boxes_for, 'legacy_square', False))
+    square_kw = {'square': True} if legacy_square else {}
     union_pad = (0.0 if (inst_boxes is not None and boxes_for is None) or
                  getattr(boxes_for, 'box_source', 'keypoints') == 'instances'
                  else cfg.crop_pad_frac)
@@ -665,11 +666,11 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 elif wi in corrupted:
                     box_t = deploy_box_prompt(mode, None, corrupted[wi], np.arange(len(frames)),
                                               a, use, boxes, scales, cgroup, dev,
-                                              square=legacy_square)
+                                              **square_kw)
                 else:
                     box_t = deploy_box_prompt(mode, None, boxes_stc, frames - f0,
                                               a, use, boxes, scales, cgroup, dev,
-                                              square=legacy_square)
+                                              **square_kw)
             if box_t is not None and prompt_off:
                 box_t = box_t.clone()
                 for i, ci in enumerate(use):

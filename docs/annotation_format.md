@@ -146,8 +146,6 @@ fps is declared per group (§6).
   Row counts *correlate* with it — annotated sessions are usually sparse and tracked ones dense —
   but they are not the same claim, and a densely-annotated clip is legal and would declare
   `"annotated"`. A consumer that needs volume should measure volume.
-- `assoc_res_max_px` (optional, default `30.0`) is the reprojection-residual gate used by
-  validation rule 12. Rigs with high-resolution sensors need a looser value.
 
 ## 5. `calibration.toml`
 
@@ -426,7 +424,7 @@ warn.
 `animal_id` is a **cross-view identity**: the same string in two cameras is the same physical
 animal. That is what makes triangulation possible without a separate association step, and it is
 checkable — a validator reprojects a triangulated instance and flags ids whose median residual
-exceeds `assoc_res_max_px` (rule 12).
+exceeds the validator's threshold (rule 12).
 
 ## 10. `extrinsics.pq` — moving cameras (optional)
 
@@ -491,7 +489,7 @@ Checkable rules, so a validator can be written without re-deriving them.
     legal. Prediction sessions (§8b) are exempt: their `instances.pq` may carry a `labeled` row
     with a null box where no detector box was available.
 12. `mode = "3d"` with per-camera annotation 2D: every `animal_id` with ≥ 2 `labeled` views
-    triangulates with median reprojection residual below `assoc_res_max_px`. Catches cross-view id
+    triangulates with median reprojection residual below the validator's threshold (30 px). Catches cross-view id
     mismatches. This rule does not compare prediction-only `points2d.pq` against `points3d.pq`.
 13. Every camera in `extrinsics.pq` has `moving = true`, and covers every frame of every group in
     which it appears.

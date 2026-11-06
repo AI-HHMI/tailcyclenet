@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ..checkpoints import provenance
 from ..detector.boxes import NMS_CENTER_DIST
+from . import ovc as _ovc
 
 
 def _center_dist(args) -> float:
@@ -128,6 +129,8 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
             'checkpoint_name': ckpt.name,
             'anchor': cfg.anchor, 'carry_source': cfg.carry_source,
             'window_predictions': bool(args.window_predictions),
+            'ovc': bool(cfg.ovc and cfg.overlap),
+            'ovc_lam': _ovc.LAM, 'ovc_cut': _ovc.CUT, 'ovc_lookahead': _ovc.LOOKAHEAD,
             'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
             'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
             'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,

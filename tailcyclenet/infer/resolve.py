@@ -242,6 +242,7 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         crop_inflate=crop_inflate,
         prefetch_windows=args.prefetch_windows,
         capture_window_predictions=bool(args.window_predictions),
+        ovc=bool(getattr(args, 'ovc', True)),
         refine_all_cams=bool(args.refine_all_cams),
         box_corrupt=args.box_corrupt or None,
         refine_consensus=bool(args.refine_consensus),

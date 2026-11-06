@@ -131,6 +131,10 @@ class InferConfig:
     prefetch_windows: int = 1
     # Retain block-local long-form pre-gate records for the optional window sidecar.
     capture_window_predictions: bool = False
+    # OVC (`infer/ovc.py`): solve per-(slot, keypoint) window offsets from the overlap disagreement
+    # and add them to every row a window wrote; blocks are held until their last window has
+    # `ovc.LOOKAHEAD` successors. False is the plain seam rule.
+    ovc: bool = False
     # TR1 (3D, --refine): pass 2 re-crops EVERY calibrated camera from pass 1's pose, with a
     # per-camera overlap test (a camera whose refined box misses its pass-1 box is dropped; a
     # camera with no pass-1 box is added when the pose reprojects into its frame). False is the
@@ -319,6 +323,19 @@ def vis_gate(v2, vlogit, thresh):
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
                scorer=None, shared_scene_encoder=False):
+    """`_run_blocks`, with the OVC seam fix applied to its blocks when `cfg.ovc` (`infer/ovc.py`)."""
+    gen = _run_blocks(model, session, gid, registry, dataset_name, cfg, box_points, boxes_for,
+                      n_rows, stats, scorer=scorer, shared_scene_encoder=shared_scene_encoder)
+    if not (cfg.ovc and cfg.overlap):
+        yield from gen
+        return
+    from . import ovc as _ovc
+    yield from _ovc.stream(gen, stats)
+
+
+def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
+                cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
+                scorer=None, shared_scene_encoder=False):
     """Predict every animal in one group, a block of windows at a time. Yields one dict per block.
 
     Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, not
@@ -391,6 +408,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    for a in range(S)])
 
     carried = [None] * S
+    ovc_chains = ovc_tail = ovc_src = None
+    if cfg.ovc and cfg.overlap:
+        from . import ovc as _ovc
+        ovc_chains, ovc_tail = _ovc.Chains(), {}
+        ovc_stride = cfg.n_frames - cfg.overlap
     window_records = []
     box_specs = parse_box_corrupt(cfg.box_corrupt) if cfg.box_corrupt else ()
     corrupted = {}
@@ -921,6 +943,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if got is None:
                 continue
             p, q, out, p2, v2, c2, quality_window, precision_window = got
+            p_raw = p
             outcome[a, wi - w0] = OUTCOMES.index('ok')
             if quality_window is not None:
                 quality[a, frames - f0] = quality_window
@@ -1046,6 +1069,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                             model_conf2d[a, off, ci] = np.nan
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
                 capture_overlap_agreement(stats, a, frames, f0, pred, p)
+            if ovc_chains is not None:
+                prev = ovc_tail.pop(a, None)
+                D = (_ovc.seam_offset(prev[1], p_raw[:cfg.overlap])
+                     if (prev is not None and prev[0] == wi - 1 and wi > 0
+                         and int(starts[wi]) - int(starts[wi - 1]) == ovc_stride
+                         and len(p_raw) >= cfg.overlap) else None)
+                ovc_chains.observe(a, wi, D)
+                if len(p_raw) >= ovc_stride + cfg.overlap:
+                    ovc_tail[a] = (wi, p_raw[ovc_stride:ovc_stride + cfg.overlap].copy())
+                ovc_src[a, frames - f0] = wi
             pred[a, frames - f0] = p
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]))
@@ -1114,6 +1147,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 det_score[...] = _scores
 
             owner_window = np.full(n_blk, -1, np.int32)
+            if ovc_chains is not None:
+                ovc_src = np.full((S, n_blk), -1, np.int32)
             triangulated = np.full((S, n_blk, K, 3), np.nan, np.float32)
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
             quality = (np.full((S, n_blk, K), np.nan, np.float32) if scorer is not None else None)
@@ -1196,7 +1231,10 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    **({} if inflate_used is None else {'crop_inflate_used': inflate_used}),
                    **({} if carry_cams is None else {'carry_crop': carry_cams}),
                    **({} if box_cams is None else {'box_prompt_cams': box_cams}),
-                   'boxes_from': _boxes_from}
+                   'boxes_from': _boxes_from,
+                   **({} if ovc_chains is None else {'ovc_src': ovc_src[:, :keep],
+                                                     'ovc_chains': ovc_chains,
+                                                     'ovc_upto': w1 - 1})}
     finally:
         if _det_pool is not None:
             _det_pool.shutdown(wait=True)

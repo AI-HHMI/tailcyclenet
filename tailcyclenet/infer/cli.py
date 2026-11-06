@@ -365,6 +365,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help='DIAGNOSTIC: reject each cross-view group that passes the gates with '
                           'probability P (seed 0): the rate-matched random control for a gating '
                           'lever (eval rule 14). Never a deployment arm.')
+    win.add_argument('--ovc', action=argparse.BooleanOptionalAction, default=True,
+                     help='the seam fix (report 76 seam-jitter): per-(slot, keypoint) window offsets '
+                          'solved from the overlap disagreement (lam 1, cut 0.25 body, 2-window '
+                          'look-ahead; infer/ovc.py). --no-ovc restores the plain seam rule.')
     adv.add_argument('--window-predictions', action='store_true',
                      help='write every window\'s pre-gate predictions to '
                           '<out>/window_predictions.pq')

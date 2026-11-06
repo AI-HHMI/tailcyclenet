@@ -29,20 +29,20 @@ def _boxes_at(cg, points, half=20.0, shift=None):
 def test_body_residual_is_a_world_distance_over_body_size():
     """Known geometry: cameras 900 units from the origin with f = 800 px, so a d-px centre offset in one view
     moves that view's ray ~d * 900 / 800 world units off the point. At body_size 1000 and the default gate
-    0.15 (150 world units), an 80-unit offset still joins the group and a 250-unit one does not -- both far
+    0.20 (200 world units), an 80-unit offset still joins the group and a 400-unit one does not -- both far
     beyond what the legacy 30 px gate would admit."""
     from tailcyclenet.infer.associate import ASSOC_RES_MAX_BODY, associate
 
-    assert ASSOC_RES_MAX_BODY == 0.15
+    assert ASSOC_RES_MAX_BODY == 0.20
     cg = _flat_rig()
     origin = [[0.0, 0.0, 0.0]]
-    for world_off, joins in ((80.0, True), (250.0, False)):
+    for world_off, joins in ((80.0, True), (400.0, False)):
         px = world_off * 800.0 / 900.0
         boxes = _boxes_at(cg, origin, shift={2: (px, 0.0)})
         g = associate(cg, boxes, max_res_body=ASSOC_RES_MAX_BODY, body_size=1000.0)
         assert len(g) == 1 and set(g[0]['boxes']) >= {0, 1}
         assert (2 in g[0]['boxes']) == joins, (world_off, sorted(g[0]['boxes']))
-        assert g[0]['residual'] <= 0.15 * 1000.0, 'the refit passed the same world-unit gate'
+        assert g[0]['residual'] <= ASSOC_RES_MAX_BODY * 1000.0, 'the refit passed the same world-unit gate'
         # the legacy pixel gate on the same boxes admits no third view at 30 px
         gp = associate(cg, boxes, max_res_px=30.0)
         assert 2 not in gp[0]['boxes']
@@ -97,7 +97,7 @@ def test_gate_is_the_cli_value_else_the_default():
     from tailcyclenet.infer.body import resolve_assoc_gate
 
     g = resolve_assoc_gate(argparse.Namespace(assoc_res_max_body=None))
-    assert g == dict(mode='body', body=0.15, why='default')
+    assert g == dict(mode='body', body=0.20, why='default')
     g = resolve_assoc_gate(argparse.Namespace(assoc_res_max_body=0.2))
     assert (g['mode'], g['body'], g['why']) == ('body', 0.2, '--assoc-res-max-body')
 
@@ -166,7 +166,7 @@ def test_first_pass_body_estimator_on_a_tiny_fixture():
                              200, 212)
     assert (a.frame_start, a.frame_stop, a.max_frames) == (200, 212, 0)
     assert (c.frame_start, c.frame_stop, c.anchor) == (200, 212, 'none')
-    assert a._assoc_gate == dict(mode='body', body=0.15, why='first pass (provisional body)')
+    assert a._assoc_gate['mode'] == 'body' and a._assoc_gate['body'] == pytest.approx(2 * 0.20), 'loose: 2x the gate'
     assert a._body_size is None, 'the first pass bootstraps its body size from the detections'
 
 

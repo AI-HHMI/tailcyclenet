@@ -1,19 +1,24 @@
 """The cross-view association gate (body units) and the body size that scales it.
 
 Association gates every residual as a WORLD distance divided by the body size, at `--assoc-res-max-body` (default
-`ASSOC_RES_MAX_BODY` = 0.15; report 76, '### detr3d-diag'). No pixel gate is used anywhere.
+`ASSOC_RES_MAX_BODY` = 0.20; report 76, '### detr3d-diag'). No pixel gate is used anywhere.
 
 The body size is `--body-length` (world units, the calibration's) when given; otherwise a label-free estimate from
 `FIRST_PASS_WINDOWS` sparse pose windows spread evenly over the run's OWN frame range ([start, stop) after
 --start-frame / --end-frame / --max-frames; never outside it), with no prior, its association gated in body units
 at a PROVISIONAL body size from the detections alone (`associate.provisional_body_size`: box diagonal x depth /
-focal over scale-free mutual-nearest pairs; x0.94-x1.36 of GT, inside the gate's flat band): the median over (row,
+focal over scale-free mutual-nearest pairs; x0.94-x1.36 of GT): the median over (row,
 frame) of the predicted 3D extent diagonal. A range that holds no more than that many windows is used whole. No
 finite pose -> the provisional (detection) body size, warned; nothing at all -> refused (pass --body-length).
-Measured against the GT extent (offline, from full 30 px deploys; nopri): 4 windows land within 4.5% on CMU Panoptic
-a1 / b1, 3dpop Seq59 / Seq29 and social-dannce soc3, 8.4% on social-dannce soc1 (6.4% with every frame); the gate
-is flat over +-20-30% body error. A pose-free box-diagonal x depth / focal estimate was 3-28% off (pigeons), so
-it is not used.
+The first pass associates at `FIRST_PASS_GATE_FACTOR` (2) x the run's gate: it only has to measure size, and at 1x
+a provisional body that is already low (x0.88 on social-dannce soc1_2022_09_23_M1_M6) mis-associated two rats in
+contact into compressed poses (178 mm vs GT 229 mm on the same frames; 2x reads 208 mm; 3-8x saturate there).
+Measured (2026-11-06, 2x) against the GT median extent DIAGONAL on the first-pass frames, matched to the same labelled
+keypoints: within 6.7% on every session of social-dannce test (15), 3dpop test (58), CMU Panoptic a1 / b1 /
+fresh2016 (4) and allen-mouse-tracked val; the raw GT diagonal reads up to 23% lower on social-dannce / allen
+because their GT rows label only some keypoints. The gate is NOT flat over +-20-30% body error in contact: at
+0.15 that clip held only within -3% of GT; at the 0.20 default it survives -10%. A pose-free box-diagonal x
+depth / focal estimate was 3-28% off (pigeons), so it is only the bootstrap.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ import numpy as np
 from .associate import ASSOC_RES_MAX_BODY
 
 FIRST_PASS_WINDOWS = 4
+FIRST_PASS_GATE_FACTOR = 2.0
 
 
 def resolve_assoc_gate(args):
@@ -70,12 +76,14 @@ def run_range(cfg, n_frames):
 
 def first_pass_config(args, cfg, start, stop):
     """The (args, cfg) of one first-pass segment [start, stop): the body gate at the run's value with the
-    PROVISIONAL body size (`_body_size = None` -> `associate_group` bootstraps it from the detections), no prior
+    PROVISIONAL body size (`_body_size = None` -> `associate_group` bootstraps it from the detections) and
+    `FIRST_PASS_GATE_FACTOR` x the run's gate (it only measures size), no prior
     (`anchor = 'none'`), everything else as the run."""
     a = copy.copy(args)
     a.frame_start, a.frame_stop, a.max_frames = int(start), int(stop), 0
     gate = getattr(args, '_assoc_gate', None) or resolve_assoc_gate(args)
-    a._assoc_gate = dict(mode='body', body=float(gate['body']), why='first pass (provisional body)')
+    a._assoc_gate = dict(mode='body', body=FIRST_PASS_GATE_FACTOR * float(gate['body']),
+                         why=f'first pass (provisional body, {FIRST_PASS_GATE_FACTOR:g}x the gate)')
     a._body_size = None
     c = dataclasses.replace(cfg, frame_start=int(start), frame_stop=int(stop), max_frames=0, anchor='none')
     return a, c

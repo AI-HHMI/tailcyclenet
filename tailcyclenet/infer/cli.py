@@ -283,10 +283,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help='in-band frames before the 3D --track backstop resolves a duplicate.')
     ident.add_argument('--assoc-res-max-body', type=float, default=None,
                        help='the cross-view association gate in BODY units: every residual is a world '
-                            'point-to-ray / ray-ray distance divided by the body size. Default: 0.15 '
-                            '(owner decision 2026-11-05; report 76 detr3d-diag: CMU Panoptic MOTA 0.653 '
-                            '-> 1.000 vs the old 30 px gate, 3dpop Seq59+Seq29 within the 30-60 px band, '
-                            'social-dannce identical).')
+                            'point-to-ray / ray-ray distance divided by the body size. Default: 0.20 '
+                            '(0.15 from 2026-11-05, report 76 detr3d-diag; 0.20 since 2026-11-06 for '
+                            'animals in contact: social-dannce DEV 8.39 -> 7.30 mm, 3dpop / Panoptic '
+                            'unchanged or better).')
     ident.add_argument('--body-length', type=float, default=None,
                        help="the animal's body size in WORLD units (the calibration's), the body gate's "
                             'scale; skips the label-free estimate. Default: estimated per run from '

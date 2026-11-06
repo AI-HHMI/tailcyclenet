@@ -12,8 +12,8 @@ import time
 import numpy as np
 import torch
 
-from .body import (estimate_body_size, first_pass_config, first_pass_segments, resolve_assoc_gate,
-                   run_range)
+from .body import (FIRST_PASS_GATE_FACTOR, estimate_body_size, first_pass_config, first_pass_segments,
+                   resolve_assoc_gate, run_range)
 from .detect import detector_boxes
 from .loading import load_deploy_detector, load_pose, load_scorer, load_source
 from .provenance import run_provenance
@@ -109,8 +109,9 @@ def _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, d
 
     `--body-length` when given. Otherwise, when there is cross-view association to gate (a detector, a 3D
     session, >= 2 cameras), the label-free first pass: `FIRST_PASS_WINDOWS` sparse pose windows over the run's
-    own frame range of the first selected group (never outside it), no prior, associated at the body gate with
-    a PROVISIONAL body size from the detections; body = the median predicted 3D extent diagonal. No finite pose
+    own frame range of the first selected group (never outside it), no prior, associated at
+    `FIRST_PASS_GATE_FACTOR` x the body gate with a PROVISIONAL body size from the detections; body = the median
+    predicted 3D extent diagonal. No finite pose
     -> the provisional (detection) body size, warned; neither -> refused. Without association the gate gates
     nothing. No pixel gate is involved anywhere.
     """
@@ -140,7 +141,8 @@ def _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, d
         body, used = estimate_body_size(preds)
         prov = float(np.median(provisional)) if provisional else float('nan')
         where = (f"{len(segs)} window(s) / {used} frames of {gid} in [{start}, {stop}), no prior, body gate "
-                 f"{gate['body']:g} at the provisional detection body {prov:.4g} {sess.units}")
+                 f"{FIRST_PASS_GATE_FACTOR * gate['body']:g} at the provisional detection body {prov:.4g} "
+                 f"{sess.units}")
         if body == body and body > 0:
             args._body_size = float(body)
             args._body_size_source = f'first pass: median pose extent over {where}'

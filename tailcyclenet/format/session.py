@@ -111,7 +111,7 @@ its views of the point-to-ray distance, divided by the group's own GT body size 
 its ungated triangulation), is <= this. Measured (report 76 detr3d-diag) on johnson-mouse-annotated, deepfly3d-v4,
 allen-mouse-annotated-outliers, monsees-acm-mouse, johnson-fly-v8: labelled-keypoint residuals p99 <= 0.021 body;
 0.05 reproduces the old 30 px accept set on 99.95-100% of points (deepfly3d-v4 the only root that differs at all).
-Smaller than the association gate (0.15) because annotated keypoints, not box centres, are triangulated."""
+Smaller than the association gate (0.20) because annotated keypoints, not box centres, are triangulated."""
 
 _WARNED_LEGACY: set = set()
 

@@ -28,12 +28,15 @@ from tracktail.model.cube import project_points_torch
 
 from ..detector.boxes import centres as box_centres
 
-ASSOC_RES_MAX_BODY = 0.15
+ASSOC_RES_MAX_BODY = 0.20
 """The default cross-view gate in BODY units (owner decision 2026-11-05): every association residual is a WORLD
 distance (point-to-ray, or ray-to-ray for a seeding pair) divided by the session's body size. In those units
 the true same-animal residuals agree across rigs (pair ray-distance p99 0.13-0.19 body on CMU Panoptic and
 3dpop; third-view growth p90 0.10-0.16), while in pixels the same noise spans 19x across rigs and in box sides
-6x. 0.15 = the third-view growth p90 on 3dpop + Panoptic, confirmed on 9 single-animal rigs. No pixel gate
+6x. 0.15 was the third-view growth p90 on 3dpop + Panoptic; 0.20 (2026-11-06) adds margin for animals in constant
+contact: at 0.15 social-dannce soc1_2022_09_23_M1_M6/f0006100 mis-associated unless the body size was within -3% of
+GT (7.6 -> 32.9 mm); at 0.20 it survives a -10% body, sdn DEV 24 groups 8.39 -> 7.30 mm, 3dpop Seq59/29/11 and
+Panoptic a1/b1 unchanged or better (idsw 12 -> 10, fp_dup 131 -> 106; Panoptic +0.02 mm, MOTA 1.000). No pixel gate
 constant remains: `associate`'s pixel engine runs only on an explicit `max_res_px`. Report 76, '### detr3d-diag'."""
 
 
@@ -425,7 +428,12 @@ def _fast_candidates(cgroup, centres, used, max_res_px, scores_per_cam, score_or
 
 
 
-def provisional_body_size(raw_box, raw_sc, cgroup_at, frames, gate=ASSOC_RES_MAX_BODY):
+PROVISIONAL_PAIR_GATE = 0.15
+"""`provisional_body_size`'s mutual-nearest pair gate (scale-free ratio); measured at this value, independent of the
+deploy gate."""
+
+
+def provisional_body_size(raw_box, raw_sc, cgroup_at, frames, gate=PROVISIONAL_PAIR_GATE):
     """A body size from DETECTIONS alone (no pose, no pixel gate): the bootstrap of the body-unit gate.
 
     For each listed frame and camera pair, every pair of detections is triangulated (2-view DLT of the box

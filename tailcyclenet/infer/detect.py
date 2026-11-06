@@ -15,7 +15,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
                iou_thresh=0.5, center_dist_thresh=NMS_CENTER_DIST, trace=None,
                trace_detail=False,
-               box_source=None, chunk=None):
+               box_source=None, chunk=None, extents=False):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     Inputs:
@@ -33,13 +33,14 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
         chunk -- frames per detector FORWARD (None = `det_chunk`: input size x device TOTAL memory);
             `batch` stays the cursor unit, and a batch that fits is one forward (byte-identical).
+        extents -- also return the pre-crop-rule boxes (tight for an `extent` head) for 2D linking.
         box_source -- this session's box source: 'instances' extents are already padded (pad 0);
             'keypoints' get the checkpoint's own `crop_pad_frac`;
             None = the checkpoint's. An `extent` head's boxes get the crop rule HERE, in source
             px (`crop_boxes_from_extents`), so callers still receive crop-rule boxes.
     Outputs:
         (boxes (D,T,C,4), scores (D,T,C)): `d` is the d-th highest-scoring detection in that
-        camera at that frame; rows become an animal axis in `associate_group`, not here.
+        camera at that frame (rows become animals in `associate_group`); + extents if asked.
     Side effects:
         Decode runs one thread per camera (where the wall clock lives; the forward is serial).
         Cameras in flight are bounded, never `batch` -- a different batch is a different cuDNN
@@ -78,6 +79,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     D = max(1, int(top_k))
     out = np.full((D, T, C, 4), np.nan, np.float32)
     sc = np.full((D, T, C), np.nan, np.float32)
+    ext = np.full((D, T, C, 4), np.nan, np.float32) if extents else None
 
     def _fetch(job):
         """Decode, reduce and letterbox one (camera, frame) job into a uint8 batch tensor.
@@ -195,8 +197,10 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                     if not b.numel():
                         continue
                     n = min(D, b.shape[0])
-                    out[:n, t, ci] = _to_crop(unletterbox_boxes(b.cpu(), *metas[j], src_wh=src),
-                                              src)[:n].numpy()
+                    unl = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
+                    out[:n, t, ci] = _to_crop(unl, src)[:n].numpy()
+                    if ext is not None:
+                        ext[:n, t, ci] = np.asarray(unl)[:n]
                     sc[:n, t, ci] = s.cpu().numpy()[:n]
             del fetched
             _memory.trim()
@@ -204,7 +208,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     finally:
         frame_pool.shutdown()
         pool.shutdown()
-    return out, sc
+    return (out, sc, ext) if extents else (out, sc)
 
 
 DET_BATCH = 16
@@ -266,11 +270,19 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
     or quantise `--start-frame` by 16). The cost is at most `batch - 1` extra frame-cameras,
     once per group; leaving the cursor at 0 would decode every frame from 0 to `frame_start`
     into a store sized for the work.
+
+    2D two-stage linking (`link_two_stage`) reads ranks past S, so detection keeps
+    max(n_det, LINK_TOP) per frame; `top_k` applies after NMS, so the first n_det are unchanged.
     """
     from .associate import associate_group
 
+    from .associate import LINK_TOP
+
     T = min(sess.groups[gid].n_frames, args.frame_stop or sess.groups[gid].n_frames)
     assoc_state, buf = {}, {}
+    two_stage = bool(args.link_boxes and getattr(args, 'link_two_stage', True)
+                     and len(sess.cam_names) == 1)
+    n_det_link = max(n_det, LINK_TOP) if two_stage else n_det
     cursor = args.frame_start - args.frame_start % DET_BATCH
 
     def boxes_for(store, lo, hi):
@@ -292,7 +304,7 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
         nonlocal cursor
         while cursor < hi:
             end = min(cursor + DET_BATCH, T)
-            raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
+            raw = detect_raw(det, det_wh, sess, gid, n_det_link, device=device,
                              score_thresh=args.det_score, reduce=det_red,
                              iou_thresh=args.det_nms_iou,
                              center_dist_thresh=args.det_nms_center_dist,
@@ -301,7 +313,8 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                              trace=(stats.setdefault('decode_trace', [])
                                     if args.det_trace else None),
                              read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
-                                 ci, cam, fr, pool=pool, reduce=reduce))
+                                 ci, cam, fr, pool=pool, reduce=reduce),
+                             extents=two_stage)
             b, s = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
                                    min_views=args.min_views, track=args.track,
                                    max_move=args.max_move,
@@ -317,7 +330,7 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                                    assoc_random_drop=args.assoc_random_drop,
                                    assoc_res_max_body=_gate_body(args),
                                    body_size=getattr(args, '_body_size', None),
-                                   frame_base=cursor)
+                                   frame_base=cursor, link_two_stage_2d=two_stage)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j])
             if stats is not None:

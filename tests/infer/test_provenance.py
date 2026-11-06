@@ -21,7 +21,7 @@ def test_provenance_records_every_box_affecting_option():
     # `detector_checkpoint` records it. `frames`/`read` are the block loop's plumbing and
     # change no pixel. See tests/test_memory.py.
     plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read', 'trace',
-                'trace_detail', 'embed_out', 'input_wh'}
+                'trace_detail', 'embed_out', 'input_wh', 'extents'}
     params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
     alias = {'score_thresh': 'det_score', 'top_k': 'det_top_k',

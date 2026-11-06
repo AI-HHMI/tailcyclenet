@@ -89,6 +89,7 @@ def identity_provenance(args):
     return {
         'track': bool(args.track),
         'link_boxes': bool(args.link_boxes),
+        'link_two_stage_2d': bool(getattr(args, 'link_two_stage', True)),
         'min_views': int(args.min_views),
         'max_move': float(args.max_move),
         'max_age': int(args.max_age),

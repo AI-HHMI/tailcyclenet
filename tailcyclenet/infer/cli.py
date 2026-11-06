@@ -262,6 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
     ident.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
                        help='2D: follow one animal per row across frames (per-frame Hungarian on '
                             'centre distance, gated at --max-move).')
+    ident.add_argument('--link-two-stage', action=argparse.BooleanOptionalAction, default=True,
+                       help='2D --link-boxes: score-aware two-stage linking on the tight extents '
+                            '(low-score boxes only extend live rows; report 76 relink). '
+                            '--no-link-two-stage restores the top-S + link_rows rule.')
     ident.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
                        help='3D multiview: one cross-view target set across frames; --no-track '
                             'restores per-frame association.')

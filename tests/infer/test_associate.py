@@ -231,8 +231,20 @@ def test_associate_group_threads_max_age_and_frame_base(tmp_path, monkeypatch):
             return []
 
     nan = (np.full((1, 2, 1, 4), np.nan, np.float32), np.full((1, 2, 1), np.nan, np.float32))
-    detmod.associate_group(nan, _FakeSession(), 'g000', 1, link=True, track=False, max_age=7)
+    detmod.associate_group(nan, _FakeSession(), 'g000', 1, link=True, track=False, max_age=7,
+                           link_two_stage_2d=False)
     assert seen.get('max_age') == 7
+
+    seen2 = {}
+
+    def spy_two_stage(boxes, scores, n_rows, **kw):
+        seen2.update(kw)
+        S, T = n_rows, boxes.shape[1]
+        return np.full((S, T, 4), np.nan, np.float32), np.full((S, T), np.nan, np.float32)
+
+    monkeypatch.setattr(detmod, 'link_two_stage', spy_two_stage)
+    detmod.associate_group(nan, _FakeSession(), 'g000', 1, link=True, track=False, max_age=6)
+    assert seen2.get('max_age') == 6
 
 
 def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path):
@@ -359,3 +371,120 @@ def test_random_drop_rejects_at_its_rate_and_zero_draws_nothing():
     assert len(associate(cg, boxes, max_res_px=30.0, random_drop=(1.0, np.random.default_rng(0)))) == 0
     assert _p8_key(associate(cg, boxes, max_res_px=30.0, random_drop=(0.0, np.random.default_rng(0)))) == \
         _p8_key(ref)
+
+
+
+# --- link_two_stage (2D default) -------------------------------------------------------------
+
+
+def _calib_frames(n, S=2, score=0.9):
+    """n frames of S well-separated, high-score animals (they set the reference score)."""
+    boxes = np.full((4, n, 4), np.nan, np.float32)
+    scores = np.full((4, n), np.nan, np.float32)
+    for t in range(n):
+        boxes[0, t] = [0, 0, 50, 50]
+        boxes[1, t] = [300, 0, 350, 50]
+        scores[:S, t] = score
+    return boxes, scores
+
+
+def test_link_two_stage_a_low_score_box_cannot_pull_a_row_onto_another_animal():
+    """The mechanism (report 76 relink): A moves right and B is missed; a low-score half box sits
+    beside A's old place. Joint Hungarian over the top-S (`link_rows`) hands A's TRUE box to row B
+    (B's only positive-affinity option is it) and A's row to the half box -- a swap. Two-stage
+    matches the high-score box first (to A) and lets the low box only extend a row in its own gate."""
+    from tailcyclenet.infer.associate import link_rows, link_two_stage
+
+    boxes, scores = _calib_frames(6)
+    boxes[1, :] = [70, 0, 120, 50]                           # B at x=70..120, A at 0..50
+    b2, s2 = boxes.copy(), scores.copy()
+    t = 5
+    b2[:, t] = np.nan
+    s2[:, t] = np.nan
+    b2[0, t], s2[0, t] = [30, 0, 80, 50], 0.9                # A's true box, moved right 30 px
+    b2[1, t], s2[1, t] = [5, 0, 55, 50], 0.2                 # a low-score half box near A's old box
+
+    legacy = link_rows(b2[:2, :, None].copy(), s2[:2, :, None].copy(), max_move=1.25)[0][:, :, 0]
+    assert np.allclose(legacy[1, t], [30, 0, 80, 50]), 'legacy: row B takes A (the swap)'
+
+    rows, rsc = link_two_stage(b2, s2, 2, max_move=1.25)
+    assert np.allclose(rows[0, t], [30, 0, 80, 50]), 'two-stage: row A keeps its own box'
+    assert not np.isfinite(rows[1, t]).any(), 'row B waits empty, it is not dragged onto A'
+    assert rsc[0, t] == np.float32(0.9)
+
+
+def test_link_two_stage_low_boxes_extend_but_never_open_rows():
+    """A low-score box extends a live row inside its gate (detector score dips at contact) but an
+    unclaimed one never opens a row; a box past rank S still extends a row."""
+    from tailcyclenet.infer.associate import link_two_stage
+
+    boxes, scores = _calib_frames(8)
+    boxes[1, 4:], scores[1, 4:] = np.nan, np.nan             # B lost from frame 4 ...
+    scores[0, 4] = 0.2                                       # A's score dips: low, still extends
+    boxes[2, 5], scores[2, 5] = [302, 0, 352, 50], 0.3       # B re-seen at RANK 3 (low): extends B
+    boxes[3, 6], scores[3, 6] = [600, 0, 650, 50], 0.2       # a far low box: never opens a row
+    rows, _ = link_two_stage(boxes, scores, 3, max_move=1.25)
+    assert np.allclose(rows[0, 4], [0, 0, 50, 50])
+    assert np.allclose(rows[1, 5], [302, 0, 352, 50])
+    assert not np.isfinite(rows[:, 6]).all(-1)[2], 'no row is born from a low-score box'
+    assert not np.isfinite(rows[2]).any()
+
+
+def test_link_two_stage_links_on_extents_and_returns_crop_boxes():
+    """The match is computed on the tight extents (a crop box's floor hides the motion), and the
+    rows carry the CROP boxes the pose loop crops to."""
+    from tailcyclenet.infer.associate import link_two_stage
+
+    boxes, scores = _calib_frames(4)
+    crop = boxes + np.array([-20, -20, 20, 20], np.float32)
+    rows, _ = link_two_stage(crop, scores, 2, extents=boxes)
+    assert np.allclose(rows[:, :, :], crop[:2])
+
+
+def test_link_two_stage_blocks_equal_one_pass():
+    """State threads across calls: 16-frame blocks link exactly as the whole clip does (the
+    driver's detection cursor), including the causal score calibration."""
+    from tailcyclenet.infer.associate import link_two_stage
+
+    rng = np.random.default_rng(0)
+    T, D, S = 70, 6, 3
+    ctr = np.cumsum(rng.normal(0, 8, (S, T, 2)), 1) + np.array([[100], [300], [500]])[:, :, None]
+    boxes = np.full((D, T, 4), np.nan, np.float32)
+    scores = np.full((D, T), np.nan, np.float32)
+    for t in range(T):
+        sc = rng.uniform(0.05, 1.0, S + 2)
+        order = np.argsort(-sc)
+        allc = np.concatenate([ctr[:, t], ctr[rng.integers(0, S, 2), t] + rng.normal(0, 20, (2, 2))])
+        for r, k in enumerate(order):
+            boxes[r, t] = [*(allc[k] - 25), *(allc[k] + 25)]
+            scores[r, t] = sc[k]
+    whole = link_two_stage(boxes, scores, S)
+    state, parts = {}, []
+    for t0 in range(0, T, 16):
+        parts.append(link_two_stage(boxes[:, t0:t0 + 16], scores[:, t0:t0 + 16], S, state=state))
+    assert np.array_equal(np.nan_to_num(whole[0], nan=-1),
+                          np.nan_to_num(np.concatenate([p[0] for p in parts], 1), nan=-1))
+
+
+def test_associate_group_2d_legacy_flag_reproduces_link_rows():
+    """`link_two_stage_2d=False` is the old rule byte for byte: the top-S boxes, then `link_rows`."""
+    from tailcyclenet.infer.associate import associate_group, link_rows
+
+    class _S:
+        rig = type('Rig', (), {'moving': {}})()
+
+        def cgroup(self, gid, t=None):
+            return []
+
+    rng = np.random.default_rng(1)
+    D, T, S = 5, 30, 2
+    b = (rng.uniform(0, 400, (D, T, 1, 2)) + np.array([0, 0])).astype(np.float32)
+    boxes = np.concatenate([b, b + 40], -1)
+    scores = np.sort(rng.uniform(0.0, 1.0, (D, T, 1)), 0)[::-1].astype(np.float32).copy()
+    out, sc = associate_group((boxes, scores), _S(), 'g', S, link=True, track=False,
+                              link_two_stage_2d=False, state={})
+    ref = link_rows(boxes[:S].copy(), scores[:S].copy(), max_move=1.25, max_age=8, state={})
+    assert np.array_equal(np.nan_to_num(out, nan=-1), np.nan_to_num(ref[0], nan=-1))
+    out2, _ = associate_group((boxes, scores, boxes), _S(), 'g', S, link=True, track=False,
+                              state={})
+    assert out2.shape == out.shape

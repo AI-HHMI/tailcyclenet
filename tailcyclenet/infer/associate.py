@@ -489,14 +489,14 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     assoc_score_order=False,
                     track_age_decay=None, track_affinity_2d=0.0, track_camera_claims=False,
                     assoc_fast=True, assoc_random_drop=0.0, assoc_res_max_body=ASSOC_RES_MAX_BODY,
-                    body_size=None):
+                    body_size=None, link_two_stage_2d=True):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
-        raw -- `detect_raw`'s (boxes, scores); session, gid, max_instances (row count S).
+        raw -- `detect_raw`'s (boxes, scores[, extents]); session, gid, max_instances (rows S).
         track -- 3D multiview default: `CrossViewTracker`, one cross-view target set carried
             across frames; `False` restores the memoryless per-frame `associate`.
-        link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`).
+        link -- tracker-less linking: 2D `link_two_stage` (link_two_stage_2d=False: `link_rows`).
         min_views / max_move -- passed through to the tracker / `associate`; max_move defaults
             to the measured 1.25 box-side gate.
         max_age -- the tracker's and `link_rows`' SHARED patience window: frames without
@@ -524,7 +524,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     import numpy as np
     import torch
 
-    r_box, r_sc = raw
+    r_box, r_sc = raw[0], raw[1]
+    r_ext = raw[2] if len(raw) > 2 else None
     D, T, C = r_sc.shape
     S = max_instances or 1
     out = np.full((S, T, C, 4), np.nan, np.float32)
@@ -619,7 +620,13 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         stats['association_groups'] = tracker.n_groups
         stats['association_camera_claims'] = tracker.n_camera_claims
     pre_link = int(np.isfinite(out).all(-1).sum())
-    if link and tracker is None:
+    if link and tracker is None and C == 1 and link_two_stage_2d:
+        rows, rsc = link_two_stage(r_box[:, :, 0], r_sc[:, :, 0], S,
+                                   extents=None if r_ext is None else r_ext[:, :, 0],
+                                   max_move=max_move, max_age=max_age,
+                                   state=state.setdefault('link2', {}))
+        out, sc = rows[:, :, None].astype(np.float32), rsc[:, :, None].astype(np.float32)
+    elif link and tracker is None:
         out, sc = link_rows(out, sc, max_move=max_move, max_age=max_age,
                             state=state.setdefault('link', {}))
     if stats is not None:
@@ -630,6 +637,107 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             int(np.isfinite(out).all(-1).sum())
 
     return out, sc
+
+
+LINK_HI_FRAC = 0.57
+"""Two-stage 2D linking: a top-S box opens or continues a row on its own only when its score is at least
+this fraction of the clip's reference score (the median S-th-ranked score over the first `LINK_CALIB_FRAMES`)."""
+LINK_LO_SCORE = 0.05
+"""Two-stage 2D linking: the floor for second-stage boxes, which may only EXTEND a live row."""
+LINK_TOP = 20
+"""Two-stage 2D linking: ranks considered per frame (max(LINK_TOP, S)); `detect_raw` must return at least this many."""
+LINK_CALIB_FRAMES = 500
+"""Two-stage 2D linking: frames whose S-th-ranked score form the reference (causal: a running median until full)."""
+
+
+def link_two_stage(boxes, scores, n_rows, extents=None, max_move=1.25, max_age=8, state=None,
+                   hi_frac=LINK_HI_FRAC, lo_score=LINK_LO_SCORE, top=LINK_TOP,
+                   calib_frames=LINK_CALIB_FRAMES):
+    """2D (one camera) score-aware two-stage linking: ranked detections -> `n_rows` rows, one animal each.
+
+    Inputs:
+        boxes (D,T,4), scores (D,T) -- `detect_raw`'s ranked detections for ONE camera (crop-rule boxes).
+        n_rows -- S, the row count.
+        extents (D,T,4) -- the detector head's TIGHT boxes, which the match is computed on (a crop
+            box's pad and floor blur centres and sides at contact); None = link on `boxes`.
+        max_move / max_age -- `link_rows`' gate (box sides) and patience.
+        state -- dict carried across calls so blocks link exactly as one causal pass.
+    Outputs:
+        (rows (S,T,4), row_scores (S,T)): the chosen detections' CROP boxes and scores; NaN = no box.
+    Notes:
+        Stage 1 matches live rows (last known tight box) to the top-S boxes whose score is at least
+        `hi_frac` x the reference score -- the median S-th-ranked score over the first `calib_frames`
+        frames (a running median until then). Stage 2 matches the rows still unmatched to every other
+        box of rank < max(top, S) with score >= `lo_score`; such a box only EXTENDS a live row and
+        never opens one. Unclaimed stage-1 boxes open empty rows. The cost is `link_rows`' centre
+        distance in box sides, gated at `max_move`.
+        Why (report 76 relink): low-score top-S boxes are contact duplicates and half-boxes and drive
+        ~40% of row swaps on crowded look-alike mice; promoting a rate-matched random set instead is null.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    from ..detector.boxes import centres as box_centres
+    from ..detector.boxes import sides as box_sides
+
+    S = int(n_rows)
+    D, T, _ = boxes.shape
+    K = min(D, max(int(top), S))
+    ext = boxes if extents is None else extents
+    if state is None:
+        state = {}
+    if 'last' not in state:
+        state.update(last=np.full((S, 4), np.nan), age=np.zeros(S, int), calib=[], started=False)
+    last, age, calib = state['last'], state['age'], state['calib']
+    rows = np.full((S, T, 4), np.nan, np.float32)
+    rsc = np.full((S, T), np.nan, np.float32)
+    rank = np.arange(K)
+    for t in range(T):
+        s = scores[:K, t]
+        if len(calib) < calib_frames and S - 1 < K and np.isfinite(s[S - 1]):
+            calib.append(float(s[S - 1]))
+        ref = float(np.median(calib)) if calib else 0.0
+        s_hi = max(hi_frac * ref, 0.01)
+        e = ext[:K, t]
+        ok = np.isfinite(s) & np.isfinite(e).all(-1)
+        hi_ix = np.flatnonzero(ok & (s >= s_hi) & (rank < S))
+        lo_ix = np.flatnonzero(ok & (s >= lo_score) & ((s < s_hi) | (rank >= S)))
+        taken = {}
+        if not state['started']:
+            if len(hi_ix):
+                taken = {r: int(d) for r, d in enumerate(hi_ix[:S])}
+                state['started'] = True
+        else:
+            alive = np.isfinite(last).all(-1)
+
+            def _match(r_ix, d_ix):
+                """Hungarian of rows `r_ix` (last tight box) to detections `d_ix`, gated at `max_move`."""
+                if not len(r_ix) or not len(d_ix):
+                    return {}
+                a, b = last[r_ix], e[d_ix]
+                d = np.linalg.norm(box_centres(a)[:, None] - box_centres(b)[None], axis=-1)
+                side = 0.5 * (box_sides(a)[:, None] + box_sides(b)[None])
+                aff = np.clip(1.0 - d / (max_move * np.maximum(side, 1e-6)), 0.0, None)
+                rr, cc = linear_sum_assignment(-aff)
+                return {int(r_ix[i]): int(d_ix[j]) for i, j in zip(rr, cc) if aff[i, j] > 0}
+
+            r_ix = np.flatnonzero(alive)
+            taken.update(_match(r_ix, hi_ix))
+            if len(lo_ix):
+                taken.update(_match(np.array([r for r in r_ix if r not in taken], int), lo_ix))
+            used = set(taken.values())
+            free = [int(d) for d in hi_ix if d not in used]
+            open_rows = [r for r in range(S) if r not in taken and not alive[r]]
+            for r, d in zip(open_rows, free):
+                taken[r] = d
+        for r, d in taken.items():
+            rows[r, t] = boxes[d, t]
+            rsc[r, t] = scores[d, t]
+            last[r] = e[d]
+        seen = np.zeros(S, bool)
+        seen[list(taken)] = True
+        age[:] = np.where(seen, 0, age + 1)
+        last[age > max_age] = np.nan
+    return rows, rsc
 
 
 def link_rows(boxes, scores=None, max_move=1.0, max_age=24, state=None):

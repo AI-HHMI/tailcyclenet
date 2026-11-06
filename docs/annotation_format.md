@@ -489,7 +489,7 @@ Checkable rules, so a validator can be written without re-deriving them.
     legal. Prediction sessions (§8b) are exempt: their `instances.pq` may carry a `labeled` row
     with a null box where no detector box was available.
 12. `mode = "3d"` with per-camera annotation 2D: every `animal_id` with ≥ 2 `labeled` views
-    triangulates with median reprojection residual below the validator's threshold (30 px). Catches cross-view id
+    triangulates with median point-to-ray distance below the validator's threshold in body units (0.05 of the group's own GT body extent). Catches cross-view id
     mismatches. This rule does not compare prediction-only `points2d.pq` against `points3d.pq`.
 13. Every camera in `extrinsics.pq` has `moving = true`, and covers every frame of every group in
     which it appears.

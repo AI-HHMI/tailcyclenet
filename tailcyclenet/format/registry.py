@@ -38,7 +38,10 @@ class Registry:
         """That dataset's own keypoint names, un-prefixed, in registry-id order."""
         got = [self.names[i] for i in self.ids_for_dataset(dataset)]
         p = f'{dataset}-'
-        return [n[len(p):] for n in got] if all(n.startswith(p) for n in got) else got
+        # Only multi-dataset registries are prefixed (see `build`); a single root whose own names
+        # happen to start with '<root>-' (root 'tunnel', keypoint 'tunnel-1') must not be stripped.
+        prefixed = len(self.datasets) > 1 and all(n.startswith(p) for n in got)
+        return [n[len(p):] for n in got] if prefixed else got
 
     def ids_for(self, dataset: str, names) -> np.ndarray:
         """Global ids ALIGNED TO `names` -- the keypoint axis the caller actually holds.

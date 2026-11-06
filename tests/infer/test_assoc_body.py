@@ -63,20 +63,26 @@ def test_body_gate_separates_two_animals_and_scales_with_body_size():
         assert np.allclose(got, [-200.0, 200.0], atol=1e-2), got
 
 
-def test_body_gate_refuses_pixel_levers_and_a_missing_body():
+def test_body_gate_refuses_a_missing_body_and_ports_score_order():
+    """A body gate needs a positive body size; TR6a's score order is gate-independent and ranks the body path
+    exactly as the pixel path: same groups on a scene where the two orders agree."""
     from tailcyclenet.infer.associate import associate
 
     cg = _flat_rig()
-    boxes = _boxes_at(cg, [[0.0, 0.0, 0.0]])
-    with pytest.raises(ValueError, match='TR5'):
-        associate(cg, boxes, max_res_body=0.15, body_size=1.0, max_res_sides=0.2)
+    boxes = _boxes_at(cg, [[-200.0, 0.0, 0.0], [200.0, 0.0, 0.0]])
     with pytest.raises(ValueError, match='positive body_size'):
         associate(cg, boxes, max_res_body=0.15, body_size=None)
+    scores = [torch.tensor([0.9, 0.2]) for _ in boxes]
+    a = associate(cg, boxes, max_res_body=0.15, body_size=1000.0)
+    b = associate(cg, boxes, max_res_body=0.15, body_size=1000.0, scores_per_cam=scores, score_order=True)
+    assert [sorted(g['members'].items()) for g in a] == [sorted(g['members'].items()) for g in b]
+    with pytest.raises(ValueError, match='score_order needs scores'):
+        associate(cg, boxes, max_res_body=0.15, body_size=1000.0, score_order=True)
 
 
-def test_pixel_path_is_the_default_of_associate():
-    """`associate` without max_res_body is the legacy pixel path, unchanged (the existing associate /
-    track tests pin its behaviour)."""
+def test_pixel_path_is_the_internal_default_of_associate():
+    """`associate` without max_res_body is the internal pixel path, unchanged (the existing associate / track
+    tests pin its behaviour)."""
     from tailcyclenet.infer.associate import associate
 
     cg = _flat_rig()
@@ -87,63 +93,57 @@ def test_pixel_path_is_the_default_of_associate():
     assert torch.equal(a[0]['point'], b[0]['point'])
 
 
-def _ns(**kw):
-    base = dict(assoc_res_max_px=None, assoc_res_max_body=None, assoc_res_max_sides=None,
-                assoc_score_order=False)
-    base.update(kw)
-    return argparse.Namespace(**base)
+def test_gate_is_the_cli_value_else_the_default():
+    from tailcyclenet.infer.body import resolve_assoc_gate
+
+    g = resolve_assoc_gate(argparse.Namespace(assoc_res_max_body=None))
+    assert (g['mode'], g['body'], g['px'], g['why']) == ('body', 0.15, 30.0, 'default')
+    g = resolve_assoc_gate(argparse.Namespace(assoc_res_max_body=0.2))
+    assert (g['mode'], g['body'], g['why']) == ('body', 0.2, '--assoc-res-max-body')
 
 
-def test_gate_resolution_order_and_body_length_key(tmp_path):
-    """CLI px > CLI body > a session's own assoc_res_max_px key > the body-unit default; session.toml
-    body_length is read; the two CLI gates and the pixel-only levers under the body gate are refused."""
+def test_removed_session_keys(tmp_path, capsys):
+    """body_length RAISES by name; a leftover assoc_res_max_px is ignored with one warning per process (silently
+    in a prediction session); neither is an attribute any more."""
     import toml
 
-    from tailcyclenet.format import Session
-    from tailcyclenet.infer.body import body_size_from_session, resolve_assoc_gate
+    from tailcyclenet.format import FormatError, Session
+    from tailcyclenet.format import session as S
 
     root = tmp_path / 'ds' / 'test' / 's'
     _session_3d(root)
-    sess = Session.load(root)
-    assert not sess.assoc_res_max_px_declared and sess.body_length is None
-    assert body_size_from_session(sess) is None
-    g = resolve_assoc_gate(_ns(), sess)
-    assert g['mode'] == 'body' and g['body'] == 0.15 and g['why'] == 'default'
-
     cfg = toml.load(root / 'session.toml')
-    cfg['assoc_res_max_px'] = 30.0
     cfg['body_length'] = 0.25
     (root / 'session.toml').write_text(toml.dumps(cfg))
-    sess = Session.load(root)
-    assert sess.assoc_res_max_px_declared and sess.body_length == 0.25
-    assert body_size_from_session(sess) == 0.25
-    g = resolve_assoc_gate(_ns(), sess)
-    assert (g['mode'], g['px'], g['why']) == ('px', 30.0, 'session.toml assoc_res_max_px')
-    g = resolve_assoc_gate(_ns(assoc_res_max_body=0.2), sess)
-    assert (g['mode'], g['body']) == ('body', 0.2)
-    g = resolve_assoc_gate(_ns(assoc_res_max_px=45.0), sess)
-    assert (g['mode'], g['px']) == ('px', 45.0)
-    with pytest.raises(SystemExit):
-        resolve_assoc_gate(_ns(assoc_res_max_px=45.0, assoc_res_max_body=0.2), sess)
-    del cfg['assoc_res_max_px']
+    with pytest.raises(FormatError, match='body_length'):
+        Session.load(root)
+    del cfg['body_length']
+    cfg['assoc_res_max_px'] = 30.0
     (root / 'session.toml').write_text(toml.dumps(cfg))
-    sess = Session.load(root)
-    with pytest.raises(SystemExit, match='PIXEL'):
-        resolve_assoc_gate(_ns(assoc_res_max_sides=0.19), sess)
-    assert resolve_assoc_gate(_ns(assoc_res_max_sides=0.19, assoc_res_max_px=30.0), sess)['mode'] == 'px'
-
-
-def test_write_session_round_trips_body_length(tmp_path):
-    from tailcyclenet.format import Session, write_session
-
-    root = tmp_path / 'ds' / 'test' / 's'
-    _session_3d(root)
+    S._WARNED_LEGACY.clear()
     s = Session.load(root)
-    out = tmp_path / 'o' / 'test' / 's'
-    write_session(out, mode=s.mode, units=s.units, label_source=s.label_source, names=s.names, rig=s.rig,
-                  groups=s.groups, labels={g: s.labels(g) for g in s.groups}, body_length=1.7)
-    back = Session.load(out)
-    assert back.body_length == 1.7 and not back.assoc_res_max_px_declared
+    err = capsys.readouterr().err
+    assert 'assoc_res_max_px` is ignored' in err and '2026-11-05' in err
+    assert not hasattr(s, 'assoc_res_max_px') and not hasattr(s, 'body_length')
+    Session.load(root)
+    assert 'assoc_res_max_px' not in capsys.readouterr().err, 'warned once per process'
+
+
+def test_first_pass_segments_stay_inside_the_run_range():
+    """K windows spread over [start, stop), first at start and last ending at stop; a range holding no more
+    than K windows is used whole; nothing outside the range is ever read."""
+    from tailcyclenet.infer.body import FIRST_PASS_WINDOWS, first_pass_segments, run_range
+    from tailcyclenet.infer.window import InferConfig
+
+    assert FIRST_PASS_WINDOWS == 4
+    seg = first_pass_segments(100, 1100, 12)
+    assert len(seg) == 4 and seg[0] == (100, 112) and seg[-1] == (1088, 1100)
+    assert all(100 <= s < e <= 1100 and e - s == 12 for s, e in seg)
+    assert first_pass_segments(0, 40, 12) == [(0, 40)]
+    assert first_pass_segments(5, 6, 12) == []
+    assert run_range(InferConfig(frame_start=50, frame_stop=900), 1000) == (50, 900)
+    assert run_range(InferConfig(max_frames=120), 1000) == (0, 120)
+    assert run_range(InferConfig(), 70) == (0, 70)
 
 
 def test_first_pass_body_estimator_on_a_tiny_fixture():
@@ -153,23 +153,37 @@ def test_first_pass_body_estimator_on_a_tiny_fixture():
 
     S, T, K = 2, 5, 4
     pred = np.full((S, T, K, 3), np.nan)
-    # row 0: a unit-ish body whose extent diagonal is exactly 3 (2, 2, 1); row 1: diagonal 5 (3, 4, 0)
     pred[0, :, 0] = 0.0
     pred[0, :, 1] = [2.0, 2.0, 1.0]
     pred[1, :, 0] = 10.0
     pred[1, :, 1] = [13.0, 14.0, 10.0]
-    pred[1, 4] = np.nan                      # one missing frame
-    assert median_extent(pred) == pytest.approx(3.0)     # 5 x 3.0 and 4 x 5.0 -> median 3.0
+    pred[1, 4] = np.nan
+    assert median_extent(pred) == pytest.approx(3.0)
     assert np.isnan(median_extent(np.full((1, 2, 3, 3), np.nan)))
     body, used = estimate_body_size([pred[:, :3], pred[:, 3:]])
     assert body == pytest.approx(3.0) and used == T
-    a, c = first_pass_config(argparse.Namespace(frame_start=50, frame_stop=900, max_frames=0), InferConfig(
-        frame_start=50, frame_stop=900), n_frames=1000, px=30.0)
-    assert (a.frame_start, a.frame_stop, c.frame_start, c.frame_stop) == (0, 300, 0, 300)
-    assert a._assoc_gate['mode'] == 'px' and a._assoc_gate['px'] == 30.0
-    _, c = first_pass_config(argparse.Namespace(frame_start=0, frame_stop=0, max_frames=0), InferConfig(),
-                             n_frames=120, px=30.0)
-    assert c.frame_stop == 120
+    a, c = first_pass_config(argparse.Namespace(frame_start=0, frame_stop=0, max_frames=500), InferConfig(),
+                             200, 212)
+    assert (a.frame_start, a.frame_stop, a.max_frames) == (200, 212, 0)
+    assert (c.frame_start, c.frame_stop, c.anchor) == (200, 212, 'none')
+    assert a._assoc_gate == dict(mode='px', px=30.0, body=None, why='first pass')
+
+
+def test_cli_body_length_skips_the_first_pass(monkeypatch):
+    """--body-length is the body size; no detection or pose pass runs."""
+    from tailcyclenet.infer import driver
+
+    def boom(*a, **k):
+        raise AssertionError('the first pass must not run')
+
+    monkeypatch.setattr(driver, 'detector_boxes', boom)
+    monkeypatch.setattr(driver, 'run_blocks', boom)
+    args = argparse.Namespace(body_length=1.6, _assoc_gate=dict(mode='body', px=30.0, body=0.15, why='default'),
+                              _body_size=None, _body_size_source='')
+    sess = argparse.Namespace(mode='3d', cam_names=['a', 'b'], units='m')
+    driver._resolve_body_size(args, sess, ['g'], None, None, None, None, {}, object(), None, None, None, None,
+                              'cpu', None, None)
+    assert args._body_size == 1.6 and args._body_size_source == 'CLI --body-length'
 
 
 def test_associate_group_threads_the_body_gate(tmp_path):

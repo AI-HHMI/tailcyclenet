@@ -12,8 +12,8 @@ import time
 import numpy as np
 import torch
 
-from .body import (body_size_from_session, estimate_body_size, first_pass_config,
-                   resolve_assoc_gate)
+from .body import (estimate_body_size, first_pass_config, first_pass_segments, resolve_assoc_gate,
+                   run_range)
 from .detect import detector_boxes
 from .loading import load_deploy_detector, load_pose, load_scorer, load_source
 from .provenance import run_provenance
@@ -105,50 +105,54 @@ def _report_group(key, wall, stats, det_stats, detected):
 
 def _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, det, det_wh, det_red,
                        det_tile, det_boxsrc, device, scorer, scorer_shared_encoder):
-    """Set `args._body_size` / `args._body_size_source` for the body-unit association gate.
+    """Set `args._body_size` / `args._body_size_source`: the body-unit gate's scale (`infer.body`).
 
-    session.toml `body_length` first; else, when there is cross-view association to gate (a detector, a 3D
-    session, >= 2 cameras), a label-free first pass: the run's own detect + `run_blocks` over the first
-    `FIRST_PASS_FRAMES` frames of the first selected group at the legacy pixel gate, body = the median 3D
-    extent diagonal of its pose output (`infer.body`). Without association the gate gates nothing.
+    `--body-length` when given. Otherwise, when there is cross-view association to gate (a detector, a 3D
+    session, >= 2 cameras), the label-free first pass: `FIRST_PASS_WINDOWS` sparse pose windows over the run's
+    own frame range of the first selected group (never outside it), no prior, association at the internal pixel
+    gate; body = the median predicted 3D extent diagonal. Nothing estimable -> a warned fallback to the internal
+    pixel gate. Without association the gate gates nothing.
     """
-    body = body_size_from_session(sess)
     gate = args._assoc_gate
-    if body is not None:
-        args._body_size, args._body_size_source = body, 'session.toml body_length'
+    if getattr(args, 'body_length', None) is not None:
+        args._body_size, args._body_size_source = float(args.body_length), 'CLI --body-length'
     elif det is None or sess.mode != '3d' or len(sess.cam_names) < 2:
         args._body_size_source = 'n/a (no cross-view association)'
     else:
         gid = gids[0]
-        n = sess.groups[gid].n_frames
-        a1, c1 = first_pass_config(args, cfg, n, gate['px'])
+        start, stop = run_range(cfg, sess.groups[gid].n_frames)
+        segs = first_pass_segments(start, stop, cfg.n_frames)
         n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
         t0 = time.time()
-        boxes_for = detector_boxes(det, det_wh, sess, gid, a1, device, det_red, det_tile,
-                                   args.det_top_k or n_want, n_want, stats={}, box_source=det_boxsrc)
-        blocks = (blk['pred'] for blk in run_blocks(
-            model, sess, gid, registry, ds_name, c1, box_points=boxes.get(f'{sess.session_id}/{gid}'),
-            boxes_for=boxes_for, n_rows=n_want, stats={}, scorer=scorer,
-            shared_scene_encoder=scorer_shared_encoder))
-        body, used = estimate_body_size(blocks)
+        preds = []
+        for s, e in segs:
+            a1, c1 = first_pass_config(args, cfg, s, e)
+            boxes_for = detector_boxes(det, det_wh, sess, gid, a1, device, det_red, det_tile,
+                                       args.det_top_k or n_want, n_want, stats={}, box_source=det_boxsrc)
+            preds += [blk['pred'] for blk in run_blocks(
+                model, sess, gid, registry, ds_name, c1, box_points=boxes.get(f'{sess.session_id}/{gid}'),
+                boxes_for=boxes_for, n_rows=n_want, stats={}, scorer=scorer,
+                shared_scene_encoder=scorer_shared_encoder)]
+        body, used = estimate_body_size(preds)
+        where = (f'{len(segs)} window(s) / {used} frames of {gid} in [{start}, {stop}), no prior, '
+                 f"internal {gate['px']:g} px gate")
         if not (body == body and body > 0):
-            print(f'WARNING: body-unit association gate: the first pass over {used} frames of {gid} produced no '
-                  f"finite pose to size the animal; falling back to the LEGACY {gate['px']:g} px gate. Set "
-                  'session.toml body_length to use the body gate.', flush=True)
+            print(f'WARNING: body-unit association gate: the first pass ({where}) produced no finite pose to size '
+                  f"the animal; falling back to the internal {gate['px']:g} px gate. Pass --body-length to use "
+                  'the body gate.', flush=True)
             args._assoc_gate = dict(mode='px', px=gate['px'], body=None,
                                     why='body size unavailable (first pass produced no pose)')
-            args._body_size_source = f'first pass over {used} frames of {gid}: no finite pose'
+            args._body_size_source = f'first pass: no finite pose ({where})'
             return
         args._body_size = float(body)
-        args._body_size_source = (f'first pass: median pose extent over frames [0, {used}) of {gid} at the '
-                                  f"legacy {gate['px']:g} px gate")
-        print(f'body size: {body:.4g} {sess.units} from a first pass over {used} frames of {gid} '
-              f'({time.time() - t0:.1f}s)', flush=True)
+        args._body_size_source = f'first pass: median pose extent over {where}'
+        print(f'body size: {body:.4g} {sess.units} from {where} ({time.time() - t0:.1f}s)', flush=True)
     if args._body_size is not None:
         print(f"association gate: {gate['body']:g} body ({gate['why']}), body size {args._body_size:.4g} "
               f"{sess.units} ({args._body_size_source}) = {gate['body'] * args._body_size:.4g} {sess.units}")
     else:
         print(f"association gate: {gate['body']:g} body ({gate['why']}); {args._body_size_source}")
+
 
 def run_dataset(args):
     """One inference run: refuse, load, then predict every group into one prediction session.
@@ -171,11 +175,8 @@ def run_dataset(args):
     refuse_out_dir(args)
     ds_name, sess, src_prov = load_source(args)
     refuse_scorer_rig(args.scorer, sess)
-    args._assoc_gate = resolve_assoc_gate(args, sess)
+    args._assoc_gate = resolve_assoc_gate(args)
     args._body_size, args._body_size_source = None, ''
-    if args._assoc_gate['mode'] == 'px':
-        print(f"association gate: LEGACY pixel gate {args._assoc_gate['px']:g} px "
-              f"({args._assoc_gate['why']})")
     device = args.device if torch.cuda.is_available() else 'cpu'
     model, config, registry, ckpt = load_pose(args, device)
     trained_frames, trained_px = trained_window(args, config)
@@ -191,9 +192,8 @@ def run_dataset(args):
     print(f'ram: {_budget}')
 
     gids = select_groups(args, sess, cfg)
-    if args._assoc_gate['mode'] == 'body':
-        _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, det, det_wh, det_red,
-                           det_tile, det_boxsrc, device, scorer, scorer_shared_encoder)
+    _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, det, det_wh, det_red,
+                       det_tile, det_boxsrc, device, scorer, scorer_shared_encoder)
     writer = SessionWriter(args.out, sess, registry,
                            run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov,
                                           scorer_run, det_tile, det_red, det_boxsrc),

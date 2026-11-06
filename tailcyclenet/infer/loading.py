@@ -60,15 +60,10 @@ def detector_box_source(det, ds_name, default):
 def load_source(args):
     """The source session: `--videos` adopted in memory, or the one `--data` session.
 
-    `--assoc-res-max-px` defaults to None so a `--data` session's own stored value survives
-    unless given; under `--videos` an absent flag resolves to the format default.
-
     Inputs: args. Outputs: (ds_name, sess, src_prov) -- the registry key, the Session, and the
         source half of the run provenance (the same keys on both branches).
     Side effects: decodes container metadata (`--videos`); may write `--dump-session`; prints.
     """
-    assoc_res_max_px = (args.assoc_res_max_px if args.assoc_res_max_px is not None else 30.0)
-
     if args.videos:
         from . import adopt
         adopt.check_flags(args)
@@ -87,7 +82,7 @@ def load_source(args):
                              'describe 2D image coordinates, not calibrated world coordinates.')
         ds_name = adopt.dataset_name(reg, args.dataset_name)
         sess = adopt.build(vplan, names=reg.local_names(ds_name), units=units,
-                           fps=args.fps, assoc_res_max_px=assoc_res_max_px,
+                           fps=args.fps,
                            trim=args.trim_to_shortest)
         src_prov = adopt.provenance_of(vplan)
         src_prov['source_split'] = ''
@@ -96,10 +91,6 @@ def load_source(args):
     else:
         args.split = args.split or 'test'
         ds_name, sess = refuse_multi_session(args.data, args.split)
-        if args.assoc_res_max_px is not None:
-            print(f'assoc_res_max_px: overriding the session\'s own '
-                  f'{sess.assoc_res_max_px:g}px with {assoc_res_max_px:g}px')
-            sess.assoc_res_max_px = float(assoc_res_max_px)
         src_prov = {'source': 'tailcyclenet infer',
                     'source_session': str(Path(args.data).resolve()),
                     'source_split': args.split,

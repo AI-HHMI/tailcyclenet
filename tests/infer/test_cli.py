@@ -304,34 +304,33 @@ def test_deleted_inference_flags_raise_by_name(cli, monkeypatch):
             cli.main()
 
 
-def test_assoc_res_max_px_overrides_a_data_session_but_defaults_to_its_own(cli, monkeypatch,
-                                                                           tmp_path):
-    """An omitted `--assoc-res-max-px` keeps the session's own value (17.5, not the format's 30);
-    given explicitly it overrides."""
+def test_the_pixel_gate_flags_are_removed_and_a_leftover_session_key_is_ignored(cli, monkeypatch, tmp_path,
+                                                                                 capsys):
+    """--assoc-res-max-px / --assoc-res-max-sides raise by name (removed 2026-11-05); a session.toml still
+    carrying assoc_res_max_px loads with one warning, and prediction sessions no longer write it."""
     import tomllib
 
     import toml
 
     session_dir, run = _cli_setup(tmp_path)
+    for flag in ('--assoc-res-max-px', '--assoc-res-max-sides'):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(session_dir),
+                                          '--out', str(tmp_path / 'x'), flag, '30'])
+        with pytest.raises(SystemExit, match='removed 2026-11-05|removed with the pixel gate'):
+            cli.main()
     toml_path = session_dir / 'session.toml'
     cfg = toml.loads(toml_path.read_text())
     cfg['assoc_res_max_px'] = 17.5
     toml_path.write_text(toml.dumps(cfg))
-
-    def _run(out, *extra):
-        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                          '--data', str(session_dir), '--split', 'test',
-                                          '--anchor', 'none', '--device', 'cpu',
-                                          '--overlap', '2', '--out', str(out), *extra])
-        cli.main()
-        with open(out / 'session.toml', 'rb') as f:
-            return tomllib.load(f)['assoc_res_max_px']
-
-    assert _run(tmp_path / 'default') == 17.5, \
-        "an omitted flag must not clobber the session's own value"
-    assert _run(tmp_path / 'override', '--assoc-res-max-px', '12') == 12.0, \
-        'given explicitly, it must override'
-
+    out = tmp_path / 'default'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(session_dir),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--out', str(out)])
+    cli.main()
+    with open(out / 'session.toml', 'rb') as f:
+        written = tomllib.load(f)
+    assert 'assoc_res_max_px' not in written
+    assert written['provenance']['assoc_gate'] == 'body'
 
 def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
     """`frame` is always the SOURCE index and groups.pq keeps the full length; `load_predictions`

@@ -105,6 +105,40 @@ def _animal_vocab(tables: list[pa.Table | None], gid: str) -> list[str]:
     return sorted(found)
 
 
+VALIDATION_RES_MAX_PX = 30.0
+"""The GT triangulation's / validation rule 12's reprojection threshold in pixels: a code constant, not data. The
+session.toml key `assoc_res_max_px` that used to carry it was removed from the format on 2026-11-05 (cross-view
+association at inference uses the body-unit gate, `infer.associate.ASSOC_RES_MAX_BODY`); every root that carried
+it carried 30.0."""
+
+_WARNED_LEGACY: set = set()
+
+
+def _refuse_removed_keys(path, cfg):
+    """session.toml keys removed from the format. `body_length` RAISES by name (none was ever written to data).
+    `assoc_res_max_px` is IGNORED: every data root was stripped of it on 2026-11-05 (manifest
+    scratch/assoc_body_gate/), and prediction sessions / scratch-derived sessions written before then still carry it,
+    so it warns once per process outside a prediction session rather than making those unreadable."""
+    import sys
+
+    if 'body_length' in cfg:
+        raise FormatError(f'{path / "session.toml"}: `body_length` is no longer a session.toml key -- '
+                          f'{REMOVED_SESSION_KEYS["body_length"]}. Delete the line.')
+    if 'assoc_res_max_px' in cfg and not cfg.get('prediction_session', False) and not _WARNED_LEGACY:
+        _WARNED_LEGACY.add('assoc_res_max_px')
+        print(f'WARNING: {path / "session.toml"}: `assoc_res_max_px` is ignored -- '
+              f'{REMOVED_SESSION_KEYS["assoc_res_max_px"]} (warned once per process).', file=sys.stderr)
+
+
+REMOVED_SESSION_KEYS = {
+    'assoc_res_max_px': 'removed from the format on 2026-11-05: cross-view association at inference uses the body-unit '
+                        'gate (scripts/infer.py --assoc-res-max-body), and the GT triangulation threshold is the code '
+                        'constant format.VALIDATION_RES_MAX_PX (30 px)',
+    'body_length': 'body size is not data (owner decision 2026-11-05): inference estimates it label-free, or takes '
+                   'scripts/infer.py --body-length',
+}
+
+
 def triangulate_group(rig: Rig, lab: Labels, gate: float) -> tuple[int, int, int]:
     """Derive 3D labels from per-camera positions; return (visible, gated, missing).
 
@@ -230,14 +264,6 @@ class Session:
     # Whether session.toml explicitly declared ``flip_pairs`` (including an empty list).
     flip_pairs_declared: bool = False
     provenance: dict = field(default_factory=dict)
-    assoc_res_max_px: float = 30.0
-    # True iff session.toml declares `assoc_res_max_px` itself: an explicit key keeps the LEGACY pixel
-    # association gate for this session (`infer.body.resolve_assoc_gate`); absent = the body-unit gate.
-    # The value above still serves the GT triangulation's default either way.
-    assoc_res_max_px_declared: bool = False
-    # The animal's body size in world (calibration) units -- the body-unit association gate's scale.
-    # None = estimated label-free at inference time (`infer.body`).
-    body_length: float | None = None
     # Prediction outputs have narrowly different coordinate/status semantics. Missing on legacy
     # annotation sessions means False; complete is optional for pre-marker sessions.
     prediction_session: bool = False
@@ -350,6 +376,7 @@ class Session:
                 notes=gt.get('notes', [''] * len(gt['group_id']))[i] or '',
             )
 
+        _refuse_removed_keys(path, cfg)
         sess = cls(
             path=path,
             mode=cfg['mode'],
@@ -362,9 +389,6 @@ class Session:
             flip_pairs=[list(p) for p in cfg.get('flip_pairs', [])],
             flip_pairs_declared='flip_pairs' in cfg,
             provenance=dict(cfg.get('provenance', {})),
-            assoc_res_max_px=float(cfg.get('assoc_res_max_px', 30.0)),
-            assoc_res_max_px_declared='assoc_res_max_px' in cfg,
-            body_length=(float(cfg['body_length']) if cfg.get('body_length') is not None else None),
             prediction_session=bool(cfg.get('prediction_session', False)),
             complete=cfg.get('complete'),
         )
@@ -506,7 +530,7 @@ class Session:
                      vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
         if (self.mode == '3d' and not self.prediction_session and out.points3d is None
                 and out.points2d is not None):
-            triangulate_group(self.rig, out, self.assoc_res_max_px)
+            triangulate_group(self.rig, out, VALIDATION_RES_MAX_PX)
         self._label_cache[gid] = out
         return out
 

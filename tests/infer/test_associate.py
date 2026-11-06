@@ -225,7 +225,6 @@ def test_associate_group_threads_max_age_and_frame_base(tmp_path, monkeypatch):
     monkeypatch.setattr(detmod, 'link_rows', spy_link_rows)
 
     class _FakeSession:
-        assoc_res_max_px = 30.0
         rig = type('Rig', (), {'moving': {}})()
 
         def cgroup(self, gid, t=None):
@@ -291,37 +290,6 @@ def _p8_key(groups):
     return [(sorted(g['members'].items()), round(g['residual'], 6)) for g in groups]
 
 
-def test_sides_gate_equals_pixel_gate_when_every_box_has_one_side():
-    """With every box the same side s, a gate of g sides IS a gate of g*s pixels: the same
-    groups, in the same order, with residuals scaled by 1/s."""
-    from tailcyclenet.infer.associate import associate
-
-    side = 80.0
-    cg, boxes = _p8_scene(side)
-    for px in (5.0, 12.0, 30.0):
-        a = associate(cg, boxes, max_res_px=px)
-        b = associate(cg, boxes, max_res_px=999.0, max_res_sides=px / side)
-        assert [sorted(g['members'].items()) for g in a] == \
-            [sorted(g['members'].items()) for g in b]
-        np.testing.assert_allclose([g['residual'] / side for g in a],
-                                   [g['residual'] for g in b], rtol=1e-5)
-
-
-def test_sides_gate_is_scale_free():
-    """A pixel gate that accepts a small-box rig rejects the same geometry at twice the image
-    scale; the box-side gate reads both the same."""
-    from tailcyclenet.infer.associate import associate
-
-    cg, small = _p8_scene(60.0)
-    n_px = len(associate(cg, small, max_res_px=10.0))
-    n_sides = len(associate(cg, small, max_res_sides=10.0 / 60.0))
-    assert n_px == n_sides
-    # half the box side at the same residual: the side gate tightens, the pixel gate cannot see it
-    _, tiny = _p8_scene(30.0)
-    assert len(associate(cg, tiny, max_res_px=10.0)) == n_px
-    assert len(associate(cg, tiny, max_res_sides=10.0 / 60.0)) <= n_px
-
-
 def test_default_associate_is_unchanged_by_the_new_keywords():
     from tailcyclenet.infer.associate import associate
 
@@ -371,7 +339,7 @@ def test_fast_associate_is_identical_to_the_reference():
         boxes[trial % 4][1] = float('nan')
         scores = [torch.as_tensor(rng.uniform(0, 1, len(b)), dtype=torch.float32)
                   for b in boxes]
-        for kw in ({}, {'max_res_sides': 0.2}, {'score_order': True}, {'min_views': 1},
+        for kw in ({}, {'score_order': True}, {'min_views': 1},
                    {'max_instances': 3}):
             ref = associate(cg, boxes, scores_per_cam=scores, **kw)
             got = associate(cg, boxes, scores_per_cam=scores, fast=True, **kw)

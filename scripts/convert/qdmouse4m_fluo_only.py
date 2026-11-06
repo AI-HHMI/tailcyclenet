@@ -81,7 +81,7 @@ def convert(combined: Path, output: Path, overwrite: bool = False) -> dict[str, 
                     out_session, mode=s.mode, units=s.units, label_source=s.label_source,
                     names=s.names, rig=rig, groups=groups, labels=labels, skeleton=s.skeleton,
                     flip_pairs=(s.flip_pairs if s.flip_pairs_declared else None),
-                    provenance=prov, assoc_res_max_px=s.assoc_res_max_px)
+                    provenance=prov)
                 if fmt.Session.load(out_session).has_visibility_assessment != s.has_visibility_assessment:
                     raise RuntimeError(f'{s.path}: visibility assessment changed')
                 for gid in s.groups:

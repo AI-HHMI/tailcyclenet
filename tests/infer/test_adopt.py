@@ -398,7 +398,7 @@ def test_the_in_memory_session_matches_the_written_one(tmp_path):
     dumped with symlinked pixels, validates and agrees field by field."""
     cal = _two_cam(tmp_path, T=6)
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
-    mem = adopt.build(p, names=KPTS_3D, units='mm', assoc_res_max_px=17.5, verbose=False)
+    mem = adopt.build(p, names=KPTS_3D, units='mm', verbose=False)
 
     out = tmp_path / 'written'
     adopt.dump(mem, out)
@@ -409,7 +409,6 @@ def test_the_in_memory_session_matches_the_written_one(tmp_path):
 
     assert (disk.mode, disk.units, disk.label_source) == (mem.mode, mem.units, mem.label_source)
     assert disk.names == mem.names and disk.cam_names == mem.cam_names
-    assert disk.assoc_res_max_px == mem.assoc_res_max_px
     for cam in mem.cam_names:
         np.testing.assert_allclose(
             disk.rig.by_name(cam).get_camera_matrix().detach().cpu().numpy(),

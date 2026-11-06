@@ -350,7 +350,7 @@ def _probe(path: Path) -> tuple[int, tuple[int, int], float]:
     return int(n), (int(w), int(h)), fps
 
 
-def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0,
+def build(plan: VideoPlan, *, names, units='mm', fps=None,
           trim=False, probe=_probe, verbose=True) -> fmt.VideoSession:
     """Probe every video, then construct the session IN MEMORY. Refusals 12-14.
 
@@ -441,7 +441,7 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
     sess = fmt.VideoSession(
         path=_common_parent(list(plan.files)) / plan.session_id,
         mode=plan.mode, units=str(units), label_source='tracked', names=list(names),
-        rig=plan.rig, groups=groups, assoc_res_max_px=float(assoc_res_max_px),
+        rig=plan.rig, groups=groups,
         provenance={'source': 'tailcyclenet infer --videos'}, empty=empty)
     for g in groups.values():
         g.session = sess
@@ -537,7 +537,6 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
         rig=p.rig, groups=groups,
         flip_pairs=[list(pair) for pair in cfg.get('flip_pairs', [])],
         flip_pairs_declared='flip_pairs' in cfg,
-        assoc_res_max_px=float(cfg.get('assoc_res_max_px', 30.0)),
         provenance=dict(prov), empty=empty)
     for g in groups.values():
         g.session = sess
@@ -554,8 +553,7 @@ def dump(sess: fmt.VideoSession, out: Path) -> None:
                       names=sess.names, rig=sess.rig, groups=sess.groups,
                       labels={g: sess.labels(g) for g in sess.groups},
                       flip_pairs=sess.flip_pairs if sess.flip_pairs_declared else None,
-                      provenance=dict(sess.provenance),
-                      assoc_res_max_px=sess.assoc_res_max_px)
+                      provenance=dict(sess.provenance))
     for gid, g in sess.groups.items():
         d = out / 'groups' / gid
         d.mkdir(parents=True, exist_ok=True)

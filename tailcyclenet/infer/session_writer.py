@@ -122,7 +122,6 @@ class SessionWriter:
             units = 'normalized'
         cfg = {'mode': source.mode, 'units': units, 'labels': 'tracked',
                'names': list(source.names), 'prediction_session': True, 'complete': False,
-               'assoc_res_max_px': float(source.assoc_res_max_px),
                'provenance': dict(provenance)}
         self._session_cfg = cfg
         self._write_session_header(toml.dumps(cfg))

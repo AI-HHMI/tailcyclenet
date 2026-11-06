@@ -314,7 +314,6 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                     dst, mode=spec['mode'], units=spec['units'], label_source='tracked',
                     names=list(spec['names']), rig=rig, groups=groups, labels=labels,
                     skeleton=spec.get('skeleton', []), flip_pairs=spec.get('flip_pairs', []),
-                    assoc_res_max_px=spec.get('assoc_res_max_px'),
                     provenance={
                         'source': f'posetail-finetuning-v4/{name}/{split}/{v4_session.name}',
                         'annotator': '', 'annotator_tool': 'scripts/convert/v4.py',

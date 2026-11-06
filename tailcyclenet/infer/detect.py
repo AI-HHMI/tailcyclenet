@@ -240,7 +240,7 @@ def det_chunk(batch, n_px, device):
 
 def _gate_body(args):
     """The run's body-unit gate (`infer.body.resolve_assoc_gate`, set by the driver as `args._assoc_gate`), or
-    None for the legacy pixel gate -- including a namespace the driver never resolved (a caller of its own)."""
+    None for the INTERNAL pixel gate (the first pass; a namespace the driver never resolved)."""
     g = getattr(args, '_assoc_gate', None)
     return None if not g or g.get('mode') != 'body' else float(g['body'])
 
@@ -307,7 +307,6 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                                    state=assoc_state,
                                    duplicate_radius=args.duplicate_radius,
                                    duplicate_persist=args.duplicate_persist,
-                                   assoc_res_max_sides=args.assoc_res_max_sides,
                                    assoc_score_order=args.assoc_score_order,
                                    track_age_decay=args.track_age_decay,
                                    track_affinity_2d=args.track_affinity_2d,

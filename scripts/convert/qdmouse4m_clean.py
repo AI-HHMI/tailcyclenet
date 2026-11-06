@@ -461,7 +461,6 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
                     groups=out_groups, labels=session_labels, skeleton=src_session.skeleton,
                     flip_pairs=(src_session.flip_pairs if src_session.flip_pairs_declared else None),
                     provenance=prov,
-                    assoc_res_max_px=src_session.assoc_res_max_px,
                 )
                 for child_id, src_group, start, end, unsplit in child_pixels:
                     dst_dir = out_session / 'groups' / child_id
@@ -573,7 +572,6 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
             groups=remaining_groups, labels=labels, skeleton=session.skeleton,
             flip_pairs=(session.flip_pairs if session.flip_pairs_declared else None),
             provenance=session.provenance,
-            assoc_res_max_px=session.assoc_res_max_px,
         )
         reloaded = fmt.Session.load(session.path)
         if reloaded.has_visibility_assessment != visibility_before:

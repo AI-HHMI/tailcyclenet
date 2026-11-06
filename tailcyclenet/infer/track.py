@@ -159,7 +159,7 @@ class CrossViewTracker:
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
                  duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0,
-                 max_res_sides=None, score_order=False, age_decay=None, affinity_2d=0.0,
+                 score_order=False, age_decay=None, affinity_2d=0.0,
                  camera_claims=False, fast=True, random_drop=0.0, max_res_body=None,
                  body_size=None):
         """Create an empty tracker with `n_slots` rows.
@@ -182,7 +182,7 @@ class CrossViewTracker:
                     on an aligned lead-in batch below `--start-frame`, so its step count alone is
                     not the source frame -- events must add this back, or a bridge/consumer that
                     reads them as source-absolute silently misreads a ranged run.
-                max_res_sides / score_order (TR5, TR6a) -- passed to every `associate` call.
+                score_order (TR6a) -- passed to every `associate` call.
                 age_decay (T2) -- None: the additive sticky-age term; lambda: `aff*exp(-l*age)`.
                 affinity_2d (TR3) -- w2 in `(1-w2)*A_3D + w2*A_2D` (`_affinity_2d`); 0 = A_3D.
                 camera_claims (TR2) -- per-camera claims after matching (`_claim_per_camera`).
@@ -203,7 +203,6 @@ class CrossViewTracker:
             raise ValueError('duplicate_radius must be non-negative')
         self.duplicate_radius = float(duplicate_radius)
         self.duplicate_persist = int(duplicate_persist)
-        self.max_res_sides = None if max_res_sides is None else float(max_res_sides)
         self.score_order = bool(score_order)
         self.n_groups = 0
         self.age_decay = None if age_decay is None else float(age_decay)
@@ -549,7 +548,7 @@ class CrossViewTracker:
 
         C = len(cgroup)
         groups = associate(cgroup, boxes_per_cam, max_res_px=self.max_res_px,
-                           min_views=self.min_views, max_res_sides=self.max_res_sides,
+                           min_views=self.min_views,
                            scores_per_cam=scores_per_cam, score_order=self.score_order,
                            fast=self.fast, random_drop=self._random_drop,
                            max_res_body=self.max_res_body, body_size=self.body_size)

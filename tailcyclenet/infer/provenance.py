@@ -55,9 +55,9 @@ def _det_chunk_rule():
 
 
 def _gate_provenance(args):
-    """The cross-view gate the run used (`infer.body.resolve_assoc_gate`), unconditionally: its unit, why,
-    both thresholds, and the body size with its source. A namespace the driver never resolved records an
-    empty unit (nothing was resolved, so nothing is claimed)."""
+    """The cross-view gate the run used (`infer.body.resolve_assoc_gate`), unconditionally: its unit ('body', or
+    'px' on the warned fallback to the internal pixel gate), why, both thresholds, and the body size with its
+    source ('first pass ...' | 'CLI --body-length'). A namespace the driver never resolved records an empty unit."""
     g = getattr(args, '_assoc_gate', None) or {}
     body = getattr(args, '_body_size', None)
     return {
@@ -97,8 +97,6 @@ def identity_provenance(args):
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
         **_gate_provenance(args),
-        'assoc_res_max_sides': (float(args.assoc_res_max_sides)
-                                if args.assoc_res_max_sides is not None else 0.0),
         'assoc_score_order': bool(args.assoc_score_order),
         'track_age_decay': (float(args.track_age_decay)
                             if args.track_age_decay is not None else -1.0),

@@ -44,6 +44,10 @@ REMOVED_FLAGS = {
                    'drops the quarantined rows; v0.3.4 is the last release that has it',
     '--det-input-wh': 'posetail-pose detector compat; a detector checkpoint records its own '
                       'input size; v0.3.4 is the last release that has it',
+    '--assoc-res-max-px': 'removed 2026-11-05; association uses the body gate, --assoc-res-max-body '
+                          '(report 76 detr3d-diag)',
+    '--assoc-res-max-sides': 'TR5 (a pixel-gate lever, measured null) is removed with the pixel gate on '
+                             '2026-11-05; association uses the body gate, --assoc-res-max-body',
 }
 
 
@@ -273,26 +277,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help='duplicate proximity in box sides for the 3D --track backstop.')
     ident.add_argument('--duplicate-persist', type=int, default=5,
                        help='in-band frames before the 3D --track backstop resolves a duplicate.')
-    ident.add_argument('--assoc-res-max-px', type=float, default=None,
-                       help='LEGACY: run the PIXEL cross-view gate at this reprojection residual '
-                            '(a pixel gate must be swept per rig). Default: the body-unit gate, '
-                            "unless the session's own session.toml declares assoc_res_max_px.")
     ident.add_argument('--assoc-res-max-body', type=float, default=None,
-                       help='the cross-view gate in BODY units: every association residual is a world '
-                            'point-to-ray / ray-ray distance divided by the body size (session.toml '
-                            'body_length, else a label-free first pass over 300 frames). Default: '
-                            '0.15 (owner decision 2026-11-05; report 76 detr3d-diag: CMU Panoptic MOTA '
-                            '0.653 -> 1.000 vs 30 px, 3dpop Seq59+Seq29 within the 30-60 px band, '
-                            'social-dannce identical). Overrides a session-declared pixel gate.')
-    ident.add_argument('--assoc-res-max-sides', type=float, default=None,
-                       help='TR5: gate cross-view grouping on the reprojection residual in BOX '
-                            "SIDES (median over views of residual / that view's box side) "
-                            'instead of pixels; when set it REPLACES the pixel gate for '
-                            'association only (the GT triangulation keeps assoc_res_max_px). '
-                            'Pixel gate only (needs --assoc-res-max-px or a session pixel key). '
-                            'Default: off. measured: 3dpop Seq59/Seq29 at 0.19 (= '
-                            '30 px at the 157 px median side): MOTA -0.0003, idsw 13->10 / '
-                            '0->3, IDF1 -0.012 [-0.045, +0.009] (2026-10-19).')
+                       help='the cross-view association gate in BODY units: every residual is a world '
+                            'point-to-ray / ray-ray distance divided by the body size. Default: 0.15 '
+                            '(owner decision 2026-11-05; report 76 detr3d-diag: CMU Panoptic MOTA 0.653 '
+                            '-> 1.000 vs the old 30 px gate, 3dpop Seq59+Seq29 within the 30-60 px band, '
+                            'social-dannce identical).')
+    ident.add_argument('--body-length', type=float, default=None,
+                       help="the animal's body size in WORLD units (the calibration's), the body gate's "
+                            'scale; skips the label-free estimate. Default: estimated per run from '
+                            f'{4} sparse pose windows over the run\'s own frame range (median 3D extent '
+                            'diagonal; within ~5%% of GT on Panoptic, 3dpop, social-dannce).')
     ident.add_argument('--assoc-score-order', action=argparse.BooleanOptionalAction,
                        default=False,
                        help='TR6a: rank cross-view candidate pairs by (support, lower box '

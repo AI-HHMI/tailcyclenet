@@ -486,7 +486,6 @@ def convert(src: Path, out: Path, max_gap: int, reject_px: float,
                 out / split / session, mode='3d', units='mm', label_source='annotated',
                 names=names, rig=rig, groups=groups, labels=labels,
                 skeleton=skeleton, flip_pairs=flip_pairs,
-                assoc_res_max_px=30.0,
                 provenance={
                     'source': f'{release_name}/{split}/{session}',
                     'annotator': '', 'annotator_tool': 'FlyPose JARVIS release',

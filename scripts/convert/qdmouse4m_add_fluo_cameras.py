@@ -149,7 +149,6 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
                     groups=groups, labels=labels, skeleton=clean.skeleton,
                     flip_pairs=(clean.flip_pairs if clean.flip_pairs_declared else None),
                     provenance=provenance,
-                    assoc_res_max_px=clean.assoc_res_max_px,
                 )
                 reloaded = fmt.Session.load(out_session)
                 if reloaded.has_visibility_assessment != visibility_before:

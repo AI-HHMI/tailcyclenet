@@ -1,4 +1,4 @@
-"""identity.crops / identity.pixid / identity.maskhead on synthetic sessions (CPU, no video, no checkpoints)."""
+"""identity.crops / identity.pixid on synthetic sessions (CPU, no video, no checkpoints)."""
 import numpy as np
 import pandas as pd
 import pytest
@@ -6,7 +6,6 @@ import torch
 
 from tailcyclenet.identity import crops as CR
 from tailcyclenet.identity import pixid as PX
-from tailcyclenet.identity.maskhead import NPARAM, MaskHead, load_maskhead
 
 H, W = 120, 160
 
@@ -96,45 +95,6 @@ def test_crops_roundtrip(tmp_path):
     CR.save_crops(tmp_path / 'c.npz', c)
     r = CR.load_crops(tmp_path / 'c.npz')
     assert r['gid'] == 'g0' and r['bl'] == 12.5 and r['crops'].shape == (2, 3, 8, 8) and list(r['ids']) == ['a', 'b']
-
-
-def test_moment_geometry_points_along_the_heavy_end():
-    """The axis angle is the mask's long axis, signed toward positive skew: away from the heavy end,
-    along the long thin side."""
-    m = np.zeros((60, 80), bool)
-    m[28:33, 10:70] = True
-    m[24:37, 55:70] = True                                           # heavy at +x
-    cx, cy, th = CR._moment_geom(m)
-    assert abs(np.cos(th) + 1) < 1e-3 and 40 < cx < 60 and abs(cy - 30) < 1
-    cx2, cy2, th2 = CR._moment_geom(m[:, ::-1])
-    assert abs(np.cos(th2) - 1) < 1e-3
-    assert CR._moment_geom(np.zeros((5, 5), bool)) is None
-
-
-def test_mask_geoms_take_the_exclusive_region_in_source_px():
-    """Two overlapping soft masks on a stride grid: each geometry is its own argmax region, mapped
-    through the inverse letterbox into source px."""
-    qs = np.zeros((2, 40, 40), np.float32)
-    qs[0, 10:20, 5:15] = 0.9
-    qs[1, 10:20, 12:30] = 0.8
-    Minv = np.array([[2.0, 0, 0], [0, 2.0, 0]])                      # input px -> source px (x2)
-    g = CR._mask_geoms(list(qs), Minv, 200, 200)
-    assert g[0][0] == pytest.approx(2 * 10, abs=1.5) and g[1][0] == pytest.approx(2 * 22.5, abs=1.5)
-    assert g[0][1] == pytest.approx(2 * 15, abs=1.5)
-
-
-def test_maskhead_roundtrip_and_dynamic_shapes(tmp_path):
-    torch.manual_seed(0)
-    mh = MaskHead(cin=16, mid=8, ctrl=16)
-    torch.save({'state': mh.state_dict(), 'arch': dict(cin=16, mid=8, ctrl=16)}, tmp_path / 'mh.pth')
-    mh2 = load_maskhead(tmp_path / 'mh.pth')
-    feats = [torch.randn(1, 16, 16, 16), torch.randn(1, 16, 8, 8), torch.randn(1, 16, 4, 4)]
-    mf, prm = mh2.mask_feats(feats), mh2.params(feats)
-    assert mf.shape == (1, 8, 16, 16) and prm.shape == (1, 16 * 16 + 8 * 8 + 4 * 4, NPARAM)
-    with torch.no_grad():
-        logits = MaskHead.dynamic(mf[0], prm[0, :3], torch.tensor([[10., 10.], [30., 20.], [5., 50.]]), torch.tensor([4., 20., 9.]))
-        assert logits.shape == (3, 16, 16)
-        assert torch.equal(mh.mask_feats(feats), mf)
 
 
 def test_tracklets_cut_at_gaps_jumps_and_contacts():

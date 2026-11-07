@@ -343,14 +343,6 @@ def build_parser() -> argparse.ArgumentParser:
                             'Output-neutral (each slot sees the inputs of the unchunked call); 8 '
                             'bounds memory at 60-100 animals (18.5 GiB reserved on an L4 at 100 fish, '
                             'where all-at-once runs out) and IS the unchunked call at <= 8 animals.')
-    ident.add_argument('--identity-mask-head', type=Path, default=None,
-                       help='--identity: pixel-ID crops from detector + mask-head masks (this '
-                            "maskhead.pth, the run's --detector) instead of the default crops "
-                            '(keypoint-aligned at K >= 2, detector-box at K = 1).')
-    ident.add_argument('--identity-mask-side', type=float, default=1.6, metavar='BL',
-                       help='--identity-mask-head: crop side in body lengths. 1.6 = the UDMT recipe; '
-                            'idtracker mice need 0.72 (the idtracker crop scale; pixel node accuracy '
-                            '0.995 vs 0.710 at 1.6 on mice_4_2).')
 
     sco = ap.add_argument_group('scorer')
     sco.add_argument('--scorer', type=Path, default=None,

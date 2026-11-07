@@ -7,8 +7,9 @@ PLACE, as `--identity-bridge` does: only `animal_id` changes, plus the deletion 
 relabel cannot place (a row-frame with any non-finite keypoint: the stack solves on fully finite rows
 only). Every decision and its inputs go to `identity.json` beside the tables and to `[provenance]`.
 
-Crop recipe (report 76 v7 / PREREG7): `--identity-mask-head` -> mask crops; else keypoint-aligned crops
-when the skeleton has head and tail-base keypoints (K >= 2), else detector-box crops (K = 1).
+Crop recipe (report 76 v7 / PREREG7): keypoint-aligned crops when the skeleton has head and tail-base
+keypoints (K >= 2), else detector-box crops (K = 1). The scratch mask-head recipe is deliberately not in the
+repo (owner decision 2026-11-07); box crops cost pixel accuracy on idtracker mice (1.00 -> 0.94 on mice_4_2).
 """
 from __future__ import annotations
 
@@ -40,11 +41,9 @@ def _source_notes(src, gid):
     return None if g.empty or g.notes.isna().all() else str(g.notes.iloc[0])
 
 
-def recipe_for(names, mask_head):
-    """'mask' | 'keypoint' | 'box' (module docstring)."""
+def recipe_for(names):
+    """'keypoint' | 'box' (module docstring)."""
     from .crops import axis_parts
-    if mask_head is not None:
-        return 'mask'
     hd, tb = axis_parts([str(n) for n in names])
     return 'keypoint' if (len(names) >= 2 and hd and tb) else 'box'
 
@@ -147,8 +146,7 @@ def _jsonable(x):
     return x
 
 
-def identity_group(out, gid, tt, *, stop=None, mask_head=None, detector=None, mask_side=1.6, device='cuda',
-                   log=print):
+def identity_group(out, gid, tt, *, stop=None, device='cuda', log=print):
     """One group: crops -> pixel-ID -> gate -> labels. Returns (record, labels or None, row animal_ids).
 
     The rows are the crops' rows: within [0, stop) a row with no entry is dropped (as the frozen stack
@@ -167,13 +165,9 @@ def identity_group(out, gid, tt, *, stop=None, mask_head=None, detector=None, ma
     if stop:
         pred = pred[:, :int(stop)]
     names = list(meta['names'])
-    recipe = recipe_for(names, mask_head)
+    recipe = recipe_for(names)
     t0 = time.time()
-    if recipe == 'mask':
-        from .maskhead import load_maskhead
-        c = C.mask_crops(out, detector, load_maskhead(mask_head, device), group=gid, device=device, stop=stop,
-                         side=mask_side)
-    elif recipe == 'keypoint':
+    if recipe == 'keypoint':
         c = C.keypoint_crops(out, group=gid, stop=stop)
     else:
         c = C.box_crops(out, group=gid, stop=stop)
@@ -210,10 +204,6 @@ def identity_session(out, args, device):
     out = Path(out)
     with open(out / TT_FILE, 'rb') as f:
         tt = pickle.load(f)
-    det = None
-    if getattr(args, 'identity_mask_head', None) is not None:
-        from ..detector.checkpoint import load_detector
-        det = load_detector(args.detector, device)
     import pandas as pd
     gids = [str(g) for g in pd.read_parquet(out / 'groups.pq').group_id.astype(str)]
     stop = int(getattr(args, 'end_frame', 0) or getattr(args, 'max_frames', 0) or 0) or None
@@ -224,9 +214,7 @@ def identity_session(out, args, device):
             continue
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
-            rec, lab, ids = identity_group(out, gid, tt, stop=stop, mask_head=args.identity_mask_head,
-                                           detector=det, mask_side=getattr(args, 'identity_mask_side', 1.6),
-                                           device=device)
+            rec, lab, ids = identity_group(out, gid, tt, stop=stop, device=device)
         if lab is not None:
             np.savez_compressed(out / LABELS_FILE.format(gid=gid), labels=lab, ids=np.array(ids))
             rec['relabel'] = relabel_tables(out, gid, ids, lab)

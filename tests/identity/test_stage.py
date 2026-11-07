@@ -44,6 +44,5 @@ def test_relabel_writes_only_animal_id(tmp_path):
 def test_label_names_and_recipes():
     assert label_names(np.array([[0, 12]]))(3) == 'id03'
     assert label_names(np.array([[0, 123]]))(3) == 'id003'
-    assert recipe_for(['nose', 'left_ear', 'tail_base'], None) == 'keypoint'
-    assert recipe_for(['centroid'], None) == 'box'
-    assert recipe_for(['nose', 'tail_base'], 'mh.pth') == 'mask'
+    assert recipe_for(['nose', 'left_ear', 'tail_base']) == 'keypoint'
+    assert recipe_for(['centroid']) == 'box'

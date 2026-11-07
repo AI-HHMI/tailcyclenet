@@ -128,8 +128,9 @@ def build_parser() -> argparse.ArgumentParser:
                           'disagreement is refused without it.')
 
     win = ap.add_argument_group('window loop')
-    win.add_argument('--anchor', default='carry', choices=ANCHORS,
-                     help="'labels' is an ORACLE, not a deployment number")
+    win.add_argument('--anchor', default=None, choices=ANCHORS,
+                     help="default carry (none, and only none, for a set-only 3D checkpoint); "
+                          "'labels' is an ORACLE, not a deployment number")
     win.add_argument('--overlap', type=int, default=4,
                      help='frames each window shares with its predecessor (sweep per root).')
     win.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
@@ -216,7 +217,8 @@ def build_parser() -> argparse.ArgumentParser:
     win.add_argument('--moe-route', default=None, choices=('contact', 'e1', 'e2'),
                      help='v7 2D MoE checkpoints only (a set decoder, E2): `contact` (default) '
                           'routes each slot-frame to E2 by the contact rule with hysteresis; '
-                          '`e1` / `e2` force one expert. Refused for a checkpoint without E2.')
+                          '`e1` / `e2` force one expert. A set-only 3D checkpoint (PBM4) is `e2` '
+                          'only. Refused for a checkpoint without E2.')
     win.add_argument('--crop-inflate', type=float, default=None,
                      help='inflate every crop about its centre. Default 1.5 with the box on, '
                           'else 1.0.')

@@ -13,6 +13,13 @@ E2's anchors are the detector's TIGHT boxes of this slot and of the 3 nearest sl
 touch the crop (crop px, NaN outside it); the anchored queries' position priors are this slot's carry
 (query 0, from the loop) and the other slots' latest WRITTEN rows (the routed rows the loop also
 carries). Everything is label-free.
+
+A SET-ONLY 3D checkpoint (PBM4, `set_only_inputs`) has no routing: every forward is E2's, anchored
+PER CAMERA on this slot's box and the 3 nearest slots' boxes (nearest by camera-0 centre distance,
+kept when inside some camera's crop; NaN in a camera whose crop it misses), no priors. A LEGACY
+square detector's boxes are the crop rule's box already and are used as they are (the PBM4 deploy,
+byte-for-byte); a tight detector's box is squared and padded by the run's `crop_pad_frac` x its
+longer side first, the geometry PBM4 trained its anchors on (`crowd.square_pad`).
 """
 from __future__ import annotations
 
@@ -155,3 +162,47 @@ class GroupRouter:
                 st[int(f)] = np.asarray(p_src[t], np.float32)
         for f in [f for f in st if f < int(frames[0]) - HISTORY]:
             del st[f]
+
+
+def set_only_inputs(a, win_boxes, use, boxes, scales, cgroup, dev, *, square, pad):
+    """`set_inputs` for a set-only 3D forward of slot `a` (module docstring). win_boxes (S,T,Call,4)
+    the detector boxes at the window's frames (source px, every rig camera); `use` / `boxes` /
+    `scales` / `cgroup` this forward's own plan (cameras in use, crop boxes, scales, crop cameras)."""
+    from ..loader.crowd import square_pad
+    from ..pose.set_decoder import NA
+    wb = np.asarray(win_boxes, np.float32)
+    if not square:
+        sq = np.full(wb.shape, np.nan, np.float32)
+        fin = np.isfinite(wb).all(-1)
+        for idx in zip(*np.nonzero(fin)):
+            sq[idx] = square_pad(wb[idx].astype(np.float64), pad)
+        wb = sq
+    S, T = wb.shape[:2]
+    cbs = []
+    for ii, ci in enumerate(use):
+        o = np.asarray(boxes[ii][:2], np.float32)
+        s_ = np.asarray(scales[ii], np.float32).reshape(-1)
+        s_ = np.concatenate([s_, s_])[:2] if s_.size == 1 else s_[:2]
+        ab = wb[:, :, ci]
+        cbs.append(np.concatenate([(ab[..., :2] - o) * s_, (ab[..., 2:] - o) * s_], -1))
+    cbc = np.stack(cbs, 2)
+    cb = cbc[:, :, 0]
+    fin = np.isfinite(cb).all(-1)
+    cen = np.where(fin[..., None], (cb[..., :2] + cb[..., 2:]) / 2, np.nan)
+    ins = np.zeros(cbc.shape[:3], bool)
+    for ii in range(len(use)):
+        Wi, Hi = (float(v) for v in cgroup[ii]['size'][:2])
+        bb = cbc[:, :, ii]
+        ins[:, :, ii] = (np.isfinite(bb).all(-1) & (bb[..., 2] > 0) & (bb[..., 0] < Wi)
+                         & (bb[..., 3] > 0) & (bb[..., 1] < Hi))
+    inside = ins.any(2)
+    with np.errstate(all='ignore'), __import__('warnings').catch_warnings():
+        __import__('warnings').simplefilter('ignore')
+        ca = np.nanmean(cen[a], 0)
+        dist = [np.nanmean(np.linalg.norm(cen[s] - ca, axis=-1)) for s in range(S)]
+    order = [a] + [int(s) for s in np.argsort(np.nan_to_num(dist, nan=1e9))
+                   if s != a and inside[s].any()]
+    anchors = np.full((1, NA, T, len(use), 4), np.nan, np.float32)
+    for j, s in enumerate(order[:NA]):
+        anchors[0, j] = np.where(ins[s][..., None], cbc[s], np.nan)
+    return {'route': 'e2', 'anchors': torch.from_numpy(anchors).to(dev), 'slot': int(a)}

@@ -418,6 +418,9 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             and getattr(model, 'set_decoder', None) is not None):
         from .moe import GroupRouter
         router = GroupRouter(cfg.moe_route, K)
+    set_only = (mode == '3d' and getattr(getattr(model, 'set_decoder', None), 'shared', False))
+    if set_only:
+        from .moe import set_only_inputs
     ovc_chains = ovc_tail = ovc_src = None
     if cfg.ovc and cfg.overlap:
         from . import ovc as _ovc
@@ -693,6 +696,10 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             set_inputs = router.inputs(a, frames, win_b, boxes, scales, cgroup_d, dev)
             if set_inputs is not None:
                 mkw['set_inputs'] = set_inputs
+        if (set_only and give_box and cfg.box_prompt == 'detector' and boxes_stc is not None):
+            win_b = corrupted[wi] if wi in corrupted else boxes_stc[:, frames - f0]
+            mkw['set_inputs'] = set_only_inputs(a, win_b, use, boxes, scales, cgroup, dev,
+                                                square=legacy_square, pad=cfg.crop_pad_frac)
         scene_ctx = (share_scene(model, scene_features=scene_features)
                      if cfg.anchor == 'self' else nullcontext())
         with scene_ctx:

@@ -185,9 +185,32 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
                          f'({trained_px}). A reduced first pass is the lever; a larger one is a '
                          'different model.')
     model_is_box = config.get('model', {}).get('box_prompt', 'none') != 'none'
-    moe = bool(config.get('model', {}).get('set_decoder', False))
+    set_mode = config.get('model', {}).get('set_decoder', False)
+    moe = bool(set_mode) and set_mode != 'only'
     moe_route = None
-    if moe:
+    if set_mode == 'only':
+        if sess.mode != '3d':
+            raise SystemExit('this checkpoint is a SET-ONLY model (set_decoder = "only", the v7 3D '
+                             'set decoder, PBM4): it deploys on 3D sessions only; this session is '
+                             f'{sess.mode}.')
+        if args.moe_route not in (None, 'e2'):
+            raise SystemExit(f'--moe-route {args.moe_route}: a set-only checkpoint has no E1 '
+                             '(box-FiLM) expert; its only route is e2.')
+        if args.anchor not in (None, 'none'):
+            raise SystemExit(f'--anchor {args.anchor}: a set-only 3D checkpoint deploys without '
+                             'priors (--anchor none); its carried-prior arm measured worse on '
+                             'social-dannce (report 76 v7 3D) and has no other-slot prior plumbing '
+                             'here.')
+        args.anchor = 'none'
+        moe_route = 'e2'
+        print('moe: set-only checkpoint (the v7 3D set decoder, PBM4): every window is E2, no '
+              'priors (--anchor none), anchors = the detector boxes of this slot and the 3 '
+              'nearest')
+        if not (args.detector or args.boxes):
+            print('moe: WARNING no --detector / --boxes: E2 runs WITHOUT anchors (as it validated)')
+        if args.box_prompt is None and (args.detector or args.boxes):
+            args.box_prompt = 'detector'
+    elif moe:
         if sess.mode != '2d':
             print('moe: this checkpoint carries a set decoder (E2), which is 2D only; a 3D '
                   'session deploys E1 (the box-FiLM model) alone')
@@ -204,6 +227,8 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
     elif args.moe_route is not None:
         raise SystemExit(f'--moe-route {args.moe_route}: this checkpoint has no set decoder (E2); '
                          'it deploys as the plain pose model.')
+    if args.anchor is None:
+        args.anchor = 'carry'
     if args.box_prompt is None:
         args.box_prompt = 'firstonly'
     box_prompt = args.box_prompt
@@ -243,8 +268,8 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
               'carry is available (owner-set default, 2026-09-05; report 55).')
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
     refine = args.refine if args.refine is not None else (
-        False if moe_route is not None else (True if box_on else sess.mode == '3d'))
-    if moe_route is not None and args.refine is None:
+        False if moe else (True if box_on else sess.mode == '3d'))
+    if moe and moe_route is not None and args.refine is None:
         print('moe: --refine defaults OFF for the 2D MoE (the 128 px pass cost +2.7 px '
               'non-contact on rat-city, report 76); pass --refine to turn it on')
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)

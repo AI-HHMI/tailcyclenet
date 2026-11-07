@@ -1,7 +1,6 @@
 """identity.crops / identity.pixid on synthetic sessions (CPU, no video, no checkpoints)."""
 import numpy as np
 import pandas as pd
-import pytest
 import torch
 
 from tailcyclenet.identity import crops as CR
@@ -35,30 +34,6 @@ def _mouse_frame(cx, cy, ang, L=40):
     cv2.line(img, tuple(int(v) for v in tail), tuple(int(v) for v in nose), 120, 6)
     cv2.circle(img, tuple(int(v) for v in nose), 6, 255, -1)
     return img, nose, tail
-
-
-def test_keypoint_crops_put_the_head_up_and_carry_the_angle(tmp_path, monkeypatch):
-    """The crop is centred on the keypoint mean and rotated head-up whatever the body angle; a frame
-    whose axis is undefined keeps the previous angle; too few keypoints -> not ok."""
-    T, angs = 4, [0.0, 1.2, -2.0, -2.0]
-    frames, pred = [], np.full((1, T, 3, 2), np.nan, np.float32)
-    for t, a in enumerate(angs):
-        img, nose, tail = _mouse_frame(80, 60, a)
-        frames.append(img)
-        pred[0, t] = [nose, (nose + tail) / 2, tail]
-    pred[0, 2, 0] = np.nan              # no head keypoint: angle carried from frame 1
-    pred[0, 3, :2] = np.nan             # 1 of 3 keypoints: not ok
-    src = _image_source(tmp_path, frames)
-    _fake_session(monkeypatch, tmp_path, pred, None, ['nose', 'centre', 'tail_base'], src)
-    c = CR.keypoint_crops('unused', out_px=32, side=1.6)
-    assert c['ok'].tolist() == [[True, True, True, False]]
-    assert c['bl'] == pytest.approx(40 * 1.25, rel=1e-4)
-    np.testing.assert_allclose(c['ang'][0, :3], [0.0, 1.2, 1.2], atol=1e-5)
-    for t in (0, 1):
-        x = c['crops'][0, t].astype(float)
-        assert x[:12].max() == 255 and x[-12:].max() < 255          # the nose blob is in the top band
-        assert x[:, 16].sum() > 4 * x[:, 3].sum()                    # the body is vertical, centred
-    assert not c['crops'][0, 3].any()
 
 
 def test_box_crops_are_unrotated_and_sized_by_the_median_box(tmp_path, monkeypatch):

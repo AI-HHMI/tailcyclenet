@@ -3,7 +3,7 @@ import numpy as np
 import polars as pl
 
 from tailcyclenet.format import DICT_COLS, write_table
-from tailcyclenet.identity.stage import label_names, recipe_for, relabel_tables
+from tailcyclenet.identity.stage import label_names, relabel_tables
 
 
 def _table(path, rows):
@@ -41,8 +41,6 @@ def test_relabel_writes_only_animal_id(tmp_path):
     assert swapped == ['id01']
 
 
-def test_label_names_and_recipes():
+def test_label_names():
     assert label_names(np.array([[0, 12]]))(3) == 'id03'
     assert label_names(np.array([[0, 123]]))(3) == 'id003'
-    assert recipe_for(['nose', 'left_ear', 'tail_base']) == 'keypoint'
-    assert recipe_for(['centroid']) == 'box'

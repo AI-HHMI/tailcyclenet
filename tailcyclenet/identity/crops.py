@@ -1,16 +1,13 @@
 """Per-row identity crops from a prediction session, the input of the per-video pixel-ID network.
 
-Two recipes, one output (`crops` (S,T,opx,opx) uint8 gray, `ok` (S,T), `ctr` (S,T,2) row centroid in
-source px, `bl` body length in source px, plus `gid`, `ids`, `names`); every recipe is label-free:
+One recipe for every skeleton (owner decision 2026-11-07): `box_crops`, the row's detector box centre,
+unrotated, side = `field` (negative = that multiple of the median box side), `out_px` px. Output:
+`crops` (S,T,opx,opx) uint8 gray, `ok` (S,T), `ctr` (S,T,2) row centroid in source px, `bl` body length
+in source px, plus `gid`, `ids`, `names`; label-free. The scratch keypoint-aligned and mask-head recipes
+are deliberately NOT in the repo (keypoint crops were the selection recipe for K >= 2 roots, so box
+crops on K >= 2 are unmeasured by the v7 / v8 finals).
 
-- `keypoint_crops` (K >= 2 skeletons): centred on the row's keypoint mean, rotated so the body axis
-  (tail base -> head keypoints) points up, side = `side` x body length, `out_px` px.
-- `box_crops` (K = 1): the row's detector box centre, unrotated, side = `field`
-  (negative = that multiple of the median box side), `out_px` px.
-
-The scratch mask-head recipe is deliberately NOT in the repo (owner decision 2026-11-07).
-
-Pixels: both recipes read libav's own gray conversion (`to_ndarray(format='gray')`),
+Pixels: the recipe reads libav's own gray conversion (`to_ndarray(format='gray')`),
 which `data.video.PyAVReader` cannot produce (it decodes rgb24, and rgb24 -> gray differs from libav's
 gray by up to 2 levels), so they decode here, sequentially, once per frame. Frame index = decode order
 (= `PyAVReader`'s presentation rank on any regular file).
@@ -24,15 +21,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-HEAD_NAMES = ('nose', 'neck', 'ear', 'head', 'snout')
 VIDEO_SUFFIXES = ('.mp4', '.avi', '.mov', '.mkv')
-
-
-def axis_parts(names):
-    """(head keypoint indices, tail-base keypoint indices) of a skeleton, matched by name."""
-    hd = [i for i, n in enumerate(names) if any(h in n.lower() for h in HEAD_NAMES)]
-    tb = [i for i, n in enumerate(names) if 'tail_base' in n.lower() or n.lower() == 'tailbase']
-    return hd, tb
 
 
 def _session(pred_dir, source, group, stop=None):
@@ -123,46 +112,6 @@ def load_crops(path, group=None):
     return dict(gid=gid, names=z['names'], **c)
 
 
-# --------------------------------------------------------------------------- keypoint crops
-def keypoint_crops(pred_dir, source=None, group=None, out_px=64, side=1.6, stop=None):
-    """Axis-aligned keypoint crops of every row (K >= 2 skeletons with head and tail-base keypoints).
-
-    Body length = 1.25 x median head-mean -> tail-base distance over rows with >= half their keypoints
-    (the head-mean -> tail-base span is ~0.8 BL). A frame whose axis is undefined or shorter than 0.2 BL
-    keeps the row's previous good angle (0 before the first); an all-NaN row has a NaN centroid.
-    `stop` (every recipe): frames [0, stop) only, e.g. a ranged run's `frame_stop`. `ok` = >= max(2, ceil(K/2)) finite keypoints."""
-    d, meta, src = _session(pred_dir, source, group, stop)
-    names = list(meta['names'])
-    gid = d['group_id']
-    hd, tb = axis_parts(names)
-    if not hd or not tb:
-        raise ValueError(f'{pred_dir}: keypoint crops need head and tail-base keypoints, names {names}')
-    P = d['pred'].astype(np.float32)
-    S, T = P.shape[:2]
-    fin = np.isfinite(P).all(-1)
-    okr = fin.sum(-1) >= max(2, (P.shape[2] + 1) // 2)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)
-        ctr = np.nanmean(np.where(fin[..., None], P, np.nan), axis=2)
-        H = np.nanmean(np.where(fin[..., hd, None], P[:, :, hd], np.nan), axis=2)
-        Tb = np.nanmean(np.where(fin[..., tb, None], P[:, :, tb], np.nan), axis=2)
-    v = H - Tb
-    L = np.linalg.norm(v, axis=-1)
-    bl = float(np.nanmedian(L[okr])) * 1.25
-    ang = np.arctan2(v[..., 1], v[..., 0])
-    good = np.isfinite(ang) & (L > 0.2 * bl)
-    last = np.where(good, np.arange(T)[None], -1)
-    last = np.maximum.accumulate(last, axis=1)
-    ang = np.where(last >= 0, np.take_along_axis(ang, np.maximum(last, 0), axis=1), np.float32(0.0)).astype(ang.dtype)
-    ok = okr & np.isfinite(ctr).all(-1)
-    opx = out_px
-    crops = np.zeros((S, T, opx, opx), np.uint8)
-    for i, img in gray_frames(*_media(src, gid), T):
-        for s in np.flatnonzero(ok[:, i]):
-            crops[s, i] = _warp(img, *ctr[s, i], side * bl, ang[s, i] + np.pi / 2, opx, cv2.INTER_AREA)
-    return _out(gid, crops, ok, ctr, bl, d['animal_ids'], names, ang=ang)
-
-
 # --------------------------------------------------------------------------- box crops
 def box_body_length(pred_dir, gid, stop=None):
     """Label-free body length of a prediction session's group, source px.
@@ -190,7 +139,7 @@ def box_body_length(pred_dir, gid, stop=None):
 
 
 def box_crops(pred_dir, source=None, group=None, field=-1.0, out_px=44, stop=None):
-    """Unrotated crops centred on each row's detector box (K = 1 roots).
+    """Unrotated crops centred on each row's detector box (every root).
 
     `field` = crop side in source px; negative = that multiple of the median box side. `ctr` is the
     row's keypoint mean, `ok` = finite box with side > 1 px and a finite centroid."""

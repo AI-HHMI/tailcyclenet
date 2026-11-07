@@ -7,9 +7,9 @@ PLACE, as `--identity-bridge` does: only `animal_id` changes, plus the deletion 
 relabel cannot place (a row-frame with any non-finite keypoint: the stack solves on fully finite rows
 only). Every decision and its inputs go to `identity.json` beside the tables and to `[provenance]`.
 
-Crop recipe (report 76 v7 / PREREG7): keypoint-aligned crops when the skeleton has head and tail-base
-keypoints (K >= 2), else detector-box crops (K = 1). The scratch mask-head recipe is deliberately not in the
-repo (owner decision 2026-11-07); box crops cost pixel accuracy on idtracker mice (1.00 -> 0.94 on mice_4_2).
+Crops: always detector-box crops (`identity.crops.box_crops`, owner decision 2026-11-07). The scratch
+keypoint-aligned (K >= 2) and mask-head recipes are deliberately not in the repo; box crops cost pixel
+accuracy on idtracker mice (1.00 -> 0.94 on mice_4_2) and are unmeasured on K >= 2 roots.
 """
 from __future__ import annotations
 
@@ -39,13 +39,6 @@ def _source_notes(src, gid):
         return None
     g = g[g.group_id.astype(str) == str(gid)]
     return None if g.empty or g.notes.isna().all() else str(g.notes.iloc[0])
-
-
-def recipe_for(names):
-    """'keypoint' | 'box' (module docstring)."""
-    from .crops import axis_parts
-    hd, tb = axis_parts([str(n) for n in names])
-    return 'keypoint' if (len(names) >= 2 and hd and tb) else 'box'
 
 
 def label_names(lab):
@@ -164,13 +157,9 @@ def identity_group(out, gid, tt, *, stop=None, device='cuda', log=print):
     pred = d['pred'].astype(float)
     if stop:
         pred = pred[:, :int(stop)]
-    names = list(meta['names'])
-    recipe = recipe_for(names)
+    recipe = 'box'
     t0 = time.time()
-    if recipe == 'keypoint':
-        c = C.keypoint_crops(out, group=gid, stop=stop)
-    else:
-        c = C.box_crops(out, group=gid, stop=stop)
+    c = C.box_crops(out, group=gid, stop=stop)
     t1 = time.time()
     ids = [str(x) for x in c['ids']]
     pos = {str(a): i for i, a in enumerate(d['animal_ids'])}
@@ -184,7 +173,7 @@ def identity_group(out, gid, tt, *, stop=None, device='cuda', log=print):
     notes = _source_notes(src, gid)
     bl = body_length(pred, notes)
     bl_source = 'source notes' if (notes and ('body_length_px=' in notes or 'box_px=' in notes)) else 'keypoint extent'
-    if not (bl > 0) and recipe != 'keypoint':
+    if not (bl > 0):
         bl, bl_source = float(C.box_body_length(out, gid, stop=stop)), 'median detector box side'
     recs = [r for r in tt['rec']['S'] if r['gid'] == gid]
     res = run_identity(pred, pix, recs, tt['events'].get(gid, []), bl)

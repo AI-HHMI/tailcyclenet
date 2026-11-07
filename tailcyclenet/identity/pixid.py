@@ -11,6 +11,11 @@ best so far, else it is rolled back. Stops when nothing is accepted, after 60 st
 (uniqueness >= max(0.9, (N-0.5)/N) (0.95 if N < 3) and a kept step's gain < `plateau`); then a final
 step trains on everything accepted. Output: per-crop softmax over N for every ok (row, frame).
 
+Crops are unrotated detector-box crops, so the network is made rotation-blind (s21's recipe): every input is
+masked to the inscribed circle, training rotates each crop by a uniform 0-360 deg angle (plus gain +-15%,
+offset +-0.1; no shift), and EVERY softmax (inference and the training-time uniqueness / accumulation checks)
+is the mean over `TTA_ROT` = 8 rotations (0, 45, ..., 315 deg).
+
 The shipped setting is one network (`K = 1`), uint8 crops resident on the device, bf16 autocast on CUDA,
 `plateau = 0.005`. Training draws from torch's global RNG on the device; it runs inside
 `torch.random.fork_rng`, so the caller's RNG state is untouched and a run depends only on `seed`.
@@ -24,6 +29,52 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as Fn
+
+
+TTA_ROT = 8
+
+
+def circle_mask(w, dev):
+    """(w, w) float mask of the inscribed circle (1 inside)."""
+    yy, xx = torch.meshgrid(torch.linspace(-1, 1, w), torch.linspace(-1, 1, w), indexing='ij')
+    return ((yy ** 2 + xx ** 2) <= 1).float().to(dev)
+
+
+def rotate(x, th):
+    """Rotate (B, 1, H, W) images by per-image angles `th` (B,) radians about the centre (bilinear, zero fill)."""
+    z = torch.zeros_like(th)
+    A = torch.stack([torch.stack([th.cos(), -th.sin(), z], 1), torch.stack([th.sin(), th.cos(), z], 1)], 1)
+    return Fn.grid_sample(x, Fn.affine_grid(A, x.shape, align_corners=False), align_corners=False)
+
+
+def prep(xb, circ, aug=False, th0=0.0):
+    """uint8 crops -> circle-masked, per-crop standardised floats. `aug`: a uniform 0-360 deg rotation, gain +-15%,
+    offset +-0.1 (torch's device RNG); else a fixed rotation by `th0` radians (none at 0)."""
+    dev = circ.device
+    x = xb.to(dev).float() / 255.
+    B = x.shape[0]
+    if aug:
+        x = rotate(x, torch.rand(B, device=dev) * 2 * np.pi)
+    elif th0:
+        x = rotate(x, torch.full((B,), float(th0), device=dev))
+    x = x * circ
+    if aug:
+        x = x * (1 + (torch.rand(B, 1, 1, 1, device=dev) - .5) * .3) + (torch.rand(B, 1, 1, 1, device=dev) - .5) * .2
+    return (x - x.mean((2, 3), keepdim=True)) / (x.std((2, 3), keepdim=True) + 1e-3)
+
+
+@torch.no_grad()
+def tta_softmax(net, xb, circ, autocast=None):
+    """Mean softmax of `net` over `TTA_ROT` rotations (0, 360/TTA_ROT, ... deg) of uint8 crops `xb`."""
+    acc = 0
+    for r in range(TTA_ROT):
+        if autocast is None:
+            lo = net(prep(xb, circ, th0=2 * np.pi * r / TTA_ROT))
+        else:
+            with autocast():
+                lo = net(prep(xb, circ, th0=2 * np.pi * r / TTA_ROT))
+        acc = acc + Fn.softmax(lo.float(), -1)
+    return acc / TTA_ROT
 
 
 class V118_3(nn.Module):
@@ -99,7 +150,7 @@ def global_segments(tid, N):
 
 
 def train_pixid(c, device=None, seed=0, K=1, N=0, cut=0.5, jump=0.5, epochs=12, cap=3000, B=8, lr=1e-3,
-                max_steps=60, bs=128, plateau=0.005, rot_deg=15.0, amp=True, log=print):
+                max_steps=60, bs=128, plateau=0.005, amp=True, log=print):
     """Train the per-video identity network on crops dict `c` and score every ok crop.
 
     `N` = 0: the most common number of ok rows per frame. Returns a dict: probs (K,S,T,N) float16
@@ -108,11 +159,11 @@ def train_pixid(c, device=None, seed=0, K=1, N=0, cut=0.5, jump=0.5, epochs=12, 
     dev = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     devices = [dev] if dev.type == 'cuda' else []
     with torch.random.fork_rng(devices=devices, device_type='cuda'):
-        return _train(c, dev, seed, K, N, cut, jump, epochs, cap, B, lr, max_steps, bs, plateau, rot_deg,
+        return _train(c, dev, seed, K, N, cut, jump, epochs, cap, B, lr, max_steps, bs, plateau,
                       amp and dev.type == 'cuda', log)
 
 
-def _train(c, dev, seed, K, N, cut, jump, epochs, cap, Bc, lr, max_steps, bs, plateau, rot_deg, amp, log):
+def _train(c, dev, seed, K, N, cut, jump, epochs, cap, Bc, lr, max_steps, bs, plateau, amp, log):
     """`train_pixid`'s body (see the module docstring). Crops stay uint8 on `dev`; uniqueness is scored on
     <= 333 frames, evenly spread, where exactly N tracklet rows exist; each accumulation step ranks the
     top 4B candidates by local uniqueness on <= 30 of their frames, lowest first; rejected candidates
@@ -147,18 +198,7 @@ def _train(c, dev, seed, K, N, cut, jump, epochs, cap, Bc, lr, max_steps, bs, pl
     uf = uf[np.linspace(0, len(uf) - 1, min(333, len(uf))).astype(int)] if len(uf) else uf
     urows = [np.flatnonzero(tid[:, t] >= 0) for t in uf]
 
-    def prep(xb, aug):
-        """uint8 crops -> per-crop standardised floats; `aug`: rotation +-rot_deg, shift +-8%, gain +-15%,
-        offset +-0.1 (torch's device RNG)."""
-        x = xb.to(dev).float() / 255.
-        if aug:
-            B = x.shape[0]
-            th = (torch.rand(B, device=dev) - .5) * 2 * np.deg2rad(rot_deg)
-            sh = (torch.rand(B, 2, device=dev) - .5) * 2 * 0.08
-            A = torch.stack([torch.stack([th.cos(), -th.sin(), sh[:, 0]], 1), torch.stack([th.sin(), th.cos(), sh[:, 1]], 1)], 1)
-            x = Fn.grid_sample(x, Fn.affine_grid(A, x.shape, align_corners=False), align_corners=False)
-            x = x * (1 + (torch.rand(B, 1, 1, 1, device=dev) - .5) * .3) + (torch.rand(B, 1, 1, 1, device=dev) - .5) * .2
-        return (x - x.mean((2, 3), keepdim=True)) / (x.std((2, 3), keepdim=True) + 1e-3)
+    circ = circle_mask(Wpx, dev)
     nets = []
     for k in range(K):
         torch.manual_seed(seed * 100 + k)
@@ -171,16 +211,14 @@ def _train(c, dev, seed, K, N, cut, jump, epochs, cap, Bc, lr, max_steps, bs, pl
 
     @torch.no_grad()
     def probs(idx, members=None):
-        """(K, n, N) softmax of crops `idx` per network, 8192 at a time."""
+        """(K, n, N) rotation-averaged softmax (`tta_softmax`) of crops `idx` per network, 8192 at a time."""
         out = []
         for n in (nets if members is None else [nets[m] for m in members]):
             n.eval()
             ps = []
             for i in range(0, len(idx), 8192):
                 xb = Xt[torch.as_tensor(idx[i:i + 8192], device=Xt.device)]
-                with autocast():
-                    lo = n(prep(xb, False))
-                ps.append(Fn.softmax(lo.float(), -1).cpu())
+                ps.append(tta_softmax(n, xb, circ, autocast).cpu())
             out.append(torch.cat(ps).numpy() if ps else np.zeros((0, N), np.float32))
         return np.stack(out)
 
@@ -212,7 +250,7 @@ def _train(c, dev, seed, K, N, cut, jump, epochs, cap, Bc, lr, max_steps, bs, pl
                 ss = rng.permutation(sel)
                 for i in range(0, len(ss), bs):
                     b = ss[i:i + bs]
-                    xb = prep(Xt[torch.as_tensor(idx[b], device=Xt.device)], True)
+                    xb = prep(Xt[torch.as_tensor(idx[b], device=Xt.device)], circ, aug=True)
                     yb = torch.from_numpy(y[b]).to(dev)
                     with autocast():
                         lo = n(xb)

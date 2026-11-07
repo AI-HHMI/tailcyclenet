@@ -88,10 +88,12 @@ def test_tracklets_cut_at_gaps_jumps_and_contacts():
 
 
 def _two_animal_crops(T=240, opx=16, seed=0):
-    """Two textures (horizontal vs vertical stripes) on rows that swap animal at every contact."""
+    """Two rotation-distinct textures (fine vs coarse concentric rings; the network is rotation-blind) on rows
+    that swap animal at every contact."""
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[:opx, :opx]
-    tex = [(np.sin(yy * 1.3) > 0) * 160 + 40, (np.sin(xx * 1.3) > 0) * 160 + 40]
+    rr = np.hypot(yy - (opx - 1) / 2, xx - (opx - 1) / 2)
+    tex = [(np.sin(rr * 2.2) > 0) * 160 + 40, (np.sin(rr * 0.7) > 0) * 160 + 40]
     S = 2
     animal = np.zeros((S, T), int)
     animal[1] = 1
@@ -134,3 +136,34 @@ def test_train_pixid_without_a_global_segment_fails_by_name(tmp_path):
     assert r == {'fail': True}
     PX.save_pixid(tmp_path / 'f.npz', r)
     assert bool(np.load(tmp_path / 'f.npz')['fail'])
+
+
+def test_training_rotation_is_uniform_over_the_full_circle(monkeypatch):
+    """`prep(aug=True)` draws one uniform angle in [0, 2 pi) per crop; inputs are masked to the inscribed circle."""
+    seen = []
+    real = PX.rotate
+    monkeypatch.setattr(PX, 'rotate', lambda x, th: seen.append(th.clone()) or real(x, th))
+    circ = PX.circle_mask(16, torch.device('cpu'))
+    torch.manual_seed(0)
+    x = PX.prep(torch.full((4096, 1, 16, 16), 200, dtype=torch.uint8), circ, aug=True)
+    th = seen[0]
+    assert th.shape == (4096,) and th.min() >= 0 and th.max() < 2 * np.pi
+    assert th.min() < 0.05 and th.max() > 2 * np.pi - 0.05 and abs(th.mean().item() - np.pi) < 0.1
+    assert circ[0, 0] == 0 and circ[8, 8] == 1 and x.shape == (4096, 1, 16, 16)
+    seen.clear()
+    PX.prep(torch.zeros((2, 1, 16, 16), dtype=torch.uint8), circ)          # no aug, th0 = 0: no rotation at all
+    assert seen == []
+
+
+def test_tta_softmax_is_the_mean_softmax_over_8_rotations():
+    torch.manual_seed(0)
+    net = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(256, 3)).eval()
+    circ = PX.circle_mask(16, torch.device('cpu'))
+    xb = torch.randint(0, 255, (5, 1, 16, 16), dtype=torch.uint8)
+    got = PX.tta_softmax(net, xb, circ)
+    with torch.no_grad():
+        want = torch.stack([torch.softmax(net(PX.prep(xb, circ, th0=2 * np.pi * r / 8)), -1) for r in range(8)]).mean(0)
+        plain = torch.softmax(net(PX.prep(xb, circ)), -1)
+    assert PX.TTA_ROT == 8 and torch.allclose(got, want, atol=1e-6) and got.shape == (5, 3)
+    assert not torch.allclose(got, plain, atol=1e-4)                       # it is not a single forward
+    assert torch.equal(got, PX.tta_softmax(net, xb, circ))                 # deterministic on CPU

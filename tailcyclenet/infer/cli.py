@@ -330,6 +330,22 @@ def build_parser() -> argparse.ArgumentParser:
                        help='OPT-IN post-pass repairing the slot permutation a hard interaction '
                             'leaves; TRADES MISSES FOR IDENTITY (quote miss and coverage with '
                             'its idsw). Edits the written session in place.')
+    ident.add_argument('--identity', action='store_true',
+                       help='2D OPT-IN: the TrackGraph identity stack (report 76 v7 / PREREG8). An in-loop '
+                            'tracktail carry witness, then per-video pixel-ID crops + a pixel-ID net, '
+                            'the v8 gate (C0 AND [v7 bar OR McNemar + null]) and, when it opens, the '
+                            'F2 + C0 relabel of animal_id; closed = the rows unchanged. Edits the '
+                            'written session in place; the gate inputs and decision go to '
+                            '[provenance] and identity.json.')
+    ident.add_argument('--identity-slot-chunk', type=int, default=8, metavar='K',
+                       help='--identity: decode at most K slots per tracktail call (0 = all at once). '
+                            'Output-neutral (each slot sees the inputs of the unchunked call); 8 '
+                            'bounds memory at 60-100 animals (18.5 GiB reserved on an L4 at 100 fish, '
+                            'where all-at-once runs out) and IS the unchunked call at <= 8 animals.')
+    ident.add_argument('--identity-mask-head', type=Path, default=None,
+                       help='--identity: pixel-ID crops from detector + mask-head masks (this '
+                            "maskhead.pth, the run's --detector) instead of the default crops "
+                            '(keypoint-aligned at K >= 2, detector-box at K = 1).')
 
     sco = ap.add_argument_group('scorer')
     sco.add_argument('--scorer', type=Path, default=None,

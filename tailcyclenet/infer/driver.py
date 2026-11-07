@@ -200,6 +200,18 @@ def run_dataset(args):
     _budget = _memory.rebudget(override_gb=args.max_ram)
     print(f'ram: {_budget}')
 
+    witness = None
+    if getattr(args, 'identity', False):
+        if args.identity_bridge:
+            raise SystemExit('--identity and --identity-bridge both rewrite animal_id; pass one.')
+        if args.videos:
+            raise SystemExit('--identity reads its crops from a source session (--data); the --videos '
+                             'path is not wired for it.')
+        if sess.mode != '2d':
+            raise SystemExit('--identity is 2D only: the pixel-ID column, the tt witness and the gate '
+                             f'are built on 2D tracklets; {sess.session_id} is {sess.mode}.')
+        from ..identity.carry import CarryWitness
+        witness = CarryWitness(model, device, slot_chunk=args.identity_slot_chunk)
     gids = select_groups(args, sess, cfg)
     _resolve_body_size(args, sess, gids, cfg, model, registry, ds_name, boxes, det, det_wh, det_red,
                        det_tile, det_boxsrc, device, scorer, scorer_shared_encoder)
@@ -238,10 +250,12 @@ def run_dataset(args):
             _t_group, _stats = time.time(), {}
             if args.overlap_trace:
                 _stats['capture_overlap_agreement'] = True
+            if witness is not None:
+                witness.begin_group(gid, sess.names)
             for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
                                   box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want,
                                   stats=_stats, scorer=scorer,
-                                  shared_scene_encoder=scorer_shared_encoder):
+                                  shared_scene_encoder=scorer_shared_encoder, witness=witness):
                 assert f0 == int(blk['window_start'][0]), (f0, int(blk['window_start'][0]))
                 writer.write_block(gid, blk, f0, w0)
                 writer.write_window_records(blk.get('window_records', ()))
@@ -251,6 +265,8 @@ def run_dataset(args):
                 n_fin += int(np.isfinite(blk['pred']).all(-1).sum())
                 n_pt += int(np.isfinite(blk['pred']).all(-1).size)
                 progress.update(blk['pred'].shape[1])
+            if witness is not None:
+                witness.end_group()
             span = ('' if not (cfg.frame_start or cfg.frame_stop)
                     else f' [{cfg.frame_start}, {f0})')
             print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
@@ -273,6 +289,12 @@ def run_dataset(args):
         print(f'wrote detector trace {args.det_trace}')
     if args.overlap_trace:
         write_overlap_trace(args.overlap_trace, overlap_rows)
+    if witness is not None:
+        from ..identity.stage import identity_session
+        witness.save(args.out / 'identity_tt.pkl')
+        model.backbone_tap = None
+        del witness
+        identity_session(args.out, args, device)
     if args.identity_bridge:
         from . import bridge as _bridge
         _cfg = _bridge.BridgeConfig()

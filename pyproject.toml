@@ -41,6 +41,7 @@ packages = [
     "tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer", "tailcyclenet.scorer",
     "tailcyclenet.configs", "tailcyclenet.data", "tailcyclenet.loader",
     "tailcyclenet.format", "tailcyclenet.pose", "tailcyclenet.evaluation", "tailcyclenet.render",
+    "tailcyclenet.identity",
 ]
 
 [tool.setuptools.package-dir]
@@ -48,6 +49,7 @@ packages = [
 
 [tool.setuptools.package-data]
 "tailcyclenet.configs" = ["base.toml", "detector.toml", "scorer.toml"]
+"tailcyclenet.identity" = ["random_draws.json"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]

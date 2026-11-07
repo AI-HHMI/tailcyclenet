@@ -210,16 +210,20 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
             print('moe: WARNING no --detector / --boxes: E2 runs WITHOUT anchors (as it validated)')
         if args.box_prompt is None and (args.detector or args.boxes):
             args.box_prompt = 'detector'
+    elif moe and sess.mode != '2d' and int(config['model'].get('set_queries') or 8) != 4:
+        print('moe: this checkpoint\'s set decoder (E2) was trained on a 2D root (8 queries); a 3D '
+              'session deploys E1 (the box-FiLM model) alone')
+        if args.moe_route is not None:
+            raise SystemExit('--moe-route: this MoE\'s E2 is the 2D one (8 queries); a 3D session '
+                             'deploys E1 alone. A 3D MoE (4 queries, trained on a 3D root) routes.')
+        moe = False
+        if args.box_prompt is None and (args.detector or args.boxes):
+            args.box_prompt = 'detector'
     elif moe:
-        if sess.mode != '2d':
-            print('moe: this checkpoint carries a set decoder (E2), which is 2D only; a 3D '
-                  'session deploys E1 (the box-FiLM model) alone')
-            if args.moe_route is not None:
-                raise SystemExit('--moe-route: the set decoder is 2D only; this session is 3D.')
-        else:
-            moe_route = args.moe_route or 'contact'
-            print(f'moe: v7 2D MoE checkpoint (E1 box-FiLM + E2 set decoder), --moe-route '
-                  f'{moe_route}')
+        moe_route = args.moe_route or 'contact'
+        print(f'moe: v7 {sess.mode.upper()} MoE checkpoint (E1 box-FiLM + E2 set decoder), '
+              f'--moe-route {moe_route}' + ('' if sess.mode == '2d' else
+                                           ' (3D: E2 without priors, contact by camera majority)'))
         if args.box_prompt is None and (args.detector or args.boxes):
             args.box_prompt = 'detector'
             print('moe: --box-prompt defaults to detector (every window) for a set-decoder '
@@ -267,9 +271,10 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         print("box prompt: FIRSTONLY -- given at each animal's first window, withheld once a "
               'carry is available (owner-set default, 2026-09-05; report 55).')
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
+    moe2d = moe and sess.mode == '2d'
     refine = args.refine if args.refine is not None else (
-        False if moe else (True if box_on else sess.mode == '3d'))
-    if moe and moe_route is not None and args.refine is None:
+        False if moe2d else (True if box_on else sess.mode == '3d'))
+    if moe2d and args.refine is None:
         print('moe: --refine defaults OFF for the 2D MoE (the 128 px pass cost +2.7 px '
               'non-contact on rat-city, report 76); pass --refine to turn it on')
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)

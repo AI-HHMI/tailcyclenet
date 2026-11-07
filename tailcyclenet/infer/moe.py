@@ -1,4 +1,4 @@
-"""The v7 2D MoE at deploy: which expert writes each (slot, frame), and E2's inputs.
+"""The v7 MoE at deploy (2D and 3D): which expert writes each (slot, frame), and E2's inputs.
 
 Routing (report 76 crowd-moe, lever B): a slot ENTERS E2 at a frame where its detector box is in
 contact with another slot's -- IoU > 0.3 or centre distance < 0.75 x the two boxes' mean longer
@@ -13,6 +13,13 @@ E2's anchors are the detector's TIGHT boxes of this slot and of the 3 nearest sl
 touch the crop (crop px, NaN outside it); the anchored queries' position priors are this slot's carry
 (query 0, from the loop) and the other slots' latest WRITTEN rows (the routed rows the loop also
 carries). Everything is label-free.
+
+3D (a MoE trained on a 3D root; the rule crowd-detr fixed 2026-11-07, before any 3D MoE deploy was
+scored, `scratch/.../v7_3d/mx3d/CONTACT_RULE_3D.txt`): the 2D rule is evaluated PER CAMERA on the
+detector boxes; a slot ENTERS E2 when it holds in >= ceil(C_a / 2) of the C_a cameras where the slot
+has a box (a majority: boxes overlap in some views from projection alone), and EXITS only when the
+1.25x-looser test holds in fewer than ceil(C_a / 2) cameras AND it has dwelt >= 4 frames. E2 runs
+without priors and is anchored per camera as below; E1 keeps the loop's prior.
 
 A SET-ONLY 3D checkpoint (PBM4, `set_only_inputs`) has no routing: every forward is E2's, anchored
 PER CAMERA on this slot's box and the 3 nearest slots' boxes (nearest by camera-0 centre distance,
@@ -84,6 +91,46 @@ def hysteresis(history, frames, bb, a):
     return m
 
 
+def contact_votes(bc, others, iou_t=NEAR_IOU, centre=NEAR_CENTRE):
+    """Per-camera contact for one slot: bc (C,4) its boxes, others (S-1,C,4) -> (cameras where the
+    2D rule holds, cameras where the slot has a box)."""
+    n = ca = 0
+    for c in range(bc.shape[0]):
+        r = in_contact(bc[c], [o[c] for o in others], iou_t, centre)
+        if r is None:
+            continue
+        ca += 1
+        n += bool(r)
+    return n, ca
+
+
+def hysteresis_3d(history, frames, bb, a):
+    """`hysteresis` with the 3D camera-majority rule (module docstring). bb (S,T,C,4)."""
+    S = bb.shape[0]
+    prev = [f for f in history if f < int(frames[0])]
+    st, ent = history[max(prev)] if prev else (False, -1)
+    m = np.zeros(len(frames), bool)
+    for t, f in enumerate(frames):
+        f = int(f)
+        others = [bb[s, t] for s in range(S) if s != a]
+        n, ca = contact_votes(bb[a, t], others)
+        if ca:
+            need = int(np.ceil(ca / 2))
+            if not st:
+                if n >= need:
+                    st, ent = True, f
+            else:
+                nl, _ = contact_votes(bb[a, t], others, NEAR_IOU / EXIT_SCALE,
+                                      EXIT_SCALE * NEAR_CENTRE)
+                if nl < need and f - ent >= DWELL:
+                    st = False
+        m[t] = st
+        history[f] = (st, ent)
+    for f in [f for f in history if f < int(frames[0]) - HISTORY]:
+        del history[f]
+    return m
+
+
 class GroupRouter:
     """One group's MoE deploy state: per-slot routing history and written rows."""
 
@@ -101,14 +148,27 @@ class GroupRouter:
         self.rows = {}
         self.stats = {'windows': 0, 'frames': 0, 'frames_e2': 0}
 
-    def inputs(self, a, frames, win_boxes, boxes, scales, cgroup, dev):
+    def inputs(self, a, frames, win_boxes, boxes, scales, cgroup, dev, *, mode='2d', use=None,
+               square=False, pad=0.05):
         """`set_inputs` for slot `a`'s window, or None when the window is E1's alone (the plain
-        forward). win_boxes (S,T,C,4) the detector boxes at the window's frames (source px)."""
+        forward). win_boxes (S,T,C,4) the detector boxes at the window's frames (source px). 3D:
+        `use` / `square` / `pad` as `set_only_inputs`, routed by `hysteresis_3d`, no priors."""
         T = len(frames)
         self.stats['windows'] += 1
         self.stats['frames'] += T
         if self.route == 'e1':
             return None
+        if mode != '2d':
+            wb = np.asarray(win_boxes, np.float64)
+            mask = (np.ones(T, bool) if self.route == 'e2'
+                    else hysteresis_3d(self.history.setdefault(a, {}), frames, wb, a))
+            if not mask.any():
+                return None
+            self.stats['frames_e2'] += int(mask.sum())
+            out = set_only_inputs(a, win_boxes, use, boxes, scales, cgroup, dev, square=square,
+                                  pad=pad)
+            out['route'] = mask
+            return out
         bb = np.asarray(win_boxes[:, :, 0], np.float64)
         mask = (np.ones(T, bool) if self.route == 'e2'
                 else hysteresis(self.history.setdefault(a, {}), frames, bb, a))

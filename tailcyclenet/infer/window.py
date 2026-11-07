@@ -175,9 +175,9 @@ class InferConfig:
     # smaller than the median of the animal's own boxes this window keeps its box (or stays
     # box-less): an exploded or collapsed carry is not the animal (`scale_agrees`). 0 = off.
     refine_carry_scale_max: float = 2.0
-    # The v7 2D MoE (a checkpoint carrying the set decoder, `infer/moe.py`): 'contact' routes each
-    # (slot, frame) to E2 by the contact rule with hysteresis, 'e1'/'e2' force one expert. None (a
-    # model without E2, or no detector boxes) is the plain path. 2D detector-box deploys only.
+    # The v7 MoE (a checkpoint carrying the set decoder, `infer/moe.py`; 2D, or 3D for a MoE trained
+    # on a 3D root): 'contact' routes each (slot, frame) to E2 by the contact rule with hysteresis,
+    # 'e1'/'e2' force one expert. None (no E2, or no detector boxes) is the plain path.
     moe_route: str | None = None
 
 
@@ -414,8 +414,9 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
     carried = [None] * S
     router = None
-    if (cfg.moe_route is not None and mode == '2d' and boxes_for is not None
-            and getattr(model, 'set_decoder', None) is not None):
+    if (cfg.moe_route is not None and boxes_for is not None
+            and getattr(model, 'set_decoder', None) is not None
+            and not model.set_decoder.shared):
         from .moe import GroupRouter
         router = GroupRouter(cfg.moe_route, K)
     set_only = (mode == '3d' and getattr(getattr(model, 'set_decoder', None), 'shared', False))
@@ -693,7 +694,10 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
         if router is not None and boxes_stc is not None:
             win_b = corrupted[wi] if wi in corrupted else boxes_stc[:, frames - f0]
-            set_inputs = router.inputs(a, frames, win_b, boxes, scales, cgroup_d, dev)
+            set_inputs = (router.inputs(a, frames, win_b, boxes, scales, cgroup_d, dev)
+                          if mode == '2d' else
+                          router.inputs(a, frames, win_b, boxes, scales, cgroup, dev, mode=mode,
+                                        use=use, square=legacy_square, pad=cfg.crop_pad_frac))
             if set_inputs is not None:
                 mkw['set_inputs'] = set_inputs
         if (set_only and give_box and cfg.box_prompt == 'detector' and boxes_stc is not None):

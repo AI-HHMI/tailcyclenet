@@ -388,7 +388,11 @@ def test_3d_contact_rule_is_a_camera_majority_with_hysteresis():
             bb[0, t, c] = box(0)
             bb[1, t, c] = box(x)
     bb[0, 2, 2] = np.nan          # slot 0 has a box in 2 cameras at t = 2 -> majority of 2 is 1
-    got = hysteresis_3d({}, np.arange(len(d)), bb, 0).tolist()
+    st = {}
+    got = hysteresis_3d(st, np.arange(len(d)), bb, 0).tolist()
+    bb_flip = bb.copy()
+    bb_flip[1] = bb[0]                 # different boxes on already-decided frames: read, not re-decided
+    assert hysteresis_3d(st, np.arange(len(d)), bb_flip, 0).tolist() == got
     # t0 2/3 near -> enter; t1..t4 dwell (< 4 frames) holds; t5 clear but dwell 5 >= 4 -> exit
     assert got == [True, True, True, True, True, False, False]
     late = hysteresis_3d({}, np.arange(2), bb[:, 1:3], 0).tolist()

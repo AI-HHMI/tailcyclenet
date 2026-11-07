@@ -17,9 +17,10 @@ carries). Everything is label-free.
 3D (a MoE trained on a 3D root; the rule crowd-detr fixed 2026-11-07, before any 3D MoE deploy was
 scored, `scratch/.../v7_3d/mx3d/CONTACT_RULE_3D.txt`): the 2D rule is evaluated PER CAMERA on the
 detector boxes; a slot ENTERS E2 when it holds in >= ceil(C_a / 2) of the C_a cameras where the slot
-has a box (a majority: boxes overlap in some views from projection alone), and EXITS only when the
-1.25x-looser test holds in fewer than ceil(C_a / 2) cameras AND it has dwelt >= 4 frames. E2 runs
-without priors and is anchored per camera as below; E1 keeps the loop's prior.
+has a box among the forward's cameras (a majority: boxes overlap in some views from projection
+alone), and EXITS only when the 1.25x-looser test holds in fewer than ceil(C_a / 2) cameras AND it
+has dwelt >= 4 frames. A decided frame is never re-decided (`hysteresis_3d`). E2 runs without priors
+and is anchored per camera as below; E1 keeps the loop's prior.
 
 A SET-ONLY 3D checkpoint (PBM4, `set_only_inputs`) has no routing: every forward is E2's, anchored
 PER CAMERA on this slot's box and the 3 nearest slots' boxes (nearest by camera-0 centre distance,
@@ -91,11 +92,11 @@ def hysteresis(history, frames, bb, a):
     return m
 
 
-def contact_votes(bc, others, iou_t=NEAR_IOU, centre=NEAR_CENTRE):
-    """Per-camera contact for one slot: bc (C,4) its boxes, others (S-1,C,4) -> (cameras where the
-    2D rule holds, cameras where the slot has a box)."""
+def contact_votes(bc, others, cams, iou_t=NEAR_IOU, centre=NEAR_CENTRE):
+    """Per-camera contact for one slot: bc (C,4) its boxes, others (S-1,C,4), over the camera
+    indices `cams` -> (cameras where the 2D rule holds, cameras where the slot has a box)."""
     n = ca = 0
-    for c in range(bc.shape[0]):
+    for c in cams:
         r = in_contact(bc[c], [o[c] for o in others], iou_t, centre)
         if r is None:
             continue
@@ -104,30 +105,42 @@ def contact_votes(bc, others, iou_t=NEAR_IOU, centre=NEAR_CENTRE):
     return n, ca
 
 
-def hysteresis_3d(history, frames, bb, a):
-    """`hysteresis` with the 3D camera-majority rule (module docstring). bb (S,T,C,4)."""
-    S = bb.shape[0]
-    prev = [f for f in history if f < int(frames[0])]
-    st, ent = history[max(prev)] if prev else (False, -1)
+def hysteresis_3d(state, frames, bb, a, cams=None):
+    """The 3D routing mask for slot `a` over one window (module docstring). bb (S,T,C,4), `cams`
+    the forward's cameras (default all). `state` ({'on', 'dwell', 'mem'}, per group and slot):
+    a frame already decided is READ from `mem` (first decision wins, so a window's overlap and a
+    refine pass repeat it); a new frame continues from the last decided one. `dwell` counts the
+    decided frames spent in E2 since entry, own-box-less frames included."""
+    S, C = bb.shape[0], bb.shape[2]
+    cams = list(range(C)) if cams is None else list(cams)
+    st = state
+    st.setdefault('on', False)
+    st.setdefault('dwell', 0)
+    mem = st.setdefault('mem', {})
     m = np.zeros(len(frames), bool)
     for t, f in enumerate(frames):
         f = int(f)
+        if f in mem:
+            m[t] = mem[f]
+            continue
         others = [bb[s, t] for s in range(S) if s != a]
-        n, ca = contact_votes(bb[a, t], others)
+        n, ca = contact_votes(bb[a, t], others, cams)
         if ca:
             need = int(np.ceil(ca / 2))
-            if not st:
+            if not st['on']:
                 if n >= need:
-                    st, ent = True, f
+                    st['on'], st['dwell'] = True, 0
             else:
-                nl, _ = contact_votes(bb[a, t], others, NEAR_IOU / EXIT_SCALE,
+                nl, _ = contact_votes(bb[a, t], others, cams, NEAR_IOU / EXIT_SCALE,
                                       EXIT_SCALE * NEAR_CENTRE)
-                if nl < need and f - ent >= DWELL:
-                    st = False
-        m[t] = st
-        history[f] = (st, ent)
-    for f in [f for f in history if f < int(frames[0]) - HISTORY]:
-        del history[f]
+                if nl < need and st['dwell'] >= DWELL:
+                    st['on'] = False
+        if st['on']:
+            st['dwell'] += 1
+        m[t] = mem[f] = st['on']
+    if len(mem) > 4 * HISTORY:
+        for k in sorted(mem)[:2 * HISTORY]:
+            del mem[k]
     return m
 
 
@@ -161,7 +174,7 @@ class GroupRouter:
         if mode != '2d':
             wb = np.asarray(win_boxes, np.float64)
             mask = (np.ones(T, bool) if self.route == 'e2'
-                    else hysteresis_3d(self.history.setdefault(a, {}), frames, wb, a))
+                    else hysteresis_3d(self.history.setdefault(a, {}), frames, wb, a, use))
             if not mask.any():
                 return None
             self.stats['frames_e2'] += int(mask.sum())

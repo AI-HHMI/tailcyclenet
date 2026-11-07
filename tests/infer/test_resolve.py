@@ -64,11 +64,11 @@ def test_refine_consensus_needs_3d_and_refine():
         (True, 0.3, float('-inf'))
 
 
-def test_refine_defaults_off_in_3d_and_on_for_a_2d_box_model():
-    """3D defaults to --no-refine (report 76 refine3d); a 2D non-MoE box model keeps refine on."""
+def test_refine_defaults_off_everywhere():
+    """--refine defaults OFF in 2D and 3D (owner 2026-11-07); --refine turns it on."""
     base = ['--run', 'r', '--data', 'd', '--out', 'o', '--detector', 'det']
     box = {'data': {}, 'model': {'box_prompt': 'film'}}
-    for mode, want in (('3d', False), ('2d', True)):
+    for mode, want in (('3d', False), ('2d', False)):
         args = build_parser().parse_args(base)
         check_frame_range(args)
         assert infer_config(args, box, SimpleNamespace(mode=mode), 4, 64, 'cpu').refine is want

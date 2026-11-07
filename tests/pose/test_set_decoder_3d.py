@@ -184,6 +184,8 @@ def test_non_pbm4_set_only_is_refused():
         compat_state(bad, {}, 'x')
     with pytest.raises(SystemExit, match='SET-DECODER-ONLY'):
         compat_state({**scratch, 'dq_apool.weight': torch.zeros(1)}, {}, 'x')
+    with pytest.raises(SystemExit, match='SET-DECODER-ONLY'):                 # sa 0: no GroupPose
+        compat_state({k: v for k, v in scratch.items() if 'dq_groups' not in k}, {}, 'x')
 
 
 def test_box_film_3d_checkpoint_is_untouched(tmp_path, batch3, capsys):

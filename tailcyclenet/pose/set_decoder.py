@@ -549,12 +549,15 @@ def is_scratch_set_only(state) -> bool:
 def map_scratch_set_only(state, where=''):
     """A scratch set-only state dict in this repo's `set_decoder = "only"` layout: only E2's own
     additions are renamed (host decoder / query encoder stay where they are). Only the PBM4
-    architecture (M = NA = 4, box-only anchors, GroupPose) maps; anything else is refused by name."""
+    architecture (M = 4 instance queries, box-anchor MLP, GroupPose, no other dq module) maps;
+    anything else is refused by name. NOT visible in the weights: the anchored count NA (an
+    `MA<n>` arm trained NA = n < 4 on the same tensors) -- such a run would load as NA = 4."""
     inst = state.get('query_encoder.kpt_dq_inst')
     extra = sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in state
                     if ('dq_' in k and not k.startswith(('dq_pres.', 'dq_abox.'))
                         and not k.startswith(('decoder.dq_groups.', 'query_encoder.kpt_dq_inst')))})
-    if inst is None or inst.shape[0] != M_ONLY or extra:
+    parts = all(any(k.startswith(x) for k in state) for x in ('decoder.dq_groups.', 'dq_abox.'))
+    if inst is None or inst.shape[0] != M_ONLY or extra or not parts:
         raise SystemExit(
             f'{where}: a scratch crowd-detr SET-DECODER-ONLY checkpoint that is not the PBM4 '
             f'architecture ({0 if inst is None else inst.shape[0]} instance queries, expected '

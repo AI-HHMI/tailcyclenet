@@ -116,6 +116,10 @@ def run_batch(model, loss_fn, batch, device, raw=None):
     experts on one scene encode (E2 on detached tokens), the loss is loss_E1 (the stock loss, the
     only one reaching the encoder) + loss_E2 (`set_decoder.set_loss`), and the two parts ride
     back in `out['loss_parts']` for the interval log. The returned `out` is E1's.
+
+    A SET-ONLY model (`set_decoder = "only"`, PBM4) is E2 alone: the forward gets no item prior
+    and no box prompt (E2's priors / boxes are its anchors'), the loss is `set_loss` alone (it
+    reaches the encoder), and the returned `out` is query 0's slice.
     """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
@@ -126,10 +130,15 @@ def run_batch(model, loss_fn, batch, device, raw=None):
         'route': 'train', 'anchors': st['anchors'][:, :NA].to(device),
         'anchor_prior': st['prior'][:, :NA].to(device),
         'anchor_prompt_t': st['prior_t'][:, :NA].to(device)}
-    out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
-                kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device),
-                box_prompt=None if box is None else box.to(device),
-                **({} if set_inputs is None else {'set_inputs': set_inputs}))
+    sd = getattr(model if raw is None else raw, 'set_decoder', None)
+    only = sd is not None and sd.shared
+    if only:
+        out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode, set_inputs=set_inputs)
+    else:
+        out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
+                    kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device),
+                    box_prompt=None if box is None else box.to(device),
+                    **({} if set_inputs is None else {'set_inputs': set_inputs}))
     set_out = out.pop('set', None) if set_inputs is not None else None
     coords_true = batch.coords.to(device)
     vis_true = vis_true_cams = vis_2d_true = None
@@ -139,6 +148,9 @@ def run_batch(model, loss_fn, batch, device, raw=None):
         vis_true = None if batch.vis is None else batch.vis.to(device)
         vis_true_cams = None if batch.vis_2d is None else batch.vis_2d.to(device)
     try:
+        if only:
+            loss = set_loss(loss_fn, model if raw is None else raw, set_out, st, device, cgroup)
+            return loss, out
         loss = loss_fn(
             model if raw is None else raw, out, coords_true=coords_true,
             vis_true=vis_true, vis_true_cams=vis_true_cams, vis_2d_true=vis_2d_true,
@@ -580,7 +592,8 @@ def main(argv: list[str] | None = None):
 
     lc = loader_config_from(data_cfg)
     lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'),
-                 set_targets=bool(config['model'].get('set_decoder', False)))
+                 set_targets=('only' if config['model'].get('set_decoder') == 'only' else
+                              bool(config['model'].get('set_decoder', False))))
     plan = plan_start(run, train_cfg.get('checkpoint_path'),
                       revision=train_cfg.get('checkpoint_revision'), no_resume=args.no_resume,
                       no_warm_start=args.no_warm_start,

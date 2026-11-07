@@ -130,6 +130,24 @@ class View:
     # per camera, (T,4,2) stored instance-box corners in THIS view's crop pixels (None = no stored
     # box; `box_source = 'instances'` only): what the tight box prompt bounds where finite
     box_pts: list | None = None
+    # (A,T,K,3) EVERY animal's world points in this view's (gauge-rotated) frame -- a set-only
+    # (`set_targets = 'only'`) 3D item only; None otherwise
+    all_world: object = None
+
+
+def _rotate_all(cgroup, coords, others, all_world):
+    """`rotate_camera_group_with_neighbours`, with EVERY animal's (A,T,K,3) world points riding the
+    same draw too (a set-only item's targets; `all_world` None = the stock call exactly)."""
+    if all_world is None:
+        cgroup, coords, others = rotate_camera_group_with_neighbours(cgroup, coords, others)
+        return cgroup, coords, others, None
+    A, T, K, _ = all_world.shape
+    extra = all_world.permute(1, 0, 2, 3).reshape(T, A * K, 3)
+    pack = extra if others is None else torch.cat([others, extra], 1)
+    cgroup, coords, pack = rotate_camera_group_with_neighbours(cgroup, coords, pack)
+    if others is not None:
+        others, pack = pack[:, :others.shape[1]], pack[:, others.shape[1]:]
+    return cgroup, coords, others, pack.reshape(T, A, K, 3).permute(1, 0, 2, 3).contiguous()
 
 
 def _session_flip_permutation(sess):
@@ -209,7 +227,7 @@ class PoseDataset(Dataset):
         self.split = split
         self.train = (split == 'train') if train is None else train
         self.datasets = load_datasets(path, split=split)
-        if cfg.set_targets:
+        if cfg.set_targets is True:
             three = [str(s.path) for ds in self.datasets for s in ds.all_sessions() if s.mode != '2d']
             if three:
                 raise SystemExit('a set decoder ([model].set_decoder) trains on 2D sessions only; a '
@@ -829,9 +847,11 @@ class PoseDataset(Dataset):
             if attempt_swap_animal:
                 others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],
                                              dtype=torch.float32)
+            all_world = (torch.as_tensor(lab.points3d[:, frames], dtype=torch.float32)
+                         if self.cfg.set_targets == 'only' and lab.points3d is not None else None)
             if self.train and world_gauge:
-                cgroup, coords, others_raw = rotate_camera_group_with_neighbours(
-                    cgroup, coords, others_raw)
+                cgroup, coords, others_raw, all_world = _rotate_all(
+                    cgroup, coords, others_raw, all_world)
             cp3 = None if crop_pts is None else [
                 apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
             jit = self._jitter(rng)
@@ -848,8 +868,8 @@ class PoseDataset(Dataset):
                        [(cp3[i] - boxes[i][:2].to(cp3[i].dtype)) * scales[i].to(cp3[i].dtype)
                         for i in range(len(cgroup))])
             if self.train and world_gauge:
-                cgroup, coords, others_raw = rotate_camera_group_with_neighbours(
-                    cgroup, coords, others_raw)
+                cgroup, coords, others_raw, all_world = _rotate_all(
+                    cgroup, coords, others_raw, all_world)
             if others_raw is not None:
                 neighbour_full = others_raw
             p2d_all = (project_points_torch(cgroup, coords)
@@ -886,7 +906,8 @@ class PoseDataset(Dataset):
                     boxes=boxes, cam_names=cam_names, r=2 if true_2d else 3,
                     single_view=single_view, p2d=p2d,
                     neighbour_full=neighbour_full, rotation=rotation_info, scale=scales,
-                    kpt_perm=kpt_perm, box_pts=box_pts)
+                    kpt_perm=kpt_perm, box_pts=box_pts,
+                    all_world=None if true_2d else all_world)
 
     def _targets(self, sel, view, rng):
         """Turn a realised `View` into the pose training targets and the item tuple.

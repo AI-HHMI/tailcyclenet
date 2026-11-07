@@ -19,13 +19,18 @@ from .model import build_model
 def compat_state(state: dict, model_cfg: dict, where) -> dict:
     """The one key mapping at the pose load boundary: a scratch MX0e checkpoint (`e1.*` + `dq_*`,
     crowd/moe 2026-11) is read in this repo's layout (`set_decoder.py`) and its `[model]` gains
-    `set_decoder = true`; every other checkpoint passes through untouched. Mutates `model_cfg`."""
-    from .set_decoder import is_scratch_layout, map_scratch_state
-    if any(k.startswith('dq_') for k in state) and not any(k.startswith('e1.') for k in state):
-        raise SystemExit(f'{where}: a scratch crowd-detr SET-DECODER-ONLY checkpoint (dq_* without '
-                         'e1.*, e.g. B1p / v7sd_*): its decoder is the set decoder, so loading it as '
-                         'a box-FiLM model would decode with the wrong expert. Not deployable here; '
-                         'use an MX0e (e1.* + dq_*) checkpoint.')
+    `set_decoder = true`; a scratch crowd-detr SET-DECODER-ONLY PBM4 checkpoint (`dq_*` without
+    `e1.*`, the v7 3D set decoder) gains `set_decoder = "only"` (any other set-only architecture is
+    refused by name); every other checkpoint passes through untouched. Mutates `model_cfg`."""
+    from .set_decoder import is_scratch_layout, map_scratch_set_only, map_scratch_state
+    if (any(k.startswith('dq_') or '.dq_' in k or '.kpt_dq_' in k for k in state)
+            and not any(k.startswith('e1.') for k in state)):
+        out = map_scratch_set_only(state, where)
+        model_cfg['set_decoder'] = 'only'
+        print(f'{where}: scratch crowd-detr set-only PBM4 layout (host decoder = E2, dq_* = E2\'s '
+              f'additions) read as set_decoder = "only" -- {len(state)} tensors key-mapped, none '
+              're-saved')
+        return out
     if not is_scratch_layout(state):
         return state
     out = map_scratch_state(state)
@@ -125,12 +130,20 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
     """
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
-    from .set_decoder import is_scratch_layout, map_scratch_state
+    from .set_decoder import (is_scratch_layout, is_scratch_set_only, map_scratch_set_only,
+                              map_scratch_state)
     if is_scratch_layout(state):
         state = map_scratch_state(state)
         if verbose:
             print('warm start: scratch MX0e layout key-mapped (e1.* -> host, dq_* -> set_decoder.*)')
         if getattr(model, 'set_decoder', None) is None:
+            state = {k: v for k, v in state.items() if not k.startswith('set_decoder.')}
+    elif is_scratch_set_only(state):
+        state = map_scratch_set_only(state, checkpoint_path)
+        if verbose:
+            print('warm start: scratch set-only PBM4 layout key-mapped (dq_* -> set_decoder.*)')
+        sd_ = getattr(model, 'set_decoder', None)
+        if sd_ is None or not sd_.shared:
             state = {k: v for k, v in state.items() if not k.startswith('set_decoder.')}
 
     state = _convert_cross_attn(state, model)
@@ -192,7 +205,7 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
         report_load('warm start', missing, unexpected, dropped)
     fresh = set(missing) | set(dropped)
     sd = getattr(model, 'set_decoder', None)
-    if sd is not None and not any(k.startswith('set_decoder.') for k in state):
+    if sd is not None and not sd.shared and not any(k.startswith('set_decoder.') for k in state):
         sd.fill_from_host(model)
         copied = {f'set_decoder.{part}.{k}' for part in ('query_encoder', 'decoder')
                   for k in getattr(sd, part).state_dict()}

@@ -16,7 +16,12 @@ decoder adds the per-query instance + anchor-box embedding to the query tokens, 
 its cross-attentions adds the GroupPose attention, and a hook on the decoder keeps the latent for the
 presence head. Nothing in the library or in E1 is touched.
 
-2D only. A 3D set decoder is a later per-root choice (the deploy seam is `--moe-route`).
+`[model].set_decoder = "only"` is the v7 3D set decoder (PBM4, report 76 crowd-detrq / detr3d-multi):
+the SAME module with no E1 beside it -- the host's own query encoder + decoder ARE E2's (shared, not
+copied), the encoder trains on E2's loss, `M_ONLY` = 4 queries all anchored (known assignment,
+no free query), per-camera anchors (the crop rule's square box: each side padded by
+`[data].crop_pad_frac` x the longer side), no ellipse pool. Its deploy is `--anchor none` (no
+priors) and query 0 is always the slot's row in 3D (world coords are never matched to pixel boxes).
 """
 from __future__ import annotations
 
@@ -34,6 +39,8 @@ from scipy.optimize import linear_sum_assignment
 # costs (L1 in crop px / HUNGARIAN_NORM); MF the anchor-box Fourier max frequency
 M = 8
 NA = 4
+# the set-only (PBM4) recipe: 4 queries, every one anchored
+M_ONLY = 4
 INST_STD = 0.5
 W_PRES = 0.2
 C_PRES = 0.2
@@ -78,13 +85,22 @@ class SetDecoder(nn.Module):
     """E2. Built from the host AFTER the host's own query encoder exists (its copies share the
     architecture; the weights are loaded or warm-filled later, `fill_from_host`)."""
 
-    def __init__(self, host):
-        """Copy the host's query encoder + decoder, add E2's own parts, hook E2's decoder."""
+    def __init__(self, host, shared=False):
+        """Copy the host's query encoder + decoder (or, `shared`, use the host's own: the set-only
+        model -- plain attributes, not submodules, so the host owns and saves them), add E2's own
+        parts, hook E2's decoder."""
         super().__init__()
-        self.query_encoder = copy.deepcopy(host.query_encoder)
-        self.decoder = copy.deepcopy(host.decoder)
+        self.shared = bool(shared)
+        self.M = M_ONLY if self.shared else M
+        self.NA = NA
+        if self.shared:
+            object.__setattr__(self, 'query_encoder', host.query_encoder)
+            object.__setattr__(self, 'decoder', host.decoder)
+        else:
+            self.query_encoder = copy.deepcopy(host.query_encoder)
+            self.decoder = copy.deepcopy(host.decoder)
         D = self.decoder.embed_dim
-        self.inst = nn.Parameter(torch.randn(M, D) * INST_STD)
+        self.inst = nn.Parameter(torch.randn(self.M, D) * INST_STD)
         self.groups = nn.ModuleList([GroupAttn(D, 8) for _ in range(self.decoder.num_layers)])
         self.pres = nn.Sequential(nn.Linear(D, D // 2), nn.GELU(), nn.Linear(D // 2, 1))
         self.abox = nn.Sequential(nn.Linear(8 * MF + 4, D), nn.GELU(), nn.Linear(D, D))
@@ -96,7 +112,10 @@ class SetDecoder(nn.Module):
             ca.register_forward_hook(self._group_hook(i))
 
     def fill_from_host(self, host):
-        """The warm-start init: E2's query encoder / decoder start as the warm-started host's."""
+        """The warm-start init: E2's query encoder / decoder start as the warm-started host's
+        (nothing to do when they ARE the host's)."""
+        if self.shared:
+            return
         self.query_encoder.load_state_dict(host.query_encoder.state_dict(), strict=True)
         self.decoder.load_state_dict(host.decoder.state_dict(), strict=True)
 
@@ -107,7 +126,7 @@ class SetDecoder(nn.Module):
         if lay is None:
             return None
         scene_features, query_embeds, *rest = args
-        T, K, Mt = lay['T'], lay['K'], M
+        T, K, Mt = lay['T'], lay['K'], self.M
         B, T_, Kt, C, D = query_embeds.shape
         assert Kt == Mt * K and T_ == T, (query_embeds.shape, T, K)
         emb = self.inst[None, None, :, None]
@@ -129,7 +148,7 @@ class SetDecoder(nn.Module):
             lay = self._layout
             if lay is None:
                 return None
-            return output + self.groups[i](args[0], lay['T'], M, lay['K'])
+            return output + self.groups[i](args[0], lay['T'], self.M, lay['K'])
         return hook
 
     def _anchor_emb(self, ab, sizes):
@@ -140,12 +159,12 @@ class SetDecoder(nn.Module):
         return (e * ok[..., None].to(e.dtype)).permute(0, 2, 1, 3, 4)
 
 
-def _pad_anchors(a):
-    """(B,na,T,[C,]4) -> (B,M,T,C,4) float, NaN beyond the first NA."""
+def _pad_anchors(a, Mq=M):
+    """(B,na,T,[C,]4) -> (B,Mq,T,C,4) float, NaN beyond the first NA."""
     if a.dim() == 4:
         a = a[:, :, :, None]
     B, na = a.shape[:2]
-    out = torch.full((B, M) + tuple(a.shape[2:]), float('nan'), device=a.device, dtype=torch.float32)
+    out = torch.full((B, Mq) + tuple(a.shape[2:]), float('nan'), device=a.device, dtype=torch.float32)
     out[:, :min(na, NA)] = a[:, :NA].float()
     return out
 
@@ -172,10 +191,14 @@ def _iou(a, b):
 def select_query(coords, pres, size, slot_boxes=None, slot=None, anch=None):
     """Which of the M queries is this slot's: query 0 when its own anchor exists anywhere in the
     window; else the one a box Hungarian (query skeleton box vs every slot's box) gives this slot;
-    else the most central, present one. coords (T,M,K,2), pres (T,M) logits, anch (M,T,C,4)."""
+    else the most central, present one. coords (T,M,K,R), pres (T,M) logits, anch (M,T,C,4).
+    3D: always query 0 -- the slot's own anchored query; world coords are never compared with
+    pixel boxes (detr3d-diag)."""
     T, Mq = coords.shape[:2]
     p = torch.sigmoid(pres).mean(0)
     if anch is not None and torch.isfinite(anch[0]).all(-1).any():
+        return 0
+    if coords.shape[-1] == 3:
         return 0
     qb = _qboxes(coords)
     qc = (qb[..., :2] + qb[..., 2:]) / 2
@@ -264,14 +287,15 @@ def set_forward(host, views, kpt_ids, camera_group, mode, *, anchors, anchor_pri
 
     anchors (B,na,T,[C,]4) crop px; anchor_prior (B,na,K,2) crop px + anchor_prompt_t (B,na[,K]):
     a position prior per anchored query. At deploy `kpt_prior`/`prompt_time` (the slot's own carry)
-    replace anchor 0's prior. No box prompt: E2's box is its anchor."""
-    assert mode == '2d', 'the set decoder is 2D only'
+    replace anchor 0's prior. No box prompt: E2's box is its anchor. 3D: anchors (B,na,T,C,4)
+    per camera, priors in world units."""
     sd = host.set_decoder
+    M, NA = sd.M, sd.NA
     B, K = kpt_ids.shape
     dev = views[0].device
     T = int(views[0].shape[1])
-    R = 2
-    anch = None if anchors is None else _pad_anchors(anchors.to(dev))
+    R = 2 if mode == '2d' else 3
+    anch = None if anchors is None else _pad_anchors(anchors.to(dev), M)
     Kt = M * K
     prior = torch.full((B, Kt, R), float('nan'), device=dev)
     pt = torch.zeros((B, Kt), dtype=torch.long, device=dev)
@@ -312,6 +336,7 @@ def select_and_slice(out, pres, anch, K, camera_group, slot_boxes=None, slot=Non
     """E2's full output reduced to the one query that is this slot's (batch item 0 decides)."""
     coords = out['coords_pred']
     T = coords.shape[1]
+    M = pres.shape[-1]
     size = camera_group[0]['size'][:2].float().cpu()
     q = select_query(coords[0, :, :M * K].detach().reshape(T, M, K, -1), pres[0].detach(), size,
                      slot_boxes, slot, None if anch is None else anch[0])
@@ -328,6 +353,10 @@ def moe_forward(host, views, kpt_ids, camera_group, mode, set_inputs, *, input_s
                  an all-False mask runs E1 only, all-True E2 only, a mixed one both on one encode.
     """
     from .model import share_scene
+    if host.set_decoder.shared:
+        return only_forward(host, views, kpt_ids, camera_group, mode, set_inputs,
+                            input_size=input_size, kpt_prior=kpt_prior, prompt_time=prompt_time,
+                            scene_features=scene_features)
     route = set_inputs['route']
     K = int(kpt_ids.shape[1])
     e1 = dict(kpt_prior=kpt_prior, prompt_time=prompt_time, box_prompt=box_prompt,
@@ -371,9 +400,39 @@ def moe_forward(host, views, kpt_ids, camera_group, mode, set_inputs, *, input_s
     return mix_outputs(o2, o1, use2[:T], T, K)
 
 
+def only_forward(host, views, kpt_ids, camera_group, mode, set_inputs, *, input_size=None,
+                 kpt_prior=None, prompt_time=None, scene_features=None):
+    """The set-only (PBM4) model's EVERY forward: E2 over its M queries, reduced to this slot's
+    query (3D: query 0). `set_inputs` None = no anchors and no priors (validation, as the PBM4
+    runs validated); `route = 'train'` keeps the full output under 'set' for `set_loss`. The box
+    prompt never reaches E2 (its box is its anchor), as in PBM4."""
+    from .model import share_scene
+    si = set_inputs or {}
+    K = int(kpt_ids.shape[1])
+
+    def e2():
+        """E2 over all queries -> (full output, presence, anchors)."""
+        return set_forward(host, views, kpt_ids, camera_group, mode, anchors=si.get('anchors'),
+                           anchor_prior=si.get('anchor_prior'),
+                           anchor_prompt_t=si.get('anchor_prompt_t'), kpt_prior=kpt_prior,
+                           prompt_time=prompt_time, input_size=input_size)
+    if scene_features is None:
+        out2, pres, anch = e2()
+    else:
+        with share_scene(host, scene_features=scene_features):
+            out2, pres, anch = e2()
+    out = select_and_slice(out2, pres, anch, K, camera_group, si.get('slot_boxes'),
+                           si.get('slot'))[0]
+    if si.get('route') == 'train':
+        out = dict(out)
+        out['set'] = dict(out=out2, pres=pres, anch=anch, K=K)
+    return out
+
+
 # ------------------------------------------------------------------------------------ the loss
 def _hungarian(cp, gt, valid_rows, pm, norm):
-    """{query: row} minimising mean L1 / norm + presence cost over the valid GT rows."""
+    """{query: row} minimising mean L1 / norm + presence cost over the valid GT rows. `norm` None
+    (3D): each row's own world extent x 2."""
     A = [i for i in range(gt.shape[0]) if bool(valid_rows[i])]
     matched = {}
     if A:
@@ -383,7 +442,11 @@ def _hungarian(cp, gt, valid_rows, pm, norm):
             f = torch.isfinite(gt[i]).all(-1)
             d = (cp - gt[i][:, None]).abs().sum(-1)
             d = torch.where(f[:, None], d, torch.zeros_like(d)).sum((0, 2)) / f.sum().clamp(min=1)
-            Cm[:, j] = (C_L1 * d / max(norm, 1e-6) + C_PRES * (1 - pm)).cpu().numpy()
+            nm = norm
+            if nm is None:
+                g_ = gt[i][f]
+                nm = float((g_.amax(0) - g_.amin(0)).max()) * 2.0 if len(g_) >= 2 else 1.0
+            Cm[:, j] = (C_L1 * d / max(nm, 1e-6) + C_PRES * (1 - pm)).cpu().numpy()
         r, c = linear_sum_assignment(Cm)
         for qi, j in zip(r, c):
             matched[int(qi)] = A[j]
@@ -397,6 +460,7 @@ def set_loss(loss_fn, raw, set_out, targets, device, cgroup=None):
     matched row has >= 2 in-crop keypoints and was assessed, 0 for an unmatched query on frames where
     every animal was assessed, else unsupervised."""
     out, pres, K = set_out['out'], set_out['pres'], set_out['K']
+    M = pres.shape[-1]
     allc = targets['all'].to(device).float()
     ass = targets['assessed'].to(device)
     okr = targets['ok'].to(device)
@@ -412,14 +476,15 @@ def set_loss(loss_fn, raw, set_out, targets, device, cgroup=None):
         n_in = torch.isfinite(gt).all(-1).sum(-1)
         valid = okr[b] & ((n_in >= 2).any(-1))
         cp = coords[b].detach().reshape(T, M, K, R)
+        NA_ = min(NA, M)
         pm = torch.sigmoid(pres[b].detach()).mean(0)
-        matched = {i: i for i in range(NA)
+        matched = {i: i for i in range(NA_)
                    if bool(valid[i]) and bool(torch.isfinite(abox[b, i]).all(-1).any())}
         rest = valid.clone()
         for i in matched.values():
             rest[i] = False
-        free = _hungarian(cp[:, NA:], gt, rest, pm[NA:], HUNGARIAN_NORM)
-        matched.update({NA + q: r for q, r in free.items()})
+        free = _hungarian(cp[:, NA_:], gt, rest, pm[NA_:], HUNGARIAN_NORM if R == 2 else None)
+        matched.update({NA_ + q: r for q, r in free.items()})
         for q in range(M):
             if q in matched:
                 i = matched[q]
@@ -429,7 +494,7 @@ def set_loss(loss_fn, raw, set_out, targets, device, cgroup=None):
             else:
                 pt[b, :, q] = torch.where(allass[b], torch.zeros(T, device=device), nan_T)
     loss = loss_fn(raw, out, coords_true=tgt, vis_true=None, vis_true_cams=None, vis_2d_true=None,
-                   cgroup=cgroup, p2d=tgt[:, None], device=device)
+                   cgroup=cgroup, p2d=tgt[:, None] if R == 2 else None, device=device)
     fm = torch.isfinite(pt)
     if fm.any():
         loss = loss + W_PRES * F.binary_cross_entropy_with_logits(pres[fm], pt[fm])
@@ -466,6 +531,38 @@ def map_scratch_state(state):
             out[k[3:]] = v
             continue
         for old, new in _SCRATCH_RENAMES:
+            if k.startswith(old):
+                out[new + k[len(old):]] = v
+                break
+        else:
+            out[k] = v
+    return out
+
+
+def is_scratch_set_only(state) -> bool:
+    """A scratch crowd-detr SET-DECODER-ONLY checkpoint (the PB series): dq_* additions, no `e1.*`
+    -- its host decoder / query encoder ARE the set decoder's."""
+    return (any(k.startswith('dq_pres.') for k in state)
+            and not any(k.startswith('e1.') for k in state))
+
+
+def map_scratch_set_only(state, where=''):
+    """A scratch set-only state dict in this repo's `set_decoder = "only"` layout: only E2's own
+    additions are renamed (host decoder / query encoder stay where they are). Only the PBM4
+    architecture (M = NA = 4, box-only anchors, GroupPose) maps; anything else is refused by name."""
+    inst = state.get('query_encoder.kpt_dq_inst')
+    extra = sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in state
+                    if ('dq_' in k and not k.startswith(('dq_pres.', 'dq_abox.'))
+                        and not k.startswith(('decoder.dq_groups.', 'query_encoder.kpt_dq_inst')))})
+    if inst is None or inst.shape[0] != M_ONLY or extra:
+        raise SystemExit(
+            f'{where}: a scratch crowd-detr SET-DECODER-ONLY checkpoint that is not the PBM4 '
+            f'architecture ({0 if inst is None else inst.shape[0]} instance queries, expected '
+            f'{M_ONLY}; extra dq modules {extra}). Only PBM4 (the v7 3D set decoder, '
+            'set_decoder = "only") is deployable here.')
+    out = {}
+    for k, v in state.items():
+        for old, new in _SCRATCH_RENAMES[:4]:
             if k.startswith(old):
                 out[new + k[len(old):]] = v
                 break

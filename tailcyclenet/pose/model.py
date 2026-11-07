@@ -36,7 +36,9 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
                 query_terms -- overrides for the pair of prior terms.
                 box_prompt -- 'none', or a `BOX_MODES` box-prompt encoder ('film').
                 set_decoder -- add E2, the anchored set decoder (`set_decoder.py`; the v7 2D
-                    MoE). False builds no module at all, so the model is byte-identical.
+                    MoE). False builds no module at all, so the model is byte-identical. "only"
+                    is the set-only model (PBM4, the v7 3D set decoder): E2 shares the host's
+                    query encoder + decoder and EVERY forward is E2's.
 
         The stock query encoder is replaced with the wide one, built from the same kwargs the
         parent used so it is a drop-in either way. `_shared_scene` starts None (encode per
@@ -89,7 +91,12 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
               f'dim {self.latent_dim}, {self.query_encoder.n_fusion_terms} terms '
               f'({", ".join(self.query_encoder.term_names())})')
         self.set_decoder = None
-        if set_decoder:
+        if set_decoder == 'only':
+            from .set_decoder import SetDecoder
+            self.set_decoder = SetDecoder(self, shared=True)
+            print(f'set decoder ONLY (PBM4): {self.set_decoder.M} queries, {self.set_decoder.NA} '
+                  'box-anchored, on the host decoder; every forward is the set decoder\'s')
+        elif set_decoder:
             from .set_decoder import M, NA, SetDecoder
             assert box_prompt != 'none', ('set_decoder needs a box model: E1, the expert the shared '
                                           'encoder trains on, is the box-FiLM decoder')
@@ -132,9 +139,17 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         wrong for a smaller input -- 0.3.5 splits it out as `input_size=`.
 
         `set_inputs` (a model with a set decoder only) runs the two-expert forward,
-        `set_decoder.moe_forward`; None is the plain path, untouched.
+        `set_decoder.moe_forward`; None is the plain path, untouched -- except for a set-only
+        model, whose every forward is E2's (`set_decoder.only_forward`; None = no anchors).
         """
         px = max(int(c['size'].max()) for c in camera_group)
+        sd = self.set_decoder
+        if sd is not None and sd.shared:
+            from .set_decoder import only_forward
+            kw.pop('box_prompt', None)
+            kw.pop('kpt_chunk', None)
+            return only_forward(self, views, kpt_ids, camera_group, mode, set_inputs,
+                                input_size=px, **kw)
         if set_inputs is not None:
             assert self.set_decoder is not None, 'set_inputs given to a model without a set decoder'
             from .set_decoder import moe_forward
@@ -318,7 +333,10 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
     query_terms = {k: bool(cfg.pop(k)) for k in
                    ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
     box_prompt = cfg.pop('box_prompt', 'none')
-    set_decoder = bool(cfg.pop('set_decoder', False))
+    set_decoder = cfg.pop('set_decoder', False)
+    if set_decoder not in (False, True, 'only'):
+        raise SystemExit(f'[model].set_decoder must be false, true (the v7 2D MoE) or "only" (the '
+                         f'v7 3D set decoder, PBM4); got {set_decoder!r}')
     if box_prompt == 'term':
         raise SystemExit(
             'box_prompt = "term" was removed: no shipped config selected it and `film` matched or '

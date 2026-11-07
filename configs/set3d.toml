@@ -1,0 +1,9 @@
+# The v7 3D set decoder (PBM4, report 76 crowd-detrq / detr3d-multi): E2 ALONE on the host decoder
+# (4 box-anchored queries, known assignment, presence head), trained end to end. Layers over
+# configs/base.toml. Deploy: --anchor none (the only allowed value), --box-prompt detector.
+
+[data]
+hard_frac = 0.5
+
+[model]
+set_decoder = "only"

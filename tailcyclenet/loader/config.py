@@ -104,8 +104,9 @@ class LoaderConfig:
     # random one. 0 draws nothing extra (byte-identical). The v7 MoE recipe is 0.5 (configs/moe.toml).
     hard_frac: float = 0.0
     # DERIVED from `[model].set_decoder` by `scripts/train.py` (never a `[data]` key): append E2's
-    # all-animals targets (`crowd.set_targets`) to every item
-    set_targets: bool = False
+    # all-animals targets (`crowd.set_targets`) to every item; 'only' (a set-only model, PBM4)
+    # keeps 4 rows, builds 3D targets too, and carries every animal through the gauge rotation
+    set_targets: bool | str = False
 
     def __post_init__(self):
         """Validate the opt-in 2D reflection configuration at construction time."""

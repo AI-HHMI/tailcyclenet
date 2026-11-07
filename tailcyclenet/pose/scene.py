@@ -73,7 +73,8 @@ class SceneEncodingMixin:
 
         When camera batching is enabled, cameras are concatenated along B exactly as in the
         deployment path. The returned raw tokens stay in that packed shape so each model's
-        positional/projection tail can run before the final `[C,B,N,D]` reshape.
+        positional/projection tail can run before the final `[C,B,N,D]` reshape. A `backbone_tap`
+        callable set on the model (`identity.carry`) is handed every encoding; it only reads.
         """
         camera_batched = self.camera_batch and len(views_norm) > 1
         if camera_batched:
@@ -96,7 +97,11 @@ class SceneEncodingMixin:
             for view in encoder_views:
                 raw.append(self.scene_encoder.encoder(
                     rearrange(view, 'b t c h w -> b c t h w')))
-        return SceneEncoding(encoder_views, raw, n_cams, batch_size, camera_batched)
+        encoding = SceneEncoding(encoder_views, raw, n_cams, batch_size, camera_batched)
+        tap = getattr(self, 'backbone_tap', None)
+        if tap is not None:
+            tap(encoding)
+        return encoding
 
     def project_scene(self, encoding: SceneEncoding):
         """Apply this checkpoint's own SceneRepresentation tail to raw encoder tokens.

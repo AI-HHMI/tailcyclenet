@@ -327,10 +327,11 @@ def vis_gate(v2, vlogit, thresh):
 @torch.no_grad()
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
-               scorer=None, shared_scene_encoder=False):
+               scorer=None, shared_scene_encoder=False, witness=None):
     """`_run_blocks`, with the OVC seam fix applied to its blocks when `cfg.ovc` (`infer/ovc.py`)."""
     gen = _run_blocks(model, session, gid, registry, dataset_name, cfg, box_points, boxes_for,
-                      n_rows, stats, scorer=scorer, shared_scene_encoder=shared_scene_encoder)
+                      n_rows, stats, scorer=scorer, shared_scene_encoder=shared_scene_encoder,
+                      witness=witness)
     if not (cfg.ovc and cfg.overlap):
         yield from gen
         return
@@ -340,7 +341,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
 def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
-                scorer=None, shared_scene_encoder=False):
+                scorer=None, shared_scene_encoder=False, witness=None):
     """Predict every animal in one group, a block of windows at a time. Yields one dict per block.
 
     Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, not
@@ -370,7 +371,7 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     Telemetry goes in `stats`, never the block dict. `--box-corrupt` keeps each in-flight
     window's corrupted boxes in `corrupted[wi]` (written by `_build_plans`, possibly on the
     prefetch thread; read by the box prompt; popped in window order). In the yielded dict, `n_frames` is a COUNT,
-    not the stop index, and `refine` is the resolved value.
+    not the stop index, and `refine` is the resolved value; `witness` (`identity.carry`) only reads.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     assert cfg.carry_source in CARRY_SOURCES, \
@@ -725,6 +726,8 @@ def _run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             q = p
             if router is not None:
                 router.record(a, frames, p)
+            if witness is not None:
+                witness.observe(a, frames, boxes[0], scales[0], views, cgroup_d, p)
         elif cfg.carry_source == 'pred':
             q = p
         elif out.get('3d_pred_triangulate') is not None:

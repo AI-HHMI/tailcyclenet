@@ -98,6 +98,7 @@ def identity_provenance(args):
         'identity_graph': bool(getattr(args, 'identity', False)),
         'identity_slot_chunk': int(getattr(args, 'identity_slot_chunk', 8)),
         'identity_mask_head': str(getattr(args, 'identity_mask_head', None) or ''),
+        'identity_mask_side': float(getattr(args, 'identity_mask_side', 1.6)),
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
         **_gate_provenance(args),

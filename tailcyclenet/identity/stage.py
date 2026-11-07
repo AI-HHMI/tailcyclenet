@@ -147,7 +147,8 @@ def _jsonable(x):
     return x
 
 
-def identity_group(out, gid, tt, *, stop=None, mask_head=None, detector=None, device='cuda', log=print):
+def identity_group(out, gid, tt, *, stop=None, mask_head=None, detector=None, mask_side=1.6, device='cuda',
+                   log=print):
     """One group: crops -> pixel-ID -> gate -> labels. Returns (record, labels or None, row animal_ids).
 
     The rows are the crops' rows: within [0, stop) a row with no entry is dropped (as the frozen stack
@@ -170,7 +171,8 @@ def identity_group(out, gid, tt, *, stop=None, mask_head=None, detector=None, de
     t0 = time.time()
     if recipe == 'mask':
         from .maskhead import load_maskhead
-        c = C.mask_crops(out, detector, load_maskhead(mask_head, device), group=gid, device=device, stop=stop)
+        c = C.mask_crops(out, detector, load_maskhead(mask_head, device), group=gid, device=device, stop=stop,
+                         side=mask_side)
     elif recipe == 'keypoint':
         c = C.keypoint_crops(out, group=gid, stop=stop)
     else:
@@ -223,7 +225,8 @@ def identity_session(out, args, device):
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
             rec, lab, ids = identity_group(out, gid, tt, stop=stop, mask_head=args.identity_mask_head,
-                                           detector=det, device=device)
+                                           detector=det, mask_side=getattr(args, 'identity_mask_side', 1.6),
+                                           device=device)
         if lab is not None:
             np.savez_compressed(out / LABELS_FILE.format(gid=gid), labels=lab, ids=np.array(ids))
             rec['relabel'] = relabel_tables(out, gid, ids, lab)

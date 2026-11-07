@@ -346,6 +346,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help='--identity: pixel-ID crops from detector + mask-head masks (this '
                             "maskhead.pth, the run's --detector) instead of the default crops "
                             '(keypoint-aligned at K >= 2, detector-box at K = 1).')
+    ident.add_argument('--identity-mask-side', type=float, default=1.6, metavar='BL',
+                       help='--identity-mask-head: crop side in body lengths. 1.6 = the UDMT recipe; '
+                            'idtracker mice need 0.72 (the idtracker crop scale; pixel node accuracy '
+                            '0.995 vs 0.710 at 1.6 on mice_4_2).')
 
     sco = ap.add_argument_group('scorer')
     sco.add_argument('--scorer', type=Path, default=None,

@@ -26,7 +26,7 @@ GRIDRESID_OFFSETS = ('query', 'triangulated')
 class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='wide',
                  gridresid_offset='query', query_terms=None, box_prompt='none', set_decoder=False,
-                 **kwargs):
+                 set_queries=None, **kwargs):
         """Build the pose tracker: the stock `TrackerEncoder` with a pose-shaped query encoder.
 
         Inputs: n_keypoints -- size of the keypoint registry.
@@ -39,6 +39,9 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
                     MoE). False builds no module at all, so the model is byte-identical. "only"
                     is the set-only model (PBM4, the v7 3D set decoder): E2 shares the host's
                     query encoder + decoder and EVERY forward is E2's.
+                set_queries -- E2's query count M, DERIVED (never configured): 8 for a 2D
+                    root's MoE, 4 for a 3D root's (`set_decoder.set_queries_for`); read back from
+                    the run's config / the checkpoint's own `set_decoder.inst` rows.
 
         The stock query encoder is replaced with the wide one, built from the same kwargs the
         parent used so it is a drop-in either way. `_shared_scene` starts None (encode per
@@ -93,15 +96,16 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         self.set_decoder = None
         if set_decoder == 'only':
             from .set_decoder import SetDecoder
-            self.set_decoder = SetDecoder(self, shared=True)
+            self.set_decoder = SetDecoder(self, shared=True, queries=set_queries)
             print(f'set decoder ONLY (PBM4): {self.set_decoder.M} queries, {self.set_decoder.NA} '
                   'box-anchored, on the host decoder; every forward is the set decoder\'s')
         elif set_decoder:
-            from .set_decoder import M, NA, SetDecoder
+            from .set_decoder import NA, SetDecoder
             assert box_prompt != 'none', ('set_decoder needs a box model: E1, the expert the shared '
                                           'encoder trains on, is the box-FiLM decoder')
-            self.set_decoder = SetDecoder(self)
-            print(f'set decoder (E2): {M} queries, {NA} box-anchored, on detached scene tokens')
+            self.set_decoder = SetDecoder(self, queries=set_queries)
+            print(f'set decoder (E2): {self.set_decoder.M} queries, {NA} box-anchored, on '
+                  'detached scene tokens')
 
     def _forward_window(self, views_norm, *args, **kwargs):
         """Route scene encodes through the local split or reuse caller-provided features."""
@@ -334,6 +338,7 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
                    ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
     box_prompt = cfg.pop('box_prompt', 'none')
     set_decoder = cfg.pop('set_decoder', False)
+    set_queries = cfg.pop('set_queries', None)
     if set_decoder not in (False, True, 'only'):
         raise SystemExit(f'[model].set_decoder must be false, true (the v7 2D MoE) or "only" (the '
                          f'v7 3D set decoder, PBM4); got {set_decoder!r}')
@@ -362,6 +367,7 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
 
     return cls(n_keypoints=n_keypoints, query=query, query_encoder=enc,
                gridresid_offset=offset, query_terms=query_terms,
-               box_prompt=box_prompt, set_decoder=set_decoder, **cfg, **extra)
+               box_prompt=box_prompt, set_decoder=set_decoder, set_queries=set_queries,
+               **cfg, **extra)
 
 

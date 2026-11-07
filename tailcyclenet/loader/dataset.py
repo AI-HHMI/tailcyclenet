@@ -130,8 +130,8 @@ class View:
     # per camera, (T,4,2) stored instance-box corners in THIS view's crop pixels (None = no stored
     # box; `box_source = 'instances'` only): what the tight box prompt bounds where finite
     box_pts: list | None = None
-    # (A,T,K,3) EVERY animal's world points in this view's (gauge-rotated) frame -- a set-only
-    # (`set_targets = 'only'`) 3D item only; None otherwise
+    # (A,T,K,3) EVERY animal's world points in this view's (gauge-rotated) frame -- a 3D item of a
+    # set-decoder run (`set_targets`) only; None otherwise
     all_world: object = None
 
 
@@ -227,11 +227,11 @@ class PoseDataset(Dataset):
         self.split = split
         self.train = (split == 'train') if train is None else train
         self.datasets = load_datasets(path, split=split)
-        if cfg.set_targets is True:
-            three = [str(s.path) for ds in self.datasets for s in ds.all_sessions() if s.mode != '2d']
-            if three:
-                raise SystemExit('a set decoder ([model].set_decoder) trains on 2D sessions only; a '
-                                 f'3D set decoder is not built. 3D session(s): {three[:3]}')
+        self.set_rows = 0
+        if cfg.set_targets:
+            from ..pose.set_decoder import M_ONLY, set_queries_for
+            three = any(s.mode != '2d' for ds in self.datasets for s in ds.all_sessions())
+            self.set_rows = M_ONLY if cfg.set_targets == 'only' else set_queries_for(three)
         prediction_sessions = [s.path for ds in self.datasets for s in ds.all_sessions()
                               if s.prediction_session]
         if prediction_sessions:
@@ -848,7 +848,7 @@ class PoseDataset(Dataset):
                 others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],
                                              dtype=torch.float32)
             all_world = (torch.as_tensor(lab.points3d[:, frames], dtype=torch.float32)
-                         if self.cfg.set_targets == 'only' and lab.points3d is not None else None)
+                         if self.cfg.set_targets and lab.points3d is not None else None)
             if self.train and world_gauge:
                 cgroup, coords, others_raw, all_world = _rotate_all(
                     cgroup, coords, others_raw, all_world)

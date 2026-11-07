@@ -19,7 +19,8 @@ from .model import build_model
 def compat_state(state: dict, model_cfg: dict, where) -> dict:
     """The one key mapping at the pose load boundary: a scratch MX0e checkpoint (`e1.*` + `dq_*`,
     crowd/moe 2026-11) is read in this repo's layout (`set_decoder.py`) and its `[model]` gains
-    `set_decoder = true`; a scratch crowd-detr SET-DECODER-ONLY PBM4 checkpoint (`dq_*` without
+    `set_decoder = true` (and `set_queries` = its instance rows: 8 for 2D MX0e, 4 for 3D); a
+    run-folder checkpoint carrying E2 records its own `set_queries` the same way; a scratch crowd-detr SET-DECODER-ONLY PBM4 checkpoint (`dq_*` without
     `e1.*`, the v7 3D set decoder) gains `set_decoder = "only"` (any other set-only architecture is
     refused by name); every other checkpoint passes through untouched. Mutates `model_cfg`."""
     from .set_decoder import is_scratch_layout, map_scratch_set_only, map_scratch_state
@@ -32,9 +33,13 @@ def compat_state(state: dict, model_cfg: dict, where) -> dict:
               're-saved')
         return out
     if not is_scratch_layout(state):
+        inst = state.get('set_decoder.inst')
+        if inst is not None:
+            model_cfg['set_queries'] = int(inst.shape[0])
         return state
     out = map_scratch_state(state)
     model_cfg['set_decoder'] = True
+    model_cfg['set_queries'] = int(out['set_decoder.inst'].shape[0])
     print(f'{where}: scratch MX0e layout (e1.* = E1, dq_* = E2) read as set_decoder.* -- '
           f'{len(state)} tensors key-mapped, none re-saved')
     return out

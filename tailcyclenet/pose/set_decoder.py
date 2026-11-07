@@ -1,4 +1,4 @@
-"""E2, the anchored set decoder of the v7 2D pose model (MX0e; report 76 crowd-moe).
+"""E2, the anchored set decoder of the v7 pose model (MX0e; report 76 crowd-moe), 2D and 3D.
 
 One network, two decoder experts on ONE scene encode: E1 is the host's own box-FiLM query encoder +
 decoder (the stock pose model, unchanged), E2 is this module -- a DETR-style set decoder with `M`
@@ -15,6 +15,10 @@ E2 owns COPIES of the host's query encoder and tracktail `Decoder`. While an E2 
 decoder adds the per-query instance + anchor-box embedding to the query tokens, a hook on each of
 its cross-attentions adds the GroupPose attention, and a hook on the decoder keeps the latent for the
 presence head. Nothing in the library or in E1 is touched.
+
+The SAME MoE trains on a 3D root (owner 2026-11-07, "make 2D and 3D the same"): E2 is then PBM4's
+recipe -- `M_ONLY` = 4 queries (`set_queries`, derived from the root), per-camera anchors, world
+targets -- beside E1 on detached tokens, loss E1 + E2; at deploy E2 runs without priors.
 
 `[model].set_decoder = "only"` is the v7 3D set decoder (PBM4, report 76 crowd-detrq / detr3d-multi):
 the SAME module with no E1 beside it -- the host's own query encoder + decoder ARE E2's (shared, not
@@ -85,13 +89,14 @@ class SetDecoder(nn.Module):
     """E2. Built from the host AFTER the host's own query encoder exists (its copies share the
     architecture; the weights are loaded or warm-filled later, `fill_from_host`)."""
 
-    def __init__(self, host, shared=False):
+    def __init__(self, host, shared=False, queries=None):
         """Copy the host's query encoder + decoder (or, `shared`, use the host's own: the set-only
         model -- plain attributes, not submodules, so the host owns and saves them), add E2's own
-        parts, hook E2's decoder."""
+        parts, hook E2's decoder. `queries` = M (default: M_ONLY set-only, else M; a 3D MoE
+        is built with M_ONLY, see `set_queries_for`)."""
         super().__init__()
         self.shared = bool(shared)
-        self.M = M_ONLY if self.shared else M
+        self.M = int(queries) if queries else (M_ONLY if self.shared else M)
         self.NA = NA
         if self.shared:
             object.__setattr__(self, 'query_encoder', host.query_encoder)
@@ -351,6 +356,8 @@ def moe_forward(host, views, kpt_ids, camera_group, mode, set_inputs, *, input_s
                  tokens; returns E1's output with E2's full output under 'set'.
       a (T,) bool mask -- deploy: frames where True take E2's (selected-query) rows, the rest E1's;
                  an all-False mask runs E1 only, all-True E2 only, a mixed one both on one encode.
+    At deploy E2 takes the slot's carry into query 0 in 2D only; in 3D it runs without priors
+    (the 3D recipe, report 76 v7 3D), while E1 keeps the loop's prior.
     """
     from .model import share_scene
     if host.set_decoder.shared:
@@ -380,13 +387,15 @@ def moe_forward(host, views, kpt_ids, camera_group, mode, set_inputs, *, input_s
         return host._forward(views, kpt_ids, camera_group, mode, kpt_chunk=kpt_chunk,
                              scene_features=scene_features, **e1)
 
+    e2_prior = (kpt_prior, prompt_time) if mode == '2d' else (None, None)
+
     def e2():
         """E2 over all queries, reduced to this slot's query."""
         out2, pres, anch = set_forward(
             host, views, kpt_ids, camera_group, mode, anchors=set_inputs['anchors'],
             anchor_prior=set_inputs.get('anchor_prior'),
             anchor_prompt_t=set_inputs.get('anchor_prompt_t'),
-            kpt_prior=kpt_prior, prompt_time=prompt_time, input_size=input_size)
+            kpt_prior=e2_prior[0], prompt_time=e2_prior[1], input_size=input_size)
         return select_and_slice(out2, pres, anch, K, camera_group,
                                 set_inputs.get('slot_boxes'), set_inputs.get('slot'))[0]
     if bool(use2[:T].all()):
@@ -537,6 +546,12 @@ def map_scratch_state(state):
         else:
             out[k] = v
     return out
+
+
+def set_queries_for(has_3d: bool) -> int:
+    """M of a MoE (`set_decoder = true`) model, DERIVED from its training root: 8 (B1p, the 2D
+    recipe) for a 2D root, `M_ONLY` = 4 (PBM4's E2, the 3D recipe) for a root with 3D sessions."""
+    return M_ONLY if has_3d else M
 
 
 def is_scratch_set_only(state) -> bool:

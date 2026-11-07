@@ -600,6 +600,15 @@ def main(argv: list[str] | None = None):
                       opt_kind=str(opt_cfg.get('optimizer', 'muon')), world=world)
     train_ds, val_ds = build_datasets(data_cfg, lc, plan)
     registry = train_ds.registry
+    if lc.set_targets:
+        user_q = config['model'].get('set_queries')
+        if user_q is not None and int(user_q) != train_ds.set_rows:
+            raise SystemExit(f'[model].set_queries = {user_q} disagrees with the value DERIVED from '
+                             f'this root ({train_ds.set_rows}: 8 for a 2D root, 4 with 3D sessions); '
+                             'it is not a config key -- drop it.')
+        config['model']['set_queries'] = train_ds.set_rows
+        if val_ds is not None:
+            val_ds.set_rows = train_ds.set_rows
     dist_utils.check_registry(fabric, registry.names)
 
     nw = args.num_workers if args.num_workers is not None else int(data_cfg.get('num_workers', 8))

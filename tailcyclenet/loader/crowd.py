@@ -16,12 +16,12 @@ the item's crop-pixel frame, own animal first, the rest by distance from the cro
   prior_t (A,)         the frame that prior describes
 (B1p's recipe, report 76 crowd-detr; fixed, not configured.)
 
-A SET-ONLY run (`set_targets = 'only'`, PBM4, the v7 3D set decoder) keeps `set_decoder.M_ONLY` = 4
-rows, and a 3D item's targets are `set_targets_3d`: every animal's WORLD points in the item's
+The row count is the model's M (`PoseDataset.set_rows`): 8 for a 2D root's MoE, 4 (`set_decoder.M_ONLY`)
+for a set-only run (PBM4) or a 3D root's MoE. A 3D item's targets are `set_targets_3d`: every animal's WORLD points in the item's
 gauge-rotated frame (`View.all_world`), and PER-CAMERA anchors (A,T,C,4) = the projection extent
 of the row's keypoints, each side padded by `[data].crop_pad_frac` x the longer side, squared (the
-crop rule's box without the floor; `square_pad`). A 2D item of such a run (`prob_2d_only`, true
-2D) takes the 2D targets at 4 rows.
+crop rule's box without the floor; `square_pad`). A 2D item (true 2D, or `prob_2d_only`) takes
+the 2D targets at the same row count.
 """
 from __future__ import annotations
 
@@ -69,12 +69,10 @@ def _jit(b, rng, j):
 
 def set_targets(ds, sel, view, rng, train):
     """E2's per-item targets (module docstring): 2D, or (a set-only run) `set_targets_3d`."""
-    if ds.cfg.set_targets == 'only':
-        from ..pose.set_decoder import M_ONLY
-        if view.r == 3:
-            return set_targets_3d(ds, sel, view, rng, train, M_ONLY)
-        return _set_targets_2d(ds, sel, view, rng, train, M_ONLY)
-    return _set_targets_2d(ds, sel, view, rng, train, A_MAX)
+    rows = getattr(ds, 'set_rows', 0) or A_MAX
+    if view.r == 3:
+        return set_targets_3d(ds, sel, view, rng, train, rows)
+    return _set_targets_2d(ds, sel, view, rng, train, rows)
 
 
 def _set_targets_2d(ds, sel, view, rng, train, A_MAX):

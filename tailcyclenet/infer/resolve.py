@@ -191,6 +191,12 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
     set_mode = config.get('model', {}).get('set_decoder', False)
     moe = bool(set_mode) and set_mode != 'only'
     moe_route = None
+    ckpt_route = config.get('model', {}).get('moe_route')
+    if ckpt_route is not None:
+        from .moe import ROUTES
+        if ckpt_route not in ROUTES or not moe:
+            raise SystemExit(f'[model].moe_route = {ckpt_route!r} in the run config: must be one of '
+                             f'{ROUTES}, on a MoE checkpoint (set_decoder = true) only.')
     if set_mode == 'only':
         if sess.mode != '3d':
             raise SystemExit('this checkpoint is a SET-ONLY model (set_decoder = "only", the v7 3D '
@@ -223,7 +229,10 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         if args.box_prompt is None and (args.detector or args.boxes):
             args.box_prompt = 'detector'
     elif moe:
-        moe_route = args.moe_route or 'contact'
+        moe_route = args.moe_route or ckpt_route or 'contact'
+        if args.moe_route is None and ckpt_route is not None:
+            print(f'moe: --moe-route {ckpt_route} is this checkpoint\'s recorded default '
+                  '([model].moe_route); pass --moe-route to override')
         print(f'moe: v7 {sess.mode.upper()} MoE checkpoint (E1 box-FiLM + E2 set decoder), '
               f'--moe-route {moe_route}' + ('' if sess.mode == '2d' else
                                            ' (3D: E2 without priors, contact by camera majority)'))

@@ -218,7 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help='v7 2D MoE checkpoints only (a set decoder, E2): `contact` (default) '
                           'routes each slot-frame to E2 by the contact rule with hysteresis; '
                           '`e1` / `e2` force one expert. A set-only 3D checkpoint (PBM4) is `e2` '
-                          'only. Refused for a checkpoint without E2.')
+                          'only. Default: the run config\'s [model].moe_route (the root\'s chosen arm), '
+                          'else contact. Refused for a checkpoint without E2.')
     win.add_argument('--crop-inflate', type=float, default=None,
                      help='inflate every crop about its centre. Default 1.5 with the box on, '
                           'else 1.0.')

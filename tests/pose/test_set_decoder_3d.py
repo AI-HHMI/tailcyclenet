@@ -422,3 +422,28 @@ def test_resolve_routes_a_3d_moe_and_keeps_a_2d_moe_on_e1_in_3d():
     c = infer_config(args(), three, s3, 4, 64, 'cpu')
     assert c.moe_route == 'contact' and not c.refine and c.anchor == 'carry'
     assert infer_config(args(moe_route='e2'), three, s3, 4, 64, 'cpu').moe_route == 'e2'
+
+
+def test_checkpoint_records_its_default_route():
+    from types import SimpleNamespace
+    from tailcyclenet.infer.cli import build_parser
+    from tailcyclenet.infer.resolve import infer_config
+    base = build_parser().parse_args(['--data', 'x', '--run', 'y', '--out', 'z', '--detector', 'd'])
+
+    def args(**kw):
+        a = SimpleNamespace(**vars(base))
+        a.__dict__.update(frame_start=0, frame_stop=0, **kw)
+        return a
+    m = {'set_decoder': True, 'box_prompt': 'film', 'set_queries': 4}
+    s3 = SimpleNamespace(mode='3d')
+    for r in ('e1', 'e2', 'contact'):
+        cfg = {'model': {**m, 'moe_route': r}, 'data': {}}
+        assert infer_config(args(), cfg, s3, 4, 64, 'cpu').moe_route == r
+    cfg = {'model': {**m, 'moe_route': 'e1'}, 'data': {}}
+    assert infer_config(args(moe_route='e2'), cfg, s3, 4, 64, 'cpu').moe_route == 'e2'
+    with pytest.raises(SystemExit, match='moe_route'):
+        infer_config(args(), {'model': {**m, 'moe_route': 'near'}, 'data': {}}, s3, 4, 64, 'cpu')
+    with pytest.raises(SystemExit, match='moe_route'):
+        infer_config(args(), {'model': {'box_prompt': 'film', 'moe_route': 'e1'}, 'data': {}},
+                     s3, 4, 64, 'cpu')
+    build_model({**MOE3, 'moe_route': 'e2'}, n_keypoints=K)      # a deploy key, never a model kwarg

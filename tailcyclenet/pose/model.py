@@ -339,6 +339,7 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
     box_prompt = cfg.pop('box_prompt', 'none')
     set_decoder = cfg.pop('set_decoder', False)
     set_queries = cfg.pop('set_queries', None)
+    cfg.pop('moe_route', None)
     if set_decoder not in (False, True, 'only'):
         raise SystemExit(f'[model].set_decoder must be false, true (the v7 2D MoE) or "only" (the '
                          f'v7 3D set decoder, PBM4); got {set_decoder!r}')

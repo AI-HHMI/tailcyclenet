@@ -35,11 +35,13 @@ class Registry:
         raise KeyError(f'{dataset!r} is not in this registry: {[d for d, _ in self.datasets]}')
 
     def local_names(self, dataset: str) -> list[str]:
-        """That dataset's own keypoint names, un-prefixed, in registry-id order."""
+        """That dataset's own keypoint names, un-prefixed, in registry-id order.
+
+        Only multi-dataset registries are prefixed (see `build`); a single root whose own names
+        happen to start with '<root>-' (root 'tunnel', keypoint 'tunnel-1') must not be stripped.
+        """
         got = [self.names[i] for i in self.ids_for_dataset(dataset)]
         p = f'{dataset}-'
-        # Only multi-dataset registries are prefixed (see `build`); a single root whose own names
-        # happen to start with '<root>-' (root 'tunnel', keypoint 'tunnel-1') must not be stripped.
         prefixed = len(self.datasets) > 1 and all(n.startswith(p) for n in got)
         return [n[len(p):] for n in got] if prefixed else got
 

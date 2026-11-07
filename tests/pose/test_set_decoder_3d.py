@@ -416,9 +416,9 @@ def test_resolve_routes_a_3d_moe_and_keeps_a_2d_moe_on_e1_in_3d():
     two = {'model': {'set_decoder': True, 'box_prompt': 'film', 'set_queries': 8}, 'data': {}}
     three = {'model': {'set_decoder': True, 'box_prompt': 'film', 'set_queries': 4}, 'data': {}}
     c = infer_config(args(), two, s3, 4, 64, 'cpu')
-    assert c.moe_route is None and c.refine and c.box_prompt == 'detector'   # E1 alone, as before
+    assert c.moe_route is None and not c.refine and c.box_prompt == 'detector'   # E1 alone; 3D --no-refine default
     with pytest.raises(SystemExit, match='2D one'):
         infer_config(args(moe_route='e2'), two, s3, 4, 64, 'cpu')
     c = infer_config(args(), three, s3, 4, 64, 'cpu')
-    assert c.moe_route == 'contact' and c.refine and c.anchor == 'carry'
+    assert c.moe_route == 'contact' and not c.refine and c.anchor == 'carry'
     assert infer_config(args(moe_route='e2'), three, s3, 4, 64, 'cpu').moe_route == 'e2'

@@ -56,12 +56,25 @@ def test_refine_consensus_needs_3d_and_refine():
         check_frame_range(args)
         with pytest.raises(SystemExit, match='refine-consensus'):
             infer_config(args, config, SimpleNamespace(mode=mode), 4, 64, 'cpu')
-    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o',
+    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o', '--refine',
                                       '--refine-consensus', '--refine-consensus-res', '0.3'])
     check_frame_range(args)
     cfg = infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64, 'cpu')
     assert (cfg.refine_consensus, cfg.refine_consensus_res, cfg.refine_consensus_vis) == \
         (True, 0.3, float('-inf'))
+
+
+def test_refine_defaults_off_in_3d_and_on_for_a_2d_box_model():
+    """3D defaults to --no-refine (report 76 refine3d); a 2D non-MoE box model keeps refine on."""
+    base = ['--run', 'r', '--data', 'd', '--out', 'o', '--detector', 'det']
+    box = {'data': {}, 'model': {'box_prompt': 'film'}}
+    for mode, want in (('3d', False), ('2d', True)):
+        args = build_parser().parse_args(base)
+        check_frame_range(args)
+        assert infer_config(args, box, SimpleNamespace(mode=mode), 4, 64, 'cpu').refine is want
+    args = build_parser().parse_args(base + ['--refine'])
+    check_frame_range(args)
+    assert infer_config(args, box, SimpleNamespace(mode='3d'), 4, 64, 'cpu').refine is True
 
 
 def test_refine_carry_fallback_is_3d_only():

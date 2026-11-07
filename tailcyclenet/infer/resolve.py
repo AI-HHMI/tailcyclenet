@@ -174,7 +174,10 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
 
     `--box-prompt auto/firstonly` resolves to `detector` for a box model with a detector/boxes
     file and never falls back to the GT `labels` oracle; a box model then takes
-    crop_inflate 1.5, refine on and refine_px 128 unless set.
+    crop_inflate 1.5 and refine_px 128 unless set. `--refine` defaults ON only for a 2D box model
+    that is not a MoE; it defaults OFF in 3D (owner decision 2026-11-07, report 76 refine3d: null
+    on 3dpop / social-dannce at 1.15-1.25x cost, Panoptic -1.05 mm -- pass --refine there) and
+    for the 2D MoE.
 
     Inputs: args, config (pose run config), sess, trained_frames/trained_px (`trained_window`),
         device. Outputs: an `InferConfig`.
@@ -273,10 +276,13 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
     moe2d = moe and sess.mode == '2d'
     refine = args.refine if args.refine is not None else (
-        False if moe2d else (True if box_on else sess.mode == '3d'))
+        False if (moe2d or sess.mode == '3d') else box_on)
     if moe2d and args.refine is None:
         print('moe: --refine defaults OFF for the 2D MoE (the 128 px pass cost +2.7 px '
               'non-contact on rat-city, report 76); pass --refine to turn it on')
+    if sess.mode == '3d' and args.refine is None:
+        print('--refine defaults OFF in 3D (null on 3dpop / social-dannce, report 76 refine3d); '
+              'pass --refine for Panoptic-like roots (-1.05 mm there)')
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
     if box_on:
         from ..pose.box_prompt import BOX_PROMPT_MIN_DIM, BOX_PROMPT_PAD, trained_geometry

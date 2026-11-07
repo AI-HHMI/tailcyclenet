@@ -440,7 +440,8 @@ def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
 def test_a_moving_rig_3d_prediction_carries_extrinsics_and_resolved_refine(cli, monkeypatch,
                                                                          tmp_path):
     """A moving-rig prediction writes the source's extrinsics.pq (else it fails rule 13), and a
-    non-box 3D run records the RESOLVED `refine = true` (it once recorded `bool(None)`)."""
+    non-box 3D run records the RESOLVED `refine` (it once recorded `bool(None)`); 3D defaults to
+    --no-refine since 2026-11-07, so the resolved value is `false`."""
     import tomllib
 
     from tailcyclenet.format import Session, validate_session
@@ -460,7 +461,7 @@ def test_a_moving_rig_3d_prediction_carries_extrinsics_and_resolved_refine(cli, 
 
     with open(out / 'session.toml', 'rb') as f:
         prov = tomllib.load(f)['provenance']
-    assert prov['refine'] is True, prov
+    assert prov['refine'] is False, prov
     assert prov['box_prompt'] == 'none' and prov['box_prompt_requested'] == 'firstonly'
     assert isinstance(prov['crop_inflate'], float)
     assert 'gridresid_offset' in prov and 'gridresid_offset_override' in prov

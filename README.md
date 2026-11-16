@@ -32,12 +32,9 @@ on one L4.
 # 1. torch built for your CUDA version (the default PyPI wheel is often CPU-only)
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-# 2. tailcyclenet
+# 2. tailcyclenet (pulls tracktail>=0.6.0 and aniposelib-pytorch from PyPI; camera geometry runs
+#    on the GPU in every setting, 2D included, so aniposelib-pytorch, not plain aniposelib, is required)
 pip install tailcyclenet
-
-# 3. aniposelib's `pytorch` branch (required: camera geometry runs on the GPU in every setting,
-#    2D included; the PyPI release of aniposelib does not have it)
-pip install "aniposelib @ git+https://github.com/lambdaloop/anipose-lib.git@pytorch"
 ```
 
 This installs the `tailcyclenet` command: `train`, `train-detector`, `train-scorer`, `infer`,

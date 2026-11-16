@@ -338,11 +338,13 @@ def build_parser() -> argparse.ArgumentParser:
                             'F2 + C0 relabel of animal_id; closed = the rows unchanged. Edits the '
                             'written session in place; the gate inputs and decision go to '
                             '[provenance] and identity.json.')
-    ident.add_argument('--identity-slot-chunk', type=int, default=8, metavar='K',
-                       help='--identity: decode at most K slots per tracktail call (0 = all at once). '
-                            'Output-neutral (each slot sees the inputs of the unchunked call); 8 '
-                            'bounds memory at 60-100 animals (18.5 GiB reserved on an L4 at 100 fish, '
-                            'where all-at-once runs out) and IS the unchunked call at <= 8 animals.')
+    ident.add_argument('--identity-slot-chunk', type=int, default=0, metavar='K',
+                       help='--identity: decode at most K slots per tracktail call. 0 (default) = AUTO: '
+                            'all decoded slots in one call (the identity-exact one) unless the memory '
+                            'estimate says it would not fit the GPU, then the largest K that does, with '
+                            'a warning. Chunking is NOT identity-exact (K = 16 / 8 / 4 give different '
+                            'births at 100 fish; K = 8 already differs at 20), so pass K only to trade '
+                            'that for memory. The K used is recorded in [provenance] and identity.json.')
 
     sco = ap.add_argument_group('scorer')
     sco.add_argument('--scorer', type=Path, default=None,

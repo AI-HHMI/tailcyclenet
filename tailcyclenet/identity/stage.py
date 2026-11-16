@@ -95,6 +95,14 @@ def relabel_tables(path, gid, animal_ids, lab):
     return counts
 
 
+def slot_chunk_report(stats):
+    """How the witness decoded: `requested` (0 = auto), `used` (the smallest slots-per-call K that ran,
+    else the most slots decoded in one call), `exact` (never chunked: identity-exact)."""
+    chunked = int(stats.get('chunked_calls', 0))
+    return dict(requested=int(stats.get('slot_chunk', 0)), chunked_calls=chunked, exact=chunked == 0,
+                used=int(stats.get('chunk_min', 0)) if chunked else int(stats.get('decode_slots_max', 0)))
+
+
 def _write_provenance(path, report):
     """Merge the identity decision into `[provenance]` (scalars; per group when the session has several)."""
     import toml
@@ -103,6 +111,8 @@ def _write_provenance(path, report):
         doc = tomllib.load(f)
     prov = doc.setdefault('provenance', {})
     prov['identity_report'] = REPORT_FILE
+    prov['identity_slot_chunk_used'] = int(report['slot_chunk']['used'])
+    prov['identity_exact'] = bool(report['slot_chunk']['exact'])
     groups = report['groups']
     for gid, g in groups.items():
         pre = 'identity_' if len(groups) == 1 else f'identity_{gid}_'
@@ -197,7 +207,7 @@ def identity_session(out, args, device):
     gids = [str(g) for g in pd.read_parquet(out / 'groups.pq').group_id.astype(str)]
     stop = int(getattr(args, 'end_frame', 0) or getattr(args, 'max_frames', 0) or 0) or None
     report = dict(rule='v8: C0 AND [v7 bar OR (p_mcn <= 0.01 AND p_null <= 0.05)]; ON -> F2 + C0 relabel',
-                  tt=TT_FILE, groups={})
+                  tt=TT_FILE, slot_chunk=slot_chunk_report(tt.get('stats', {})), groups={})
     for gid in gids:
         if not any(r['gid'] == gid for r in tt['rec']['S']) and gid not in tt['events']:
             continue

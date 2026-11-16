@@ -256,6 +256,36 @@ def test_load_config_layers_over_its_family_base(tmp_path):
     assert load_config(p, base=base) == {'data': {'boxes': 'instances'}, 'training': {'iters': 4}}
 
 
+def _train_config(tmp_path, body=''):
+    """`load_train_config` on an overlay holding `body` (the data path is a placeholder)."""
+    p = tmp_path / 'run.toml'
+    p.write_text('[data]\npath = "/x"\n' + body)
+    args = SimpleNamespace(config=p, data=None, iters=None, out=str(tmp_path / 'run'))
+    return tr.load_train_config(args)[0]
+
+
+def test_default_training_model_is_the_moe_in_both_modes(tmp_path):
+    """`set_decoder` defaults to true (E1 + E2) with the MoE's crowded-window stream; the config
+    never names the mode, so a 2D and a 3D root train the same architecture."""
+    cfg = _train_config(tmp_path)
+    assert cfg['model']['set_decoder'] is True
+    assert cfg['data']['hard_frac'] == 0.5
+
+
+@pytest.mark.parametrize('model,data,decoder,hard_frac', [
+    ('set_decoder = false\n', '', False, 'unset'),
+    ('set_decoder = "only"\n', '', 'only', 'unset'),
+    ('set_decoder = "only"\n', 'hard_frac = 0.5\n', 'only', 0.5),
+    ('set_decoder = true\n', 'hard_frac = 0.0\n', True, 0.0),
+    ('', 'hard_frac = 0.25\n', True, 0.25),
+])
+def test_explicit_set_decoder_and_hard_frac_win(tmp_path, model, data, decoder, hard_frac):
+    """An explicit value always wins; `set_decoder = false` is the plain recipe (no hard_frac)."""
+    cfg = _train_config(tmp_path, (f'{data}[model]\n{model}' if model else data))
+    assert cfg['model']['set_decoder'] == decoder
+    assert cfg['data'].get('hard_frac', 'unset') == hard_frac
+
+
 def test_load_config_extends_is_deleted_and_raises(tmp_path):
     from tailcyclenet.config import load_config
 

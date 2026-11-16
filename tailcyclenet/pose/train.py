@@ -206,11 +206,29 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+MOE_HARD_FRAC = 0.5
+"""The crowded-window share of the v7 MoE recipe (report 79 section 1)."""
+
+
+def default_moe_hard_frac(config: dict) -> None:
+    """The MoE recipe's `[data].hard_frac` where the config left it unset.
+
+    `[model].set_decoder` defaults to true (`configs/base.toml`), and the MoE trains on a
+    crowded-window stream (`hard_frac = 0.5`, `configs/moe.toml` before it became the default).
+    The default is derived here, not written in base.toml, so `set_decoder = false` is exactly
+    the plain box-FiLM recipe (`hard_frac = 0`) and `"only"` keeps its own config's value. A
+    `hard_frac` the user wrote, including 0, is never touched.
+    """
+    if config['model'].get('set_decoder') is True and 'hard_frac' not in config['data']:
+        config['data']['hard_frac'] = MOE_HARD_FRAC
+
+
 def load_train_config(args) -> tuple[dict, Path]:
     """The layered config with the CLI overrides applied and every unknown key refused -> (config, run)."""
     config = load_config(args.config or BASE_CONFIG)
     check_image_size(config)
     data_cfg, train_cfg = config['data'], config['training']
+    default_moe_hard_frac(config)
     if args.data:
         data_cfg['path'] = str(args.data)
     if args.iters:

@@ -50,6 +50,8 @@ query_encoder = "wide"      # the only encoder; the two query terms are built if
 box_prompt = "film"
 # What the 3D residual is an offset FROM. No default: both values load the same tensors, so a mismatch silently mis-reads -- the key asserts what the weights were trained as (inert in 2D); "triangulated" is refuted with query = "prior".
 gridresid_offset = "query"
+# The v7 MoE, 2D AND 3D: E1 (box-FiLM) + E2 (set decoder on detached tokens); `train.py` derives hard_frac = 0.5 with it. false = the plain box-FiLM model, "only" = the 3D set-only model (PBM4); an explicit value always wins.
+set_decoder = true
 
 video_encoder_version = "large"
 # STAGED UNFREEZE, the only statement about the encoder's gradient state (the old `freeze_encoder` is gone): a bool = never / from step 0; an INT = the iteration to unfreeze at; `false` reproduces the old arm exactly.

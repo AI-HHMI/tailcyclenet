@@ -101,7 +101,7 @@ class LoaderConfig:
     box_prompt_geometry: str = 'tight'
     # Crowded-window share of the TRAIN stream, by rejection (`crowd.is_crowded`: another animal
     # within 0.8 x this one's extent); > 0 also makes the swap neighbour the NEAREST animal, not a
-    # random one. 0 draws nothing extra (byte-identical). The v7 MoE recipe is 0.5 (configs/moe.toml).
+    # random one. 0 draws nothing extra (byte-identical). The v7 MoE recipe is 0.5 (`pose.train.default_moe_hard_frac`).
     hard_frac: float = 0.0
     # DERIVED from `[model].set_decoder` by `scripts/train.py` (never a `[data]` key): append E2's
     # all-animals targets (`crowd.set_targets`) to every item; 'only' (a set-only model, PBM4)

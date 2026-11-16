@@ -16,8 +16,11 @@ decoded (gate 1.0); other points ride their uniquely-claiming slot's centroid di
 held when no slot claims them uniquely. Each point is decoded once, in its most central crop.
 
 Memory: the decode over slots runs in chunks of `slot_chunk` slots, every chunk padded to the same
-group-wide query count, so each slot sees exactly the inputs of the unchunked call (tracktail mixes
-queries only within a batch row). `slot_chunk` >= the number of decoded slots IS the unchunked call.
+group-wide query count. Chunking is NOT identity-exact (report 79 lesson 15: at 100 fish K = 16 / 8 / 4
+give different births; at 20 fish K = 8 already differs), and `slot_chunk` >= the number of decoded
+slots IS the exact unchunked call. So `slot_chunk = 0` (the default) is AUTO: every decoded slot in one
+call, chunked only when `decode_slot_bytes` says that would not fit the GPU, then at the largest K that
+fits, with a warning. An explicit K > 0 always wins.
 `sample_patches` is swapped for a memory-exact equivalent during the decode only
 (`fast_sample_patches`): upstream gathers a full frame per query, which is what runs out of memory at
 60-100 animals.
@@ -46,6 +49,48 @@ REFRESH_SEP = 0.25
 REFRESH_FRAC = 0.7
 """Hull share an identity needs to re-seed from an isolated slot."""
 TAIL = ('tail',)
+
+
+SLOT_FIXED_BYTES = 0.9
+"""Decode working set per slot, in multiples of that slot's raw encoder tokens (measured, below)."""
+QUERY_FRAME_BYTES = 128_000
+"""Decode working set per (query, frame) per 1536 tokens (measured, below)."""
+SLOT_BUDGET_FRACTION = 0.8
+"""Share of the GPU memory still available that auto-chunking lets the decode use."""
+
+
+def decode_slot_bytes(enc, views, n_queries):
+    """The GPU bytes one slot adds to the batched decode: its concatenated tokens and views, plus the
+    scene tail and the point decoder's working set for `n_queries` points.
+
+    Measured on `_track` (fp32, 256 px crops, 12 frames, ViT-L: 1536 tokens x 4096 channels), peak
+    extra memory is linear in the batch (B = 1..64, constant per slot to 0.5%) and in the query count:
+    50.3 MiB per slot at 20 queries, 108.8 MiB at 60 = 21.1 MiB + 1.46 MiB per query. The model below
+    reproduces that, and the 100-fish L4 logs (report 79 ttchunk: K = 16 peaked +2.8 GiB over the pose
+    loop, all-at-once ran out at 22 GiB). Autocast and fewer frames only make it conservative.
+    """
+    raw = sum(f.numel() * f.element_size() for f in enc.raw_features)
+    vid = sum(v.numel() * v.element_size() for v in views)
+    tokens, frames = enc.raw_features[0].shape[1], views[0].shape[1]
+    return (raw + vid) + SLOT_FIXED_BYTES * raw + QUERY_FRAME_BYTES * (tokens / 1536) * frames * n_queries
+
+
+def auto_slot_chunk(n_slots, per_slot_bytes, budget_bytes):
+    """-> (K, exact): all `n_slots` in one call when they fit `budget_bytes`, else the largest K >= 1
+    that does (`exact` is False then: chunked decoding is not identity-exact)."""
+    fit = int(budget_bytes // max(1.0, per_slot_bytes))
+    return (n_slots, True) if fit >= n_slots else (max(1, fit), False)
+
+
+def gpu_budget_bytes(device):
+    """What the decode may allocate now: free device memory plus what this process has cached and not
+    used, times `SLOT_BUDGET_FRACTION`. None off CUDA (no GPU bound, so auto = one call)."""
+    device = torch.device(device)
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return None
+    free, _ = torch.cuda.mem_get_info(device)
+    reusable = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return SLOT_BUDGET_FRACTION * (free + reusable)
 
 
 def fast_sample_patches(images, centers, query_times, patch_size):
@@ -185,12 +230,14 @@ class CarryWitness:
     order) / `end_group`; `save` writes the records. The pose path is untouched: the witness only
     reads what the loop already computed (the backbone tokens via `tap`, views, coords)."""
 
-    def __init__(self, model, device, slot_chunk=8):
+    def __init__(self, model, device, slot_chunk=0):
         """Attach to `model` (sets its `backbone_tap`); the head loads at the first decode."""
         self.model, self.device, self.slot_chunk = model, device, int(slot_chunk)
         self.head = None
         self.rec, self.events, self.stats = [], {}, dict(windows=0, dec_calls=0, slot_windows=0,
-                                                          slot_windows_dec=0)
+                                                          slot_windows_dec=0, slot_chunk=self.slot_chunk,
+                                                          decode_slots_max=0, chunked_calls=0,
+                                                          chunk_min=0)
         self.state, self.nid, self.ev = {}, 0, []
         self.gid, self.names, self.ws, self.items, self._last = None, [], None, {}, None
         model.backbone_tap = self.tap
@@ -397,6 +444,32 @@ class CarryWitness:
         rec['psrc'] = {a: items[a]['psrc'].astype(np.float32) for a in slots}
         self.rec.append(rec)
 
+    def _chunk_for(self, gjobs, items, nmax):
+        """Slots per tracktail call for one shape group: the explicit `slot_chunk`, else all of them
+        unless they would not fit the GPU (then the largest K that does, with a one-time warning)."""
+        n = len(gjobs)
+        self.stats['decode_slots_max'] = max(self.stats['decode_slots_max'], n)
+        if self.slot_chunk > 0:
+            ck = self.slot_chunk
+        else:
+            budget = gpu_budget_bytes(self.device)
+            if budget is None:
+                return n
+            a0 = gjobs[0][0]
+            ck, exact = auto_slot_chunk(
+                n, decode_slot_bytes(items[a0]['enc'], items[a0]['views'], nmax), budget)
+            if not exact and not getattr(self, '_warned', False):
+                self._warned = True
+                print(f'WARNING identity: decoding {n} slots x {nmax} queries in one tracktail call would not '
+                      f'fit the GPU ({budget / 2**30:.1f} GiB usable); chunking at {ck} slots per call. '
+                      'Chunked results are NOT identity-exact (report 79 lesson 15: different births than the '
+                      'unchunked call). Pass --identity-slot-chunk K to choose K, or use a larger GPU.',
+                      flush=True)
+        if ck < n:
+            self.stats['chunked_calls'] += 1
+            self.stats['chunk_min'] = ck if not self.stats['chunk_min'] else min(self.stats['chunk_min'], ck)
+        return ck
+
     @torch.no_grad()
     def _decode(self, items, jobs):
         """Batched decode of every job, in chunks of `slot_chunk` slots padded to one query count."""
@@ -408,7 +481,7 @@ class CarryWitness:
         for gjobs in groups.values():
             if len(gjobs) > 1:
                 nmax = max(len(ix) for _, ix, _ in gjobs)
-                CK = self.slot_chunk if self.slot_chunk > 0 else len(gjobs)
+                CK = self._chunk_for(gjobs, items, nmax)
                 for c0 in range(0, len(gjobs), CK):
                     cjobs = gjobs[c0:c0 + CK]
                     B_ = len(cjobs)

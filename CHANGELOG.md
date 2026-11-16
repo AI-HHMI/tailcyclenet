@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changes that move numbers
+- `train` defaults to the v7 MoE (`[model].set_decoder = true`, `hard_frac = 0.5` when unset) in 2D AND 3D; `configs/moe.toml` is gone (it is the
+  default). Explicit `set_decoder = false` / `"only"` and any written `hard_frac` win. A resume of an older plain run folder must now state
+  `set_decoder = false`. A 3D MoE deploys `--moe-route contact` unless told otherwise (E1-only measured better in 3D, report 79).
+- `--identity-slot-chunk` defaults to auto (0): all decoded slots in one tracktail call, which is the identity-exact one (chunking changes births:
+  K = 16 / 8 / 4 differ at 100 fish, K = 8 already at 20). It chunks, with a warning, only when the memory estimate says one call would not fit the GPU.
+  The K used and whether the decode was exact are recorded in `[provenance]` and `identity.json`.
+
 ## 0.5.0 (2026-11-16)
 
 ### Features and behaviour changes (since 0.4.2)

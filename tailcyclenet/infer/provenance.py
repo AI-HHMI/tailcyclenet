@@ -96,7 +96,7 @@ def identity_provenance(args):
         'max_age': int(args.max_age),
         'identity_bridge': bool(args.identity_bridge),
         'identity_graph': bool(getattr(args, 'identity', False)),
-        'identity_slot_chunk': int(getattr(args, 'identity_slot_chunk', 8)),
+        'identity_slot_chunk': int(getattr(args, 'identity_slot_chunk', 0)),
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
         **_gate_provenance(args),

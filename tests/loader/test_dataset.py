@@ -996,7 +996,7 @@ def test_a_3d_session_without_points3d_is_triangulated_at_load(tmp_path):
     rig = fmt.load_calibration(path / 'calibration.toml')
     original.points2d = np.full((1, 4, len(KPTS_3D), 3, 2), np.nan, np.float32)
     for c, cam in enumerate(rig.cameras):
-        projected = cam.project(original.points3d[0].reshape(-1, 3)).detach().cpu().numpy()
+        projected = np.asarray(cam.project(original.points3d[0].reshape(-1, 3)))
         projected = projected.reshape(4, -1, 2)
         positioned = np.isin(original.vis2d[0, :, :, c], (fmt.VISIBLE, fmt.PROJECTED))
         original.points2d[0, :, :, c] = np.where(

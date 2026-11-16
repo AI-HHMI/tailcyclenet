@@ -25,7 +25,7 @@ def _project_3d_labels(sess, lab):
     C = len(sess.rig)
     lab.points2d = np.full((S, T, K, C, 2), np.nan, np.float32)
     for c, cam in enumerate(sess.rig.cameras):
-        xy = cam.project(lab.points3d.reshape(-1, 3)).detach().cpu().numpy()
+        xy = np.asarray(cam.project(lab.points3d.reshape(-1, 3)))
         xy = xy.reshape(S, T, K, 2)
         positioned = np.isin(lab.vis2d[..., c], fmt.POSITIONED)
         lab.points2d[..., c, :] = np.where(positioned[..., None], xy, np.nan)

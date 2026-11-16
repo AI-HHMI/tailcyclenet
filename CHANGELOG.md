@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Dependencies
+- `tracktail>=0.6.0,<1` (was 0.5.0). 0.6.0 pins `numpy==1.26`, so the env stays on numpy 1.26 even though the pixi `numpy` spec is now `*`.
+- `aniposelib` git branch `pytorch` replaced by PyPI `aniposelib-pytorch>=1.1.0` (import name still `aniposelib`; also required by tracktail 0.6.0).
+  Its `Camera.project` returns numpy for numpy input, so two tests no longer call `.detach().cpu()` on it.
+
 ## 0.4.1 (2026-10-21)
 
 ### Changes that move numbers

@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-11-16)
+
+### Features and behaviour changes (since 0.4.2)
+- `infer --identity`: 2D TrackGraph v7 + v8 pixel-ID identity post-pass (rotation-blind pixel net, detector-box crops).
+- Mixture-of-experts pose models (box-FiLM + set decoder) in 2D and 3D, routed with `--moe-route e1 | e2 | contact`.
+- Tight detector boxes everywhere (`box_target` is `square` / `tight`); `--refine` is off by default in 2D and 3D.
 
 ### Dependencies
 - `tracktail>=0.6.0,<1` (was 0.5.0). 0.6.0 pins `numpy==1.26`, so the env stays on numpy 1.26 even though the pixi `numpy` spec is now `*`.

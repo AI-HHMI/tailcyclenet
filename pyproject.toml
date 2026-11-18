@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "tracktail>=0.6.0,<1",
+    "tracktail>=0.6.2,<1",
     "aniposelib-pytorch>=1.1.0",
     "torch>=2.9,<3",
     "einops",
@@ -77,17 +77,18 @@ MALLOC_ARENA_MAX = "2"
 # tracktail (renamed from posetail at 0.5.0: `posetail.posetail.*` -> `tracktail.model.*`,
 # `posetail.datasets.posetail_dataset` -> `tracktail.datasets.tracktail_dataset`) is a LIBRARY
 # here, never modified, installed from PyPI (a reference checkout lives at
-# ~/ghome/projects/posetail/posetail-next for READING only). Any 0.x release from 0.6.0 on is
-# accepted; pixi.lock records the exact version tested (0.6.0 pins numpy==1.26 and requires
-# aniposelib-pytorch, so numpy stays 1.26 whatever the loose spec below says). 0.4.1 landed every workaround this repo
+# ~/ghome/projects/posetail/posetail-next for READING only). Any 0.x release from 0.6.2 on is
+# accepted; pixi.lock records the exact version tested. 0.6.1 unpinned numpy (the lock keeps
+# 1.26; numpy 2 is allowed but untested here) and 0.6.2 added the [training.speed] helpers (tracktail.model.speed) that tailcyclenet's own
+# training loop ports. 0.4.1 landed every workaround this repo
 # carried -- the cube.py patches, crop_box_for_points, input_size=/scene_features=, T=1 guard,
 # occlusion/vis guards -- and packaged TrackerEncoder weights from Hugging Face; 0.4.2 landed
 # int64 query/target time indices, removal of the deprecated torch.backends.cuda.sdp_kernel
 # context, and the video_encoder_pretrained flag threaded through TrackerEncoder.
-tracktail = ">=0.6.0,<1"
+tracktail = ">=0.6.2,<1"
 # aniposelib-pytorch (PyPI, import name `aniposelib`): Camera is an nn.Module whose projection,
 # triangulation and Jacobians are torch ops, so camera geometry runs on GPU with the model.
-# tracktail 0.6.0 requires it itself; declared here too because tailcyclenet imports aniposelib.
+# tracktail requires it itself; declared here too because tailcyclenet imports aniposelib.
 aniposelib-pytorch = ">=1.1.0"
 tailcyclenet = { path = ".", editable = true }
 torch = { version = "<3", index = "https://download.pytorch.org/whl/cu128" }

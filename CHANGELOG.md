@@ -17,6 +17,10 @@
   K = 16 / 8 / 4 differ at 100 fish, K = 8 already at 20). It chunks, with a warning, only when the memory estimate says one call would not fit the GPU.
   The K used and whether the decode was exact are recorded in `[provenance]` and `identity.json`.
 
+### Dependencies
+- `tracktail>=0.6.2,<1` (was 0.6.0). 0.6.1 unpinned numpy (pixi.lock keeps 1.26) and requires `opencv-python>=4.10.0.84` (the lock moves
+  4.9.0.80 -> 4.11.0.86); 0.6.2 adds `pyarrow` and the `[training.speed]` helpers of its own `train.py`. No tailcyclenet call site changed.
+
 ## 0.5.0 (2026-11-16)
 
 ### Features and behaviour changes (since 0.4.2)

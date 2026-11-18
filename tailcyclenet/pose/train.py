@@ -10,6 +10,7 @@ import argparse
 import ctypes
 import gc
 import json
+import math
 import os
 import time
 from collections import Counter
@@ -158,7 +159,7 @@ def run_batch(model, loss_fn, batch, device, raw=None):
             cgroup=cgroup, p2d=None if batch.p2d is None else batch.p2d.to(device), device=device)
         if set_out is not None:
             loss_e2 = set_loss(loss_fn, model if raw is None else raw, set_out, st, device, cgroup)
-            out['loss_parts'] = {'loss_e1': float(loss.detach()), 'loss_e2': float(loss_e2.detach())}
+            out['loss_parts'] = {'loss_e1': loss.detach(), 'loss_e2': loss_e2.detach()}
             loss = loss + loss_e2
     except ValueError as e:
         if 'non-finite' not in str(e):
@@ -453,10 +454,17 @@ class StepLoop:
         self.it = self.step * self.world
 
     def train_step(self, batch):
-        """One optimizer step -> (grad_norm, grad_norm_muon), or None when it was skipped."""
+        """One optimizer step -> (grad_norm, grad_norm_muon), or None when it was skipped.
+
+        The step reads the device ONCE, after the clip: loss, grad norm and Muon-half norm come back
+        in one transfer that decides the skip and feeds the interval log, so the optimizer's kernels
+        stay queued while the host fetches the next batch. A loss without a graph (the poisoned-loss
+        path of `run_batch`) skips before backward; a non-finite loss with a graph skips after it
+        (its gradients are discarded by the next `zero_grad`), the same parameters either way.
+        """
         fabric, opt = self.fabric, self.opt
         loss, out = run_batch(self.model, self.loss_fn, batch, self.device, raw=self.raw)
-        if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(loss))):
+        if not dist_utils.all_ranks_finite(fabric, loss.requires_grad):
             self._skip()
             return None
         opt.zero_grad(set_to_none=True)
@@ -464,12 +472,14 @@ class StepLoop:
         gn = torch.nn.utils.clip_grad_norm_(self.clip_params, self.max_grad or 1e9)
         mgrads = [p.grad for p in self.unclipped_params if p.grad is not None]
         mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())
+        loss_v, gn_v, mgn_v = torch.stack(
+            [t.detach().float().to(loss.device) for t in (loss, gn, mgn)]).tolist()
         if not dist_utils.all_ranks_finite(
-                fabric, bool(torch.isfinite(gn) and torch.isfinite(mgn))):
+                fabric, math.isfinite(loss_v) and math.isfinite(gn_v) and math.isfinite(mgn_v)):
             self._skip()
             return None
         opt.step()
-        self.running.append(dist_utils.all_ranks_mean(fabric, float(loss.detach())))
+        self.running.append(dist_utils.all_ranks_mean(fabric, loss_v))
         for name, value in (out.get('loss_parts') or {}).items():
             self.running_parts.setdefault(name, []).append(value)
         if self.local_metric_freq and self.step % self.local_metric_freq == 0:
@@ -481,7 +491,7 @@ class StepLoop:
         for name, (total, count) in drain_smoothness(self.loss_fn).items():
             self.smoothness_running[name][0] += total
             self.smoothness_running[name][1] += count
-        self.clipped.append(float(self.max_grad is not None and float(gn) > self.max_grad))
+        self.clipped.append(float(self.max_grad is not None and gn_v > self.max_grad))
         self.step += 1
         self.it = self.step * self.world
         return gn, mgn
@@ -502,7 +512,8 @@ class StepLoop:
                      f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
         smoothness = smoothness_log_values(self.smoothness_running, fabric)
         train_metric_values = metric_log_values(self.metrics_running, fabric)
-        parts = {f'train/{k}': dist_utils.all_ranks_mean(fabric, float(np.mean(v)))
+        parts = {f'train/{k}': dist_utils.all_ranks_mean(
+                     fabric, float(np.mean(torch.stack(v).tolist())))
                  for k, v in sorted(self.running_parts.items())}
         if parts:
             fabric.print('         ' + '  '.join(f'{k[6:]} {v:.4f}' for k, v in parts.items()),

@@ -21,9 +21,26 @@ if not hasattr(cube, '_tailcyclenet_scalar_projection_sensitivity'):
     cube._tailcyclenet_scalar_projection_sensitivity = cube.projection_sensitivity
 
 
+SKEW_ATTR = '_tailcyclenet_has_skew'
+
+
+def remember_skew(matrix, skew: bool):
+    """Record `skew` on this exact matrix tensor, so `has_skew` answers without a device read.
+
+    The flag rides on the tensor object, not the camera dict: tracktail copies camera dicts
+    (`dict(cam, offset=...)`) but keeps the same matrix tensor, and a new matrix (a rotated or
+    re-moved camera) carries no flag and is tested afresh.
+    """
+    setattr(matrix, SKEW_ATTR, bool(skew))
+
+
 def has_skew(cam) -> bool:
-    """Whether the camera's 2x2 image transform has an off-diagonal term."""
+    """Whether the camera's 2x2 image transform has an off-diagonal term (`remember_skew`'s flag
+    when the matrix carries one)."""
     matrix = cam['mat']
+    cached = getattr(matrix, SKEW_ATTR, None)
+    if cached is not None:
+        return cached
     return bool(torch.any(matrix[:2, :2].abs().masked_fill(
         torch.eye(2, dtype=torch.bool, device=matrix.device), 0.0) != 0))
 

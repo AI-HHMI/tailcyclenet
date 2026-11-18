@@ -439,23 +439,31 @@ def only_forward(host, views, kpt_ids, camera_group, mode, set_inputs, *, input_
 
 
 # ------------------------------------------------------------------------------------ the loss
+def _row_norm(g, f):
+    """A GT row's own world extent x 2 (1.0 with < 2 finite points), floored at 1e-6, as a device
+    scalar: the largest per-axis span of the finite points, so no masked select reads the device."""
+    inf = torch.full_like(g, float('inf'))
+    hi = torch.where(f[:, :, None], g, -inf).amax((0, 1))
+    lo = torch.where(f[:, :, None], g, inf).amin((0, 1))
+    span = (hi - lo).max() * 2.0
+    return torch.where(f.sum() >= 2, span, torch.ones_like(span)).clamp(min=1e-6)
+
+
 def _hungarian(cp, gt, valid_rows, pm, norm):
     """{query: row} minimising mean L1 / norm + presence cost over the valid GT rows. `norm` None
-    (3D): each row's own world extent x 2."""
-    A = [i for i in range(gt.shape[0]) if bool(valid_rows[i])]
+    (3D): each row's own world extent x 2. `valid_rows` is a host sequence of bools; the cost
+    matrix is built on the device and read back once."""
+    A = [i for i in range(gt.shape[0]) if valid_rows[i]]
     matched = {}
     if A:
-        Mq = cp.shape[1]
-        Cm = np.zeros((Mq, len(A)))
-        for j, i in enumerate(A):
+        cols = []
+        for i in A:
             f = torch.isfinite(gt[i]).all(-1)
             d = (cp - gt[i][:, None]).abs().sum(-1)
             d = torch.where(f[:, None], d, torch.zeros_like(d)).sum((0, 2)) / f.sum().clamp(min=1)
-            nm = norm
-            if nm is None:
-                g_ = gt[i][f]
-                nm = float((g_.amax(0) - g_.amin(0)).max()) * 2.0 if len(g_) >= 2 else 1.0
-            Cm[:, j] = (C_L1 * d / max(nm, 1e-6) + C_PRES * (1 - pm)).cpu().numpy()
+            nm = max(norm, 1e-6) if norm is not None else _row_norm(gt[i], f)
+            cols.append(C_L1 * d / nm + C_PRES * (1 - pm))
+        Cm = torch.stack(cols, 1).cpu().numpy().astype(np.float64)
         r, c = linear_sum_assignment(Cm)
         for qi, j in zip(r, c):
             matched[int(qi)] = A[j]
@@ -487,9 +495,10 @@ def set_loss(loss_fn, raw, set_out, targets, device, cgroup=None):
         cp = coords[b].detach().reshape(T, M, K, R)
         NA_ = min(NA, M)
         pm = torch.sigmoid(pres[b].detach()).mean(0)
-        matched = {i: i for i in range(NA_)
-                   if bool(valid[i]) and bool(torch.isfinite(abox[b, i]).all(-1).any())}
-        rest = valid.clone()
+        valid_h = valid.tolist()
+        anchored = torch.isfinite(abox[b, :NA_]).all(-1).any(-1).tolist()
+        matched = {i: i for i in range(NA_) if valid_h[i] and anchored[i]}
+        rest = list(valid_h)
         for i in matched.values():
             rest[i] = False
         free = _hungarian(cp[:, NA_:], gt, rest, pm[NA_:], HUNGARIAN_NORM if R == 2 else None)

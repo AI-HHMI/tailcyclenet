@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from .. import distributed as dist_utils
+from ..tracktail_compat import has_skew, remember_skew
 from .model import share_scene
 from .prompt import self_prompt
 
@@ -20,10 +21,21 @@ def brief(m: dict) -> str:
 
 
 def to_device(batch, device):
-    """Move a batch's views and cgroup onto `device`, non-blocking where safe."""
+    """Move a batch's views and cgroup onto `device` without a host sync.
+
+    Every copy is non-blocking (a pageable source is staged by the driver before the call
+    returns, so the host tensor may be reused at once). Each camera's skew flag is read from the
+    HOST matrix and recorded on the device one (`tracktail_compat.remember_skew`), so the per-call
+    skew test in the geometry never reads the device back.
+    """
     views = [v.to(device, non_blocking=True) for v in batch.views]
-    cgroup = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
-              for c in batch.cgroup]
+    cgroup = []
+    for c in batch.cgroup:
+        moved = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                 for k, v in c.items()}
+        if torch.is_tensor(c.get('mat')):
+            remember_skew(moved['mat'], has_skew(c))
+        cgroup.append(moved)
     return views, cgroup
 
 

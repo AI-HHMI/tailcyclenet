@@ -32,6 +32,7 @@ from .evaluate import (SMOOTHNESS_KEYS, TRAIN_METRIC_KEYS, TRAIN_METRIC_MODES, b
 from .losses import PoseLoss
 from .model import build_model
 from .set_decoder import NA, set_loss
+from .speed import apply_training_speedups
 from .optim import KNOWN_OPTIMIZER_KEYS
 from .start import build_start, plan_start
 from .unfreeze import apply_staged_unfreeze, trainable_encoder_params
@@ -43,7 +44,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 KNOWN_TRAINING_KEYS = frozenset({
     'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision', 'max_grad_norm',
     'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq', 'train_metric_freq', 'out',
-    'optimizer', 'losses'})
+    'optimizer', 'losses', 'speed'})
 
 
 def check_training_keys(train_cfg: dict) -> None:
@@ -669,6 +670,8 @@ def main(argv: list[str] | None = None):
     gen = sampler_generator(int(train_cfg.get('seed', 23)), fabric.global_rank, world, first_step)
     loader = train_loader(train_ds, nw, local_iters, first_step, gen)
 
+    speed = apply_training_speedups(raw, train_cfg, device.type)
+    fabric.print(f'speed: {speed}')
     wrap = world > 1 or args.precision != '32-true'
     model = fabric.setup_module(raw) if wrap else raw
 
@@ -677,6 +680,7 @@ def main(argv: list[str] | None = None):
     if is0:
         save_run_meta(run, config, registry, extra={
             'world_size': world, 'devices': str(args.devices), 'precision': args.precision,
+            'speed': speed,
             'lr_effective': float(opt_cfg_scaled['learning_rate']),
             'kpt_lr_effective': float(opt_cfg_scaled.get('kpt_lr',
                                                          opt_cfg_scaled['learning_rate']))})

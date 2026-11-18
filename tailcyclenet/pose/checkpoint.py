@@ -45,6 +45,16 @@ def compat_state(state: dict, model_cfg: dict, where) -> dict:
     return out
 
 
+def _drop_untrained_lift_head(model, state: dict, where) -> None:
+    """A config that builds the lift head over a checkpoint with no `lift_head.*` weights (an older
+    checkpoint read under the new default) must not deploy a random head: drop it, say so."""
+    if getattr(model, 'lift_head', None) is not None and not any(
+            k.startswith('lift_head.') for k in state):
+        model.lift_head = None
+        print(f'{where}: no lift_head.* weights in this checkpoint -- the lift head is dropped and '
+              'single-view 3D uses the stock output')
+
+
 def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None = None):
     """Load a self-contained pose checkpoint, whether packaged or copied from training."""
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -70,6 +80,7 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
     state = compat_state(state, config.setdefault('model', {}), path)
     model = build_model({**config['model'], 'video_encoder_pretrained': False},
                         n_keypoints=registry.n_keypoints)
+    _drop_untrained_lift_head(model, state, path)
     missing, unexpected = model.load_state_dict(state, strict=False)
     report_load('load_run', missing, unexpected, [])
     model.run_provenance = prov
@@ -110,6 +121,7 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
     state = compat_state(state, config.setdefault('model', {}), path)
     model = build_model({**config['model'], 'video_encoder_pretrained': False},
                         n_keypoints=registry.n_keypoints)
+    _drop_untrained_lift_head(model, state, path)
     missing, unexpected = model.load_state_dict(state, strict=False)
     report_load('load_run', missing, unexpected, [])
     model.run_provenance = prov

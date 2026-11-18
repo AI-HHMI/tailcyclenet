@@ -15,6 +15,7 @@ import torch
 from tracktail.model.tracker_encoder import TrackerEncoder
 
 from .anchor import query_anchored, reanchor_per_frame, scene_center, uncalibrated_singleview_anchor
+from .lift_head import LiftHead, lift_cameras, static_cameras
 from .query_encoder import BOX_ENCODERS, BOX_MODES, WideQueryEncoder
 from .scene import SceneEncodingMixin
 
@@ -26,7 +27,8 @@ GRIDRESID_OFFSETS = ('query', 'triangulated')
 class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='wide',
                  gridresid_offset='query', query_terms=None, box_prompt='none', set_decoder=False,
-                 set_queries=None, **kwargs):
+                 set_queries=None, lift_head=False, lift_head_layers=8, lift_head_width=256,
+                 **kwargs):
         """Build the pose tracker: the stock `TrackerEncoder` with a pose-shaped query encoder.
 
         Inputs: n_keypoints -- size of the keypoint registry.
@@ -42,6 +44,8 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
                 set_queries -- E2's query count M, DERIVED (never configured): 8 for a 2D
                     root's MoE, 4 for a 3D root's (`set_decoder.set_queries_for`); read back from
                     the run's config / the checkpoint's own `set_decoder.inst` rows.
+                lift_head -- the single-view lift head (`lift_head.py`, report 83 §9; see
+                    `_lift`); False (the code default: an old run folder builds none) adds no module.
 
         The stock query encoder is replaced with the wide one, built from the same kwargs the
         parent used so it is a drop-in either way. `_shared_scene` starts None (encode per
@@ -106,6 +110,16 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
             self.set_decoder = SetDecoder(self, queries=set_queries)
             print(f'set decoder (E2): {self.set_decoder.M} queries, {NA} box-anchored, on '
                   'detached scene tokens')
+        self.lift_head = None
+        self.lift_deploy = True
+        if lift_head:
+            assert set_decoder != 'only', (
+                'lift_head with set_decoder = "only" (PBM4): its loss is set_loss alone, so the head '
+                'would never train and would deploy random weights. Set lift_head = false.')
+            self.lift_head = LiftHead(n_keypoints, width=int(lift_head_width),
+                                      layers=int(lift_head_layers))
+            print(f'lift head: {int(lift_head_layers)} layers x {int(lift_head_width)}, 2D-only '
+                  'tokens; single-camera 3D output')
 
     def _forward_window(self, views_norm, *args, **kwargs):
         """Route scene encodes through the local split or reuse caller-provided features."""
@@ -147,6 +161,34 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         model, whose every forward is E2's (`set_decoder.only_forward`; None = no anchors).
         """
         px = max(int(c['size'].max()) for c in camera_group)
+        out = self._route(views, kpt_ids, camera_group, mode, set_inputs, px, kw)
+        return self._lift(out, kpt_ids, camera_group, mode)
+
+    def _lift(self, out, kpt_ids, camera_group, mode):
+        """Add the lift head's `lift_cam` / `lift_world` (C,B,T,K,3) to a 3D output.
+
+        It reads the output's `2d_pred` AFTER the expert routing: in MoE training that is E1's 2D
+        (the expert the stock 3D loss and the shared encoder train on; E2 trains by its set loss),
+        at deploy the routed / mixed 2D that `points2d.pq` records. Training: every 3D forward on a
+        static rig. Eval: only a ONE-camera forward with `lift_deploy` set, where `coords_pred`
+        becomes the head's world output; a multiview eval forward never runs the head, so its
+        output is bit-identical to a model without one.
+        """
+        head = self.lift_head
+        if (head is None or mode != '3d' or not isinstance(out, dict) or '2d_pred' not in out
+                or not static_cameras(camera_group)):
+            return out
+        if not self.training and (len(camera_group) != 1 or not self.lift_deploy):
+            return out
+        xc, xw = lift_cameras(head, out['2d_pred'], kpt_ids, camera_group)
+        out = dict(out)
+        out['lift_cam'], out['lift_world'] = xc, xw
+        if not self.training:
+            out['coords_pred'] = xw[0].to(out['coords_pred'].dtype)
+        return out
+
+    def _route(self, views, kpt_ids, camera_group, mode, set_inputs, px, kw):
+        """The expert routing of `forward` (plain, MoE or set-only)."""
         sd = self.set_decoder
         if sd is not None and sd.shared:
             from .set_decoder import only_forward
@@ -340,6 +382,9 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
     set_decoder = cfg.pop('set_decoder', False)
     set_queries = cfg.pop('set_queries', None)
     cfg.pop('moe_route', None)
+    lift = {k: cfg.pop(k) for k in ('lift_head', 'lift_head_layers', 'lift_head_width') if k in cfg}
+    if lift.get('lift_head') not in (None, False, True):
+        raise SystemExit(f'[model].lift_head must be true or false; got {lift["lift_head"]!r}')
     if set_decoder not in (False, True, 'only'):
         raise SystemExit(f'[model].set_decoder must be false, true (the v7 2D MoE) or "only" (the '
                          f'v7 3D set decoder, PBM4); got {set_decoder!r}')
@@ -369,6 +414,6 @@ def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **ext
     return cls(n_keypoints=n_keypoints, query=query, query_encoder=enc,
                gridresid_offset=offset, query_terms=query_terms,
                box_prompt=box_prompt, set_decoder=set_decoder, set_queries=set_queries,
-               **cfg, **extra)
+               **lift, **cfg, **extra)
 
 

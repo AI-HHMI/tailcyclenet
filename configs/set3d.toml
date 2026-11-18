@@ -7,3 +7,5 @@ hard_frac = 0.5
 
 [model]
 set_decoder = "only"
+# The lift head trains through the stock 3D loss path, which a set-only model never runs.
+lift_head = false

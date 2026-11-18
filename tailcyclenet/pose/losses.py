@@ -31,10 +31,13 @@ class PoseLoss(TotalLoss):
     unknown key still raises `TypeError`.
     """
 
-    def __init__(self, vis_loss_2d_weight: float = 0.1, **kwargs):
+    def __init__(self, vis_loss_2d_weight: float = 0.1, lift_loss_weight: float = 0.5,
+                 **kwargs):
         """Set the 2D visibility BCE weight; everything else reaches `TotalLoss` unchanged.
 
         Inputs: vis_loss_2d_weight -- weight of the 2D visibility term; defaults to 0.1.
+                lift_loss_weight -- weight of the single-view lift head's per-camera loss
+                    (`lift_head.lift_loss`, report 83 §9); inert without the head's output.
 
         `gamma` and `feature_loss_weight` default to 0 here, not to the library's 0.8 / 0.5: both
         gate on outputs the TrackerEncoder never emits (`coords_pred_iters`,
@@ -45,6 +48,7 @@ class PoseLoss(TotalLoss):
         kwargs.setdefault('feature_loss_weight', 0.0)
         super().__init__(**kwargs)
         self.vis_loss_2d_weight = vis_loss_2d_weight
+        self.lift_loss_weight = lift_loss_weight
 
     def forward(self, model, outputs, coords_true, vis_true, vis_true_cams,
                vis_2d_true=None, cgroup=None, p2d=None, device=None):
@@ -79,4 +83,18 @@ class PoseLoss(TotalLoss):
         self.loss_history['vis_loss_2d'].append(vis_loss_2d.item())
         if torch.isfinite(vis_loss_2d):
             total = total + vis_loss_2d
-        return total
+        return total + self._lift_term(outputs, coords_true, cgroup, p2d, device)
+
+    def _lift_term(self, outputs, coords_true, cgroup, p2d, device):
+        """The lift head's per-camera loss on a 3D item (`lift_head.lift_loss` x weight); 0 on a
+        2D item, a `prob_2d_only` item (`p2d` given) or a forward without the head's output."""
+        if (self.lift_loss_weight == 0 or 'lift_cam' not in outputs or p2d is not None
+                or coords_true.shape[-1] != 3):
+            return 0.0
+        from .lift_head import lift_loss
+        term, shape, root = lift_loss(outputs['lift_cam'], coords_true, cgroup)
+        term = self.lift_loss_weight * term
+        self.loss_history['lift'].append(term.item())
+        self.loss_history['lift_shape_mm'].append(shape.item())
+        self.loss_history['lift_root'].append(root.item())
+        return term if torch.isfinite(term) else 0.0

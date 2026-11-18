@@ -111,6 +111,11 @@ def load_pose(args, device):
     precision = args.precision
     camera_batch = args.camera_batch
     model.set_scene_speed(precision=precision, camera_batch=camera_batch)
+    model.lift_deploy = bool(getattr(args, 'lift_head', True))
+    config['model']['lift_head'] = model.lift_head is not None
+    if model.lift_head is not None:
+        print(f'lift head: {"USED" if model.lift_deploy else "OFF (--no-lift-head)"} for a '
+              'one-camera 3D session; multiview keeps triangulation')
     print(f'speed: precision={precision} camera_batch={camera_batch}')
     print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)  '
           f'query={config["model"].get("query", "prior")}  '

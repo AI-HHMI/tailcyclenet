@@ -158,6 +158,8 @@ def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run,
             'crop_inflate': float(cfg.crop_inflate),
             'gridresid_offset': str(config['model']['gridresid_offset']),
             'gridresid_offset_override': str(args.gridresid_offset or ''),
+            'lift_head': (bool(config['model'].get('lift_head', False))
+                          and bool(getattr(args, 'lift_head', True))),
             **provenance()}.items(),
            *([] if scorer is None else [
                ('scorer', str(Path(scorer_path).resolve())),

@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Changes that move numbers
+- `train` adds the single-view lift head by default (`[model].lift_head = true`, 8 layers x 256, `[training.losses].lift_loss_weight = 0.5`;
+  report 83 §9): a set-lifter over each camera's own detached predicted 2D, trained per camera on every 3D item. A one-camera 3D
+  inference takes its 3D from it (`--no-lift-head` keeps the stock output, recorded as `lift_head` in `[provenance]`); multiview
+  output is bit-identical. A checkpoint without the head loads and infers as before. Resuming an older run folder with the new
+  default needs `lift_head = false`. Not combinable with `set_decoder = "only"`.
+- A warm start from a multi-root base (e.g. univ-mouse) now copies the identity rows of a single-root finetune: they were matched on
+  the base's prefixed names (`allen-mouse-combined-nose`) against the run's unprefixed ones (`nose`), so every row started fresh.
 - `train` defaults to the v7 MoE (`[model].set_decoder = true`, `hard_frac = 0.5` when unset) in 2D AND 3D; `configs/moe.toml` is gone (it is the
   default). Explicit `set_decoder = false` / `"only"` and any written `hard_frac` win. A resume of an older plain run folder must now state
   `set_decoder = false`. A 3D MoE deploys `--moe-route contact` unless told otherwise (E1-only measured better in 3D, report 79).

@@ -392,6 +392,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help='the seam fix (report 76 seam-jitter): per-(slot, keypoint) window offsets '
                           'solved from the overlap disagreement (lam 1, cut 0.25 body, 2-window '
                           'look-ahead; infer/ovc.py). --no-ovc restores the plain seam rule.')
+    win.add_argument('--lift-head', action=argparse.BooleanOptionalAction, default=True,
+                     help='a ONE-camera 3D session takes its 3D from the checkpoint\'s single-view '
+                          'lift head (report 83 §9) when it has one; multiview is untouched either '
+                          'way. --no-lift-head keeps the stock single-view 3D output.')
     adv.add_argument('--window-predictions', action='store_true',
                      help='write every window\'s pre-gate predictions to '
                           '<out>/window_predictions.pq')

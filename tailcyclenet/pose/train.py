@@ -651,8 +651,6 @@ def main(argv: list[str] | None = None):
                                                   'video_encoder_pretrained': False}
         return build_model(cfg, n_keypoints=registry.n_keypoints)
 
-    # The identity rows are matched BY NAME in the base's spelling: a single-root finetune of a
-    # multi-root base spells 'nose' where the base spells 'allen-mouse-combined-nose'.
     started = build_start(plan, make_model, opt_cfg_scaled, config['model'], device,
                           names=(registry.spelled_as(plan.registry)
                                  if plan.registry is not None else registry.names))

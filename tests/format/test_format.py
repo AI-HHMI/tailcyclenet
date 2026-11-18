@@ -112,6 +112,91 @@ def test_triangulate_group(tmp_path):
     assert lab.vis3d[0, 0, 0] == fmt.MISSING and np.isnan(lab.points3d[0, 0, 0]).all()
 
 
+def _offset_rig(offsets, sensor=(1280, 1024), image=(640, 512)):
+    """A calibrated 3-camera Rig whose stored images are crops of the sensor at NONZERO `offsets`.
+
+    The intrinsics (principal point) are in SENSOR pixels, as for a real crop, so a point the camera
+    projects to sensor pixel `s` is stored at `s - offset`.
+    """
+    from aniposelib.cameras import Camera, CameraGroup
+
+    cams, off = [], {}
+    for i, (name, o) in enumerate(offsets.items()):
+        f = 1400.0
+        cam = Camera(matrix=np.array([[f, 0, sensor[0] / 2], [0, f, sensor[1] / 2], [0, 0, 1.0]]),
+                     dist=np.array([-0.05, 0.01, 0.0, 0.0, 0.0]), rvec=np.array([0.05 * i, 0.15 * i - 0.15, 0.0]),
+                     tvec=np.array([-60.0 * i + 60, 5.0 * i, 400.0]), name=name)
+        cam.set_size(image)
+        cams.append(cam)
+        off[name] = o
+    return fmt.Rig(CameraGroup(cams), offset=off, moving={n: False for n in off},
+                   calibrated={n: True for n in off})
+
+
+OFFSETS = {'cam0': (300.0, 250.0), 'cam1': (120.0, 400.0), 'cam2': (500.0, 80.0)}
+
+
+def _stored_pixel_labels(rig, pts3d):
+    """Labels whose 2D positions are what a camera at its offset stores: `Camera.project`'s output."""
+    K, C = len(pts3d), len(rig)
+    lab = fmt.empty_labels(1, 1, K, C, mode3d=True)
+    for c, cam in enumerate(rig.cameras):
+        xy = np.asarray(cam.project(pts3d.reshape(-1, 3))).reshape(K, 2)
+        lab.points2d[0, 0, :, c] = xy
+    lab.vis2d[:] = fmt.VISIBLE
+    return lab
+
+
+def test_offset_rig_triangulates_stored_pixels_without_double_offset():
+    """Regression: with NONZERO camera offsets the stored image pixels triangulate straight back.
+
+    aniposelib-pytorch >= 1.1.0 cameras are offset-aware (`project` subtracts, `undistort_points` /
+    `triangulate` add the camera's own offset back), so `triangulate_group` must hand the labels over
+    unchanged. It used to add the offset again (and subtract it again in its residual), so every point
+    reprojected ~ the offset away, failed the 0.05-body gate, and a 3D dataset gave no training windows.
+    """
+    rig = _offset_rig(OFFSETS)
+    assert all(tuple(c.offset.tolist()) == OFFSETS[c.get_name()] for c in rig.cameras)   # camera carries it
+    rng = np.random.default_rng(0)
+    pts3d = rng.uniform(-15.0, 15.0, (8, 3))
+    lab = _stored_pixel_labels(rig, pts3d)
+    # the test premise: stored pixels sit `offset` away from the sensor-frame projection
+    for c, cam in enumerate(rig.cameras):
+        name = cam.get_name()
+        cam.set_offset((0.0, 0.0))
+        sensor = np.asarray(cam.project(pts3d))
+        cam.set_offset(OFFSETS[name])
+        np.testing.assert_allclose(sensor - lab.points2d[0, 0, :, c], np.broadcast_to(OFFSETS[name], (8, 2)), atol=1e-3)
+
+    visible, gated, missing = fmt.triangulate_group(rig, lab)
+    assert (visible, gated, missing) == (8, 0, 0)
+    assert (lab.vis3d == fmt.VISIBLE).all()
+    np.testing.assert_allclose(lab.points3d[0, 0], pts3d, atol=1e-2)
+    for c, cam in enumerate(rig.cameras):                      # ~0 reprojection error in stored pixels
+        back = np.asarray(cam.project(lab.points3d[0, 0].astype(np.float64)))
+        assert np.abs(back - lab.points2d[0, 0, :, c]).max() < 0.05
+
+
+def test_rig_offset_assignment_and_calibration_roundtrip_reach_the_cameras(tmp_path):
+    """`Rig.offset` and each camera's own `offset` are one fact: assigning one sets the other, and a
+    calibration.toml round trip keeps both, so `rig.tracktail()` and `cam.project()` agree."""
+    rig = _offset_rig({n: (0.0, 0.0) for n in OFFSETS})
+    for n, o in OFFSETS.items():
+        rig.offset[n] = o                                      # what the converters do after loading
+    assert all(tuple(c.offset.tolist()) == OFFSETS[c.get_name()] for c in rig.cameras)
+    fmt.dump_calibration(tmp_path / 'calibration.toml', rig)
+    back = fmt.load_calibration(tmp_path / 'calibration.toml')
+    assert back.offset == OFFSETS
+    assert all(tuple(c.offset.tolist()) == OFFSETS[c.get_name()] for c in back.cameras)
+    pts = np.array([[1.0, 2.0, 3.0], [-4.0, 5.0, 0.5]])
+    import torch
+    from tracktail.model.cube import project_points_torch
+    for c, cam in enumerate(back.cameras):
+        a = np.asarray(cam.project(pts))
+        b = project_points_torch([back.tracktail()[c]], torch.as_tensor(pts, dtype=torch.float32))[0].numpy()
+        np.testing.assert_allclose(a, b, atol=0.05)            # tracktail's path agrees with aniposelib's
+
+
 def test_short_distortions_load_padded():
     """Short calibration vectors are zero-padded for projection, without mutating the doc."""
     for distortions, expected in (([], np.zeros(5)), ([0.1, -0.2], [0.1, -0.2, 0.0, 0.0, 0.0])):

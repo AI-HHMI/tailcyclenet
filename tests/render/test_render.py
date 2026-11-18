@@ -135,6 +135,26 @@ def test_static_skew_projection_uses_full_intrinsics(tmp_path):
     np.testing.assert_allclose(got, expected, rtol=0.0, atol=2e-4)
 
 
+def test_static_zero_skew_projection_subtracts_the_offset_once(tmp_path):
+    """Regression: aniposelib's `Camera.project` is offset-aware, so `render.project` must not subtract the
+    rig's offset a second time (the skewed path above subtracts it once, by hand)."""
+    from aniposelib.cameras import Camera, CameraGroup
+
+    from tailcyclenet import format as fmt
+    from tailcyclenet.render.render import project
+
+    K = np.array([[800.0, 0.0, 320.0], [0.0, 780.0, 240.0], [0.0, 0.0, 1.0]])
+    cam = Camera(matrix=K, dist=np.zeros(5), rvec=np.zeros(3), tvec=np.array([0.0, 0.0, 50.0]), name='c')
+    cam.set_size((640, 480))
+    rig = fmt.Rig(CameraGroup([cam]), offset={'c': (7.0, -4.0)}, moving={'c': False}, calibrated={'c': True})
+    sess = fmt.Session(path=tmp_path / 's', mode='3d', units='mm', label_source='tracked',
+                       names=['a', 'b'], rig=rig, groups={'g': fmt.Group('g', 1)})
+    world = np.array([[[[1.0, 2.0, 10.0], [-2.0, 1.0, 20.0]]]], dtype=np.float64)
+    homogeneous = (world + np.array([0.0, 0.0, 50.0])) @ K.T
+    expected = homogeneous[..., :2] / homogeneous[..., 2, None] - np.array([7.0, -4.0])
+    np.testing.assert_allclose(project(sess, world, 0), expected, rtol=0.0, atol=2e-4)
+
+
 def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
     """A directory session and an `adopt.build` (--videos) session over the SAME mp4 render
     byte-identical frames."""

@@ -268,7 +268,7 @@ def make_labels(data: dict[str, np.ndarray], start: int, rig: fmt.Rig) -> fmt.La
         safe_xyz = np.nan_to_num(xyz, nan=0.0).reshape(-1, 3)
         with torch.no_grad():
             p = cam.project(torch.as_tensor(safe_xyz, dtype=cam.matrix.dtype)).cpu().numpy()
-        p = p.reshape(WINDOW, k, 2) - np.asarray(rig.offset[camera], dtype=np.float64)
+        p = p.reshape(WINDOW, k, 2)  # cam.project() is offset-aware: stored-image pixels already
         projected[:, :, ci] = p.astype(np.float32)
 
     pair = source_valid2d & valid3d[:, :, None]

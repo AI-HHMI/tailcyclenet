@@ -35,11 +35,45 @@ def nominal_rig(name: str, size, dist=None) -> Rig:
                moving={name: False}, calibrated={name: False})
 
 
+class _CameraOffsets(dict):
+    """`Rig.offset`: a plain {name: (x, y)} dict that also writes each value into that camera.
+
+    aniposelib-pytorch >= 1.1.0 cameras are offset-aware (`project` returns stored-image pixels,
+    `undistort_points` / `triangulate` take them), so the camera's own `offset` buffer and the rig's
+    dict must never disagree; setting one without the other is how offsets got applied twice.
+    """
+    _rig = None
+
+    def _push(self, name, value):
+        rig = self._rig
+        if rig is None:
+            return
+        for cam in rig.cgroup.cameras:
+            if cam.get_name() == name:
+                cam.set_offset([float(v) for v in value[:2]])
+
+    def __setitem__(self, name, value):
+        super().__setitem__(name, value)
+        self._push(name, value)
+
+    def update(self, *args, **kwargs):
+        for name, value in dict(*args, **kwargs).items():
+            self[name] = value
+
+    def setdefault(self, name, default=None):
+        if name not in self:
+            self[name] = default
+        return self[name]
+
+
 @dataclass
 class Rig:
     """An aniposelib `CameraGroup` plus the three per-camera facts it does not model.
 
-    `offset` is the stored image's origin in the sensor frame (project, then subtract offset);
+    `offset` is the stored image's origin in the sensor frame (project, then subtract offset). The
+    cameras are offset-aware, so `offset` is kept in step with each camera's own `offset` (both
+    directions: construction and every later assignment push it into the camera). 2D labels are in
+    stored-image pixels and go to the cameras as they are; nothing adds or subtracts `offset` by hand.
     `moving` says per-frame extrinsics live in `extrinsics.pq`; `calibrated` says whether a
     matrix was really carried or `nominal_camera` invented one.
     """
@@ -48,6 +82,13 @@ class Rig:
     offset: dict[str, tuple[float, float]]
     moving: dict[str, bool]
     calibrated: dict[str, bool]
+
+    def __post_init__(self):
+        offsets = _CameraOffsets(self.offset)
+        offsets._rig = self
+        for name, value in offsets.items():
+            offsets._push(name, value)
+        self.offset = offsets
 
     @property
     def cameras(self):

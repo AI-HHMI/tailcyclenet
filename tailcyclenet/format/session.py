@@ -144,8 +144,9 @@ REMOVED_SESSION_KEYS = {
 def triangulate_group(rig: Rig, lab: Labels, gate: float = VALIDATION_RES_MAX_BODY) -> tuple[int, int, int]:
     """Derive 3D labels from per-camera positions; return (visible, gated, missing).
 
-    Stored 2D coordinates are in image pixels, so camera offsets are restored before
-    triangulation. `visible` and `projected` both carry positions; `missing` does not.
+    Stored 2D coordinates are in image pixels and the rig's cameras are offset-aware (`Rig` keeps each
+    camera's `offset` in step with `rig.offset`), so the labels go to triangulation as stored; adding the
+    offset here would apply it twice. `visible` and `projected` both carry positions; `missing` does not.
     A point with at least two views is accepted when the median over its views of the point-to-ray distance
     (world units), divided by the group's body size, is within `gate` (body units, `VALIDATION_RES_MAX_BODY`).
     The body size is the group's own: the median over (animal, frame) of the extent diagonal of the UNGATED
@@ -164,8 +165,7 @@ def triangulate_group(rig: Rig, lab: Labels, gate: float = VALIDATION_RES_MAX_BO
     from tracktail.model.cube import undistort_points
 
     S, T, K, C, _ = lab.points2d.shape
-    off = np.asarray([rig.offset[n] for n in rig.names], dtype=np.float64)
-    p2 = lab.points2d.astype(np.float64) + off.reshape(1, 1, 1, C, 2)
+    p2 = lab.points2d.astype(np.float64)
     lab.points3d = np.full((S, T, K, 3), np.nan, np.float32)
     lab.vis3d = np.full((S, T, K), UNLABELED, np.int8)
 
@@ -188,7 +188,7 @@ def triangulate_group(rig: Rig, lab: Labels, gate: float = VALIDATION_RES_MAX_BO
             seen = np.isfinite(xy[c]).all(-1)
             if not seen.any():
                 continue
-            img = torch.as_tensor(xy[c][seen] - off[c], dtype=torch.float64)
+            img = torch.as_tensor(xy[c][seen], dtype=torch.float64)
             rn = undistort_points(cam, img).numpy()
             m = (cam['ext'][0] if cam['ext'].ndim == 3 else cam['ext']).double().numpy()
             rot, tr = m[:3, :3], m[:3, 3]

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Changes that move numbers
+- Camera offsets were applied twice with aniposelib-pytorch >= 1.1.0 (offset-aware cameras): `triangulate_group` added `rig.offset` to the stored image-pixel labels before `cgroup.triangulate` and subtracted it again in its residual, so every 3D-annotated dataset with a crop offset reprojected about the offset away, failed the 0.05-body gate and gave no training windows. It now triangulates the stored pixels as they are. `Rig.offset` is kept in step with each camera's own `offset` (construction and assignment push it into the camera), `render.project` no longer subtracts the offset a second time, and the qdmouse4m / tuthill_fly converters pass image pixels.
 - `train` adds the single-view lift head by default (`[model].lift_head = true`, 8 layers x 256, `[training.losses].lift_loss_weight = 0.5`;
   report 83 §9): a set-lifter over each camera's own detached predicted 2D, trained per camera on every 3D item. A one-camera 3D
   inference takes its 3D from it (`--no-lift-head` keeps the stock output, recorded as `lift_head` in `[provenance]`); multiview

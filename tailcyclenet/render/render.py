@@ -63,8 +63,8 @@ def project(session, pred, cam, gid=None, frames=None):
     """(S,T,K,3) world points -> (S,T,K,2) pixels in camera `cam`'s stored image.
 
     Zero-skew static cameras use aniposelib's established projection. Static cameras with
-    nonzero skew use tracktail's full-matrix projection; `offset` is subtracted because `matrix`
-    is in SENSOR coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
+    nonzero skew use tracktail's full-matrix projection, which subtracts the camera dict's `offset`
+    (`matrix` is in SENSOR coordinates). Both paths return stored-image pixels. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
     `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
     `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
     pixels already -- the same call `infer.crops.fill_box_agreement` makes, for the same reason. The
@@ -96,8 +96,7 @@ def project(session, pred, cam, gid=None, frames=None):
     with torch.no_grad():
         p = torch.as_tensor(np.asarray(pred).reshape(-1, 3),
                             dtype=obj.matrix.dtype, device=obj.matrix.device)
-        xy = obj.project(p).cpu().numpy()
-    xy = xy - np.asarray(session.rig.offset[name], np.float64)
+        xy = obj.project(p).cpu().numpy()  # offset-aware: already stored-image pixels
     return xy.reshape(pred.shape[:-1] + (2,)).astype(np.float32)
 
 

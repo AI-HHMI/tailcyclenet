@@ -154,21 +154,21 @@ def _np(value) -> np.ndarray:
     return np.asarray(value.detach().cpu() if hasattr(value, 'detach') else value, dtype=np.float64)
 
 
-def reprojection(rig: fmt.Rig, p2_sensor: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def reprojection(rig: fmt.Rig, p2_image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Triangulate and return (3D, per-camera pixel residual norm)."""
-    p3 = _np(rig.cgroup.triangulate(p2_sensor, progress=False))
-    err = np.linalg.norm(_np(rig.cgroup.reprojection_error(p3, p2_sensor)), axis=-1)
+    p3 = _np(rig.cgroup.triangulate(p2_image, progress=False))
+    err = np.linalg.norm(_np(rig.cgroup.reprojection_error(p3, p2_image)), axis=-1)
     return p3, err
 
 
-def refine_rig(rig: fmt.Rig, p2_sensor: np.ndarray, reject_px: float) -> tuple[fmt.Rig, np.ndarray, np.ndarray, dict]:
+def refine_rig(rig: fmt.Rig, p2_image: np.ndarray, reject_px: float) -> tuple[fmt.Rig, np.ndarray, np.ndarray, dict]:
     """Reject gross observations, bundle-adjust extrinsics, and apply the final gate.
 
     Keep the adjustment only when its median residual is not plainly worse than the archived
     calibration. The camera group is mutated by bundle adjustment, so callers must reload it if
     that guard rejects the result.
     """
-    work = p2_sensor.copy()
+    work = p2_image.copy()
     initial_p3, initial_err = reprojection(rig, work)
     for _ in range(2):
         _, err = reprojection(rig, work)
@@ -206,8 +206,8 @@ def make_multiview(src: Path, out: Path, prefix: str, folders: list[Path], rejec
     """Convert one synchronized six-camera prefix into one 3D session.
 
     Metadata can include unlabeled images; retain only images present in every camera's DLC CSV.
-    Preserve source DLC coordinates as 2D labels: sensor-offset coordinates are used only for
-    triangulation and gating, and filtered observations are omitted rather than replaced by
+    Preserve source DLC coordinates as 2D labels: the offset-aware cameras triangulate and gate on the
+    same image pixels, and filtered observations are omitted rather than replaced by
     reprojections.
     """
     folders = sorted(folders, key=lambda p: p.name[-1])
@@ -240,8 +240,8 @@ def make_multiview(src: Path, out: Path, prefix: str, folders: list[Path], rejec
         sizes[cam] = (int(im.shape[1]), int(im.shape[0]))
     rig, cal_name = calibrated_rig(src, prefix, sizes, sarah_cal_root)
     raw = np.stack([np.stack([r['xy'] for r in rows]).reshape(-1, 2) for rows in csv_data])
-    offsets = np.asarray([rig.offset[c] for c in CAMERAS])[:, None, :]
-    rig, work, p3, stats = refine_rig(rig, raw + offsets, reject_px)
+    # the rig's cameras carry the crop offset (Rig.offset pushes it in), so raw image pixels go in as they are
+    rig, work, p3, stats = refine_rig(rig, raw, reject_px)
 
     dst = out / 'train' / _session_id(prefix)
     if clean and dst.exists():

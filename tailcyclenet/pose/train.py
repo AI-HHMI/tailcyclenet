@@ -33,7 +33,7 @@ from .evaluate import (SMOOTHNESS_KEYS, TRAIN_METRIC_KEYS, TRAIN_METRIC_MODES, b
 from .losses import PoseLoss
 from .model import build_model
 from .set_decoder import NA, set_loss
-from .speed import apply_training_speedups
+from .speed import apply_training_speedups, enable_checkpointing, speed_options
 from .optim import KNOWN_OPTIMIZER_KEYS
 from .start import build_start, plan_start
 from .unfreeze import apply_staged_unfreeze, trainable_encoder_params
@@ -355,6 +355,8 @@ class StepLoop:
         self.local_iters = dist_utils.per_rank(self.n_iter, world)
         self.log_path = run / 'log.jsonl'
         self.max_grad = float(train_cfg.get('max_grad_norm', 0)) or None
+        self.oom_fallback = world == 1 and (
+            speed_options(train_cfg)['encoder_activation_checkpointing'] == 'auto')
         val_freq = int(train_cfg.get('val_freq', 0))
         print_freq = int(train_cfg.get('print_freq', 20))
         ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
@@ -453,6 +455,34 @@ class StepLoop:
         self.step += 1
         self.it = self.step * self.world
 
+    def _forward_backward(self, batch):
+        """Forward + backward -> (loss, out), or None when the loss has no graph (skip it)."""
+        loss, out = run_batch(self.model, self.loss_fn, batch, self.device, raw=self.raw)
+        if not dist_utils.all_ranks_finite(self.fabric, loss.requires_grad):
+            return None
+        self.opt.zero_grad(set_to_none=True)
+        self.fabric.backward(loss)
+        return loss, out
+
+    def _oom_guarded(self, batch):
+        """`_forward_backward`, retried ONCE with encoder checkpointing turned on when it runs out
+        of CUDA memory under `encoder_activation_checkpointing = "auto"` in a one-process run (the
+        optimizer has not stepped, so the retry trains the same batch from the same weights). The
+        switch stays on for the rest of the run; any other OOM raises as before."""
+        try:
+            return self._forward_backward(batch)
+        except torch.OutOfMemoryError:
+            if not (self.oom_fallback and enable_checkpointing(self.raw)):
+                raise
+        self.opt.zero_grad(set_to_none=True)
+        drain_smoothness(self.loss_fn)
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.fabric.print(f'  CUDA out of memory at iteration {self.it}: encoder activation '
+                          'checkpointing turned ON (speed "auto"), retrying the step', flush=True)
+        self.record({'iter': self.it, 'oom_checkpointing_on': True})
+        return self._forward_backward(batch)
+
     def train_step(self, batch):
         """One optimizer step -> (grad_norm, grad_norm_muon), or None when it was skipped.
 
@@ -463,12 +493,11 @@ class StepLoop:
         (its gradients are discarded by the next `zero_grad`), the same parameters either way.
         """
         fabric, opt = self.fabric, self.opt
-        loss, out = run_batch(self.model, self.loss_fn, batch, self.device, raw=self.raw)
-        if not dist_utils.all_ranks_finite(fabric, loss.requires_grad):
+        ran = self._oom_guarded(batch)
+        if ran is None:
             self._skip()
             return None
-        opt.zero_grad(set_to_none=True)
-        fabric.backward(loss)
+        loss, out = ran
         gn = torch.nn.utils.clip_grad_norm_(self.clip_params, self.max_grad or 1e9)
         mgrads = [p.grad for p in self.unclipped_params if p.grad is not None]
         mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())

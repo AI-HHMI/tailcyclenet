@@ -10,23 +10,24 @@ With the section absent training runs as if it said (measured on L4, report 88):
     enabled = true
     autocast_bf16 = ["encoder", "decoder"]   # bf16 inside these parts, fp32 handed back
     compile = ["encoder"]                    # torch.compile per V-JEPA block
-    encoder_activation_checkpointing = true  # trainable blocks only
+    encoder_activation_checkpointing = "auto"  # trainable blocks only, when memory needs it
 
 `encoder_activation_checkpointing` checkpoints only a block that will have a backward (trainable
 parameters or an input that requires grad): the 16 always-frozen blocks, and every block before
 the staged unfreeze, build no graph, so checkpointing them only cost the Python wrapper (the
 library flag checkpoints every block). The answer is re-read per call, so the unfreeze turns it on
-for the blocks it releases. `false` keeps every activation (+~4 GB on social-dannce unfrozen).
+for the blocks it releases. `false` keeps every activation (+~4 GB on social-dannce unfrozen,
+~7% faster there). `"auto"` (default): on under `AUTO_CKPT_MIN_GB` of GPU memory (an L4), off above;
+when off, a one-process run's CUDA OOM turns it on and retries the step (DDP: the memory rule only).
 `enabled = false` restores fp32 eager (the activation-checkpointing key still applies). Every
 patch is on the module INSTANCE (`forward` attribute, `Module.compile`), so parameter names and
 `state_dict` keys are unchanged and a checkpoint loads either way; inference never calls this and
-keeps its own `set_scene_speed` levers. bf16 is used only on CUDA with bf16 support and compile
-only on CUDA; otherwise those parts are skipped by name and training runs fp32 eager.
+keeps its own `set_scene_speed` levers. bf16 is used only on a CUDA GPU with NATIVE bf16
+(compute capability 8.0+; torch's default check also accepts emulated bf16, which is slower than
+fp32) and compile only on CUDA with compute capability 7.0+ (triton's floor); otherwise those parts
+are skipped by name with the reason recorded, and training runs fp32 / eager.
 
-Parts: `encoder` = `scene_encoder.encoder` (the V-JEPA ViT, the dominant cost); `decoder` = the
-camera / temporal / cross-attention and MLP blocks of E1's decoder AND E2's (their residual stream,
-heads, losses and camera geometry stay fp32). tracktail measured bf16 on kv_proj / query / heads
-as an accuracy cost (+11% train loss), so those are not offered.
+Parts: `encoder` = the V-JEPA ViT; `decoder` = E1/E2 attention + MLP blocks (heads stay fp32).
 """
 from __future__ import annotations
 
@@ -41,8 +42,10 @@ DEFAULTS = {
     'enabled': True,
     'autocast_bf16': ['encoder', 'decoder'],
     'compile': ['encoder'],
-    'encoder_activation_checkpointing': True,
+    'encoder_activation_checkpointing': 'auto',
 }
+AUTO_CKPT_MIN_GB = 32.0
+CKPT_ATTR = '_tailcyclenet_ckpt'
 _OFF = {'autocast_bf16': [], 'compile': []}
 RECOMPILE_LIMIT = 64
 _DEC_BLOCKS = ('camera_attns', 'temporal_attns', 'cross_attns', 'mlps')
@@ -66,6 +69,9 @@ def speed_options(train_cfg: dict) -> dict:
         if bad:
             raise SystemExit(f'[training.speed].{key}: unknown part(s) {sorted(bad)}; known: '
                              f'{list(allowed)}')
+    if opts['encoder_activation_checkpointing'] not in (True, False, 'auto'):
+        raise SystemExit('[training.speed].encoder_activation_checkpointing: true, false or "auto", '
+                         f'not {opts["encoder_activation_checkpointing"]!r}')
     return opts
 
 
@@ -101,6 +107,18 @@ def _needs_backward(blk, x) -> bool:
     return any(p.requires_grad for p in blk.parameters())
 
 
+class _Switch:
+    """The checkpointing flag every patched block reads per call (`enable_checkpointing` flips it)."""
+
+    def __init__(self, on: bool):
+        """Start on or off."""
+        self.on = bool(on)
+
+    def __bool__(self):
+        """The current flag."""
+        return self.on
+
+
 def _block_forward(blk, fwd, ckpt, x, *args, **kwargs):
     """One encoder block: checkpointed iff `ckpt` and it needs a backward."""
     if ckpt and _needs_backward(blk, x):
@@ -108,7 +126,7 @@ def _block_forward(blk, fwd, ckpt, x, *args, **kwargs):
     return fwd(x, *args, **kwargs)
 
 
-def patch_encoder_blocks(encoder, compile_blocks: bool, ckpt: bool) -> None:
+def patch_encoder_blocks(encoder, compile_blocks: bool, ckpt) -> None:
     """Per-block compile and selective checkpointing, OUTSIDE the compiled region (checkpoint wraps
     the compiled forward, so dynamo never traces the requires-grad branch). The library's own
     every-block flag is turned off: this function owns checkpointing from here.
@@ -120,9 +138,36 @@ def patch_encoder_blocks(encoder, compile_blocks: bool, ckpt: bool) -> None:
     if compile_blocks:
         import torch._dynamo.config as dynamo_config
         dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, RECOMPILE_LIMIT)
+    if not isinstance(ckpt, _Switch):
+        ckpt = _Switch(ckpt)
+    setattr(encoder, CKPT_ATTR, ckpt)
     for blk in encoder.blocks:
         fwd = torch.compile(blk.forward) if compile_blocks else blk.forward
         blk.forward = functools.partial(_block_forward, blk, fwd, ckpt)
+
+
+def enable_checkpointing(model) -> bool:
+    """Turn the patched encoder's checkpointing on -> whether it was off (the OOM fallback)."""
+    switch = getattr(model.scene_encoder.encoder, CKPT_ATTR, None)
+    if switch is None or switch.on:
+        return False
+    switch.on = True
+    return True
+
+
+def _capability(device_type: str):
+    """The CUDA device's (major, minor) compute capability, or None off CUDA."""
+    if device_type != 'cuda' or not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability()
+
+
+def _auto_checkpointing(device_type: str) -> bool:
+    """`"auto"`: checkpoint on a GPU with under `AUTO_CKPT_MIN_GB` of total memory."""
+    if _capability(device_type) is None:
+        return False
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    return total / 2 ** 30 < AUTO_CKPT_MIN_GB
 
 
 def decoder_blocks(model) -> list:
@@ -147,15 +192,21 @@ def apply_training_speedups(model, train_cfg: dict, device_type: str) -> dict:
     camera count changes every step), so flash attention is used instead (tracktail's finding).
     """
     opts = speed_options(train_cfg)
-    ckpt = bool(opts['encoder_activation_checkpointing'])
+    mode = opts['encoder_activation_checkpointing']
+    ckpt = _auto_checkpointing(device_type) if mode == 'auto' else bool(mode)
     info = {'encoder_activation_checkpointing': 'trainable blocks' if ckpt else False}
-    cuda = device_type == 'cuda' and torch.cuda.is_available()
+    if mode == 'auto':
+        info['encoder_activation_checkpointing_mode'] = 'auto'
+    cap = _capability(device_type)
     ac, comp = set(opts['autocast_bf16']), set(opts['compile'])
-    if ac and not (cuda and torch.cuda.is_bf16_supported()):
-        info['autocast_bf16_skipped'] = f'no bf16 on {device_type}'
+    if ac and not (cap and cap >= (8, 0)
+                   and torch.cuda.is_bf16_supported(including_emulation=False)):
+        info['autocast_bf16_skipped'] = (f'no native bf16 on {device_type}'
+                                         + (f' (capability {cap[0]}.{cap[1]})' if cap else ''))
         ac = set()
-    if comp and not cuda:
-        info['compile_skipped'] = f'no torch.compile on {device_type}'
+    if comp and not (cap and cap >= (7, 0)):
+        info['compile_skipped'] = (f'no torch.compile on {device_type}'
+                                   + (f' (capability {cap[0]}.{cap[1]})' if cap else ''))
         comp = set()
     if ac:
         torch.backends.cuda.enable_cudnn_sdp(False)

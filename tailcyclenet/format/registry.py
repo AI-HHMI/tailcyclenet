@@ -66,6 +66,26 @@ class Registry:
                 f'subset, but not invent one. Retrain, or fix the session\'s `names`.')
         return ids[[ix[n] for n in names]]
 
+    def spelled_as(self, base: 'Registry') -> tuple[str, ...]:
+        """This registry's names (same order) in `base`'s spelling, for warm-start name matching.
+
+        A multi-root base prefixes every name ('allen-mouse-combined-nose'); a single-root run
+        built from the data alone does not ('nose'). A dataset both registries name is re-spelled
+        the base's way; a name of a dataset the base does not name is returned unchanged.
+        """
+        out = list(self.names)
+        for ds, ids in self.datasets:
+            recorded = dict(base.datasets).get(ds)
+            if not recorded:
+                continue
+            p = f'{ds}-'
+            base_pref = all(base.names[i].startswith(p) for i in recorded)
+            mine_pref = len(self.datasets) > 1 and all(self.names[i].startswith(p) for i in ids)
+            for i in ids:
+                local = self.names[i][len(p):] if mine_pref else self.names[i]
+                out[i] = p + local if base_pref else local
+        return tuple(out)
+
     @staticmethod
     def _base_spelling(base: 'Registry | None', ds: 'Dataset') -> str | None:
         """How `base` spells this dataset's keypoints: 'prefixed', 'unprefixed', or None.

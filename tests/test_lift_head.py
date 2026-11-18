@@ -2,6 +2,7 @@
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,6 +15,7 @@ from tailcyclenet.pose.checkpoint import _drop_untrained_lift_head
 from tailcyclenet.pose.lift_head import LiftHead, lift_cameras, lift_loss
 from tailcyclenet.pose.losses import PoseLoss
 from tailcyclenet.pose.model import build_model
+from tailcyclenet.pose.train import run_batch, to_device
 from tests.helpers import SMALL, _session_3d
 
 
@@ -170,10 +172,43 @@ def test_old_checkpoint_loads_without_a_head(batch):
     assert kept.lift_head is not None
 
 
-def test_lift_head_refused_on_a_set_only_model():
-    with pytest.raises(AssertionError, match='set_loss alone'):
-        build_model({**SMALL, **HEAD, 'box_prompt': 'film', 'set_decoder': 'only'},
-                    n_keypoints=5)
+def test_set_only_model_trains_the_head_per_query(tmp_path):
+    """PBM4: the head lifts every query of the full E2 output against its matched target (the
+    loss is `set_loss` alone), gets a gradient, and gives a one-camera eval forward its 3D."""
+    from tailcyclenet.pose import set_decoder as sdm
+    from tests.helpers import KPTS_3D, _session_3d_multi
+    root = tmp_path / 'mice'
+    _session_3d_multi(root / 'train' / 's', T=8, sep=5.0)
+    cfg = LoaderConfig(n_frames=4, image_size=64, min_crop_dim=16, prob_2d_only=0.0,
+                       aug_prob=0.0, crop_jitter=0.0, prompt_dropout=0.0, box_prompt='film',
+                       set_targets='only', hard_frac=0.5, cams_to_sample=[3, 3],
+                       mode_3d_frac=1.0)
+    ds = PoseDataset(root, 'train', cfg)
+    torch.manual_seed(0)
+    np.random.seed(0)
+    item = next(it for it in (ds[(0, i)] for i in range(20)) if it is not None)
+    b = pose_collate([item])
+    K = len(KPTS_3D)
+    torch.manual_seed(0)
+    m = build_model({**SMALL, **HEAD, 'box_prompt': 'film', 'set_decoder': 'only'},
+                    n_keypoints=K).train()
+    loss_fn = PoseLoss()
+    loss, out = run_batch(m, loss_fn, b, 'cpu')
+    assert torch.isfinite(loss) and 'lift_cam' not in out, 'the query-0 slice is not lifted'
+    assert np.isfinite(loss_fn.loss_history['lift'][-1])
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.lift_head.parameters())
+    views, cg = to_device(b, 'cpu')
+    m.eval()
+    with torch.no_grad():
+        one = m([views[0]], b.kpt_ids, [cg[0]], mode='3d',
+                set_inputs={'anchors': b.set_targets['anchors'][:, :sdm.NA, :, :1]})
+        m.lift_deploy = False
+        off = m([views[0]], b.kpt_ids, [cg[0]], mode='3d',
+                set_inputs={'anchors': b.set_targets['anchors'][:, :sdm.NA, :, :1]})
+    assert one['lift_world'].shape == (1, 1, 4, K, 3)
+    assert torch.equal(one['coords_pred'], one['lift_world'][0])
+    assert 'lift_world' not in off
 
 
 def test_cli_lift_head_switch():

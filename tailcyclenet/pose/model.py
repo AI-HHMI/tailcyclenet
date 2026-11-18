@@ -113,9 +113,6 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         self.lift_head = None
         self.lift_deploy = True
         if lift_head:
-            assert set_decoder != 'only', (
-                'lift_head with set_decoder = "only" (PBM4): its loss is set_loss alone, so the head '
-                'would never train and would deploy random weights. Set lift_head = false.')
             self.lift_head = LiftHead(n_keypoints, width=int(lift_head_width),
                                       layers=int(lift_head_layers))
             print(f'lift head: {int(lift_head_layers)} layers x {int(lift_head_width)}, 2D-only '
@@ -178,6 +175,9 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         if (head is None or mode != '3d' or not isinstance(out, dict) or '2d_pred' not in out
                 or not static_cameras(camera_group)):
             return out
+        sd = self.set_decoder
+        if self.training and sd is not None and sd.shared:
+            return self._lift_set(out, kpt_ids, camera_group)
         if not self.training and (len(camera_group) != 1 or not self.lift_deploy):
             return out
         xc, xw = lift_cameras(head, out['2d_pred'], kpt_ids, camera_group)
@@ -185,6 +185,26 @@ class PoseTrackerEncoder(SceneEncodingMixin, TrackerEncoder):
         out['lift_cam'], out['lift_world'] = xc, xw
         if not self.training:
             out['coords_pred'] = xw[0].to(out['coords_pred'].dtype)
+        return out
+
+    def _lift_set(self, out, kpt_ids, camera_group):
+        """A set-only (PBM4) TRAINING forward: lift every query of the full E2 output on its own.
+
+        Its loss is `set_loss` alone, the stock loss on all M*K tokens against per-query
+        (Hungarian-matched) targets, so the head's `lift_cam` rides in `out['set']['out']` as
+        (C,B*M,T,K,3) with `lift_groups` = M, and `PoseLoss` regroups those targets the same way.
+        Query q owns tokens q*K..(q+1)*K-1. The query-0 slice is left alone (nothing scores it).
+        """
+        st = out.get('set')
+        if st is None or '2d_pred' not in st['out']:
+            return out
+        o2, M, K = st['out'], int(st['pres'].shape[-1]), int(st['K'])
+        p = o2['2d_pred']
+        C, B, T = p.shape[:3]
+        p = p.reshape(C, B, T, M, K, 2).permute(0, 1, 3, 2, 4, 5).reshape(C, B * M, T, K, 2)
+        xc, _ = lift_cameras(self.lift_head, p, kpt_ids.repeat_interleave(M, 0), camera_group)
+        out = dict(out)
+        out['set'] = dict(st, out=dict(o2, lift_cam=xc, lift_groups=M))
         return out
 
     def _route(self, views, kpt_ids, camera_group, mode, set_inputs, px, kw):

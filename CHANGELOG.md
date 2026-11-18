@@ -7,7 +7,7 @@
   report 83 §9): a set-lifter over each camera's own detached predicted 2D, trained per camera on every 3D item. A one-camera 3D
   inference takes its 3D from it (`--no-lift-head` keeps the stock output, recorded as `lift_head` in `[provenance]`); multiview
   output is bit-identical. A checkpoint without the head loads and infers as before. Resuming an older run folder with the new
-  default needs `lift_head = false`. Not combinable with `set_decoder = "only"`.
+  default needs `lift_head = false`. A set-only model (`set_decoder = "only"`) lifts every set query against its matched target.
 - A warm start from a multi-root base (e.g. univ-mouse) now copies the identity rows of a single-root finetune: they were matched on
   the base's prefixed names (`allen-mouse-combined-nose`) against the run's unprefixed ones (`nose`), so every row started fresh.
 - `train` defaults to the v7 MoE (`[model].set_decoder = true`, `hard_frac = 0.5` when unset) in 2D AND 3D; `configs/moe.toml` is gone (it is the

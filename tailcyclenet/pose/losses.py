@@ -87,11 +87,17 @@ class PoseLoss(TotalLoss):
 
     def _lift_term(self, outputs, coords_true, cgroup, p2d, device):
         """The lift head's per-camera loss on a 3D item (`lift_head.lift_loss` x weight); 0 on a
-        2D item, a `prob_2d_only` item (`p2d` given) or a forward without the head's output."""
+        2D item, a `prob_2d_only` item (`p2d` given) or a forward without the head's output. A
+        set-only output (`lift_groups` = M) regroups its (B,T,M*K,3) targets per query."""
         if (self.lift_loss_weight == 0 or 'lift_cam' not in outputs or p2d is not None
                 or coords_true.shape[-1] != 3):
             return 0.0
         from .lift_head import lift_loss
+        M = outputs.get('lift_groups')
+        if M is not None:
+            B, T, MK, _ = coords_true.shape
+            coords_true = (coords_true.reshape(B, T, M, MK // M, 3).permute(0, 2, 1, 3, 4)
+                           .reshape(B * M, T, MK // M, 3))
         term, shape, root = lift_loss(outputs['lift_cam'], coords_true, cgroup)
         term = self.lift_loss_weight * term
         self.loss_history['lift'].append(term.item())

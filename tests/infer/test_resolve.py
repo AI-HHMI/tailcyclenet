@@ -108,3 +108,47 @@ def test_refine_carry_dup_radius_resolves_and_refuses_negative():
     check_frame_range(args)
     with pytest.raises(SystemExit, match='refine-carry-dup-radius'):
         infer_config(args, config, SimpleNamespace(mode='3d'), 4, 64, 'cpu')
+
+
+def _defaults(mode, model, extra=()):
+    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o', *extra])
+    check_frame_range(args)
+    return infer_config(args, {'data': {}, 'model': model}, SimpleNamespace(mode=mode), 4, 64,
+                        'cpu')
+
+
+def test_anchor_defaults_to_none_in_3d_and_carry_in_2d(capsys):
+    """Report 86/90: a 3D session deploys without a carried prior by default (one printed line);
+    2D keeps carry; an explicit --anchor carry still wins in 3D."""
+    plain = {'box_prompt': 'none'}
+    assert _defaults('3d', plain).anchor == 'none'
+    assert 'no carried prior by default, report 86' in capsys.readouterr().out
+    assert _defaults('2d', plain).anchor == 'carry'
+    assert 'report 86' not in capsys.readouterr().out
+    assert _defaults('3d', plain, ['--anchor', 'carry']).anchor == 'carry'
+    assert _defaults('3d', {'box_prompt': 'film'}, ['--detector', 'det']).anchor == 'none'
+    moe3 = {'box_prompt': 'film', 'set_decoder': True, 'set_queries': 4}
+    assert _defaults('3d', moe3, ['--detector', 'det']).anchor == 'carry'   # MoE: as before
+
+
+def test_set_only_checkpoint_still_refuses_explicit_carry():
+    import pytest
+    with pytest.raises(SystemExit, match='--anchor carry'):
+        _defaults('3d', {'set_decoder': 'only', 'box_prompt': 'film'}, ['--anchor', 'carry'])
+
+
+def test_box_prompt_defaults_to_detector_for_box_film_given_a_box_source():
+    """A box-FiLM checkpoint with --detector / --boxes deploys the box every window (`detector`,
+    as every report-86 number); explicit --box-prompt firstonly still wins; a non-box model
+    ignores the box either way; without a box source a box model is refused as before."""
+    import pytest
+    film = {'box_prompt': 'film'}
+    for mode in ('2d', '3d'):
+        for src in (['--detector', 'det'], ['--boxes', 'b.npz']):
+            cfg = _defaults(mode, film, src)
+            assert (cfg.box_prompt, cfg.box_prompt_first_only) == ('detector', False)
+        cfg = _defaults(mode, film, ['--detector', 'det', '--box-prompt', 'firstonly'])
+        assert (cfg.box_prompt, cfg.box_prompt_first_only) == ('detector', True)
+        assert _defaults(mode, {'box_prompt': 'none'}, ['--detector', 'det']).box_prompt == 'none'
+        with pytest.raises(SystemExit, match='no --detector or --boxes'):
+            _defaults(mode, film)

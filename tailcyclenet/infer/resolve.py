@@ -178,6 +178,9 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
     decisions 2026-11-07): 3D (report 76 refine3d: null on 3dpop / social-dannce at 1.15-1.25x
     cost, Panoptic -1.05 mm -- pass --refine there) and 2D (the MoE: +2.7 px non-contact on
     rat-city; plain box-FiLM + refine was the worst calms21 arm, +3.16 px contact).
+    Report 86/90 defaults (measured on box-FiLM): an unset `--anchor` is `none` for a plain
+    checkpoint on a 3D session, `carry` in 2D and for a MoE checkpoint (it deploys as before); an
+    unset `--box-prompt` is `detector` for a box model given --detector / --boxes.
 
     Inputs: args, config (pose run config), sess, trained_frames/trained_px (`trained_window`),
         device. Outputs: an `InferConfig`.
@@ -244,7 +247,15 @@ def infer_config(args, config, sess, trained_frames, trained_px, device):
         raise SystemExit(f'--moe-route {args.moe_route}: this checkpoint has no set decoder (E2); '
                          'it deploys as the plain pose model.')
     if args.anchor is None:
-        args.anchor = 'carry'
+        args.anchor = 'none' if sess.mode == '3d' and not set_mode else 'carry'
+        if args.anchor == 'none':
+            print('--anchor defaults to none -- 3D: no carried prior by default, report 86 '
+                  '(3dpop -1.13 mm vs carry, OVC on); pass --anchor carry to override')
+    if args.box_prompt is None and model_is_box and (args.detector or args.boxes):
+        args.box_prompt = 'detector'
+        print('--box-prompt defaults to detector (every window) for a box-FiLM checkpoint given '
+              '--detector / --boxes, as every report-86 number was measured; pass --box-prompt '
+              'firstonly to override')
     if args.box_prompt is None:
         args.box_prompt = 'firstonly'
     box_prompt = args.box_prompt

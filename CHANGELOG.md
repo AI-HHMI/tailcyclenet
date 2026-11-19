@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### Changes that move numbers
+- `train` defaults to the plain box-FiLM model again (`[model].set_decoder = false`; report 86/90): from tracktail-static, 20k, 2 seeds the
+  MoE beat neither box-FiLM arm in 2D and no set-only arm beat box-FiLM in 2D or on 3dpop. The MoE (`true`) and PBM4 (`"only"`,
+  `configs/set3d.toml`, crowded 3D roots like social-dannce) stay opt-ins. An unset `[data].hard_frac` is derived: 0.5 for a set decoder, and
+  for box-FiLM 0.0 on a 3D root / 0.5 on a 2D one (mixed-mode folders 0.0, printed). Resuming a MoE run folder with the default config is
+  refused by the strict load, and the message says to state `set_decoder = true`. The init (`checkpoint_path`) is unchanged.
+- `infer` on a 3D session defaults to `--anchor none` for a plain box-FiLM checkpoint (3dpop -1.13 mm MPJPE vs `carry`, OVC on; a printed line
+  says so); 2D and MoE checkpoints keep `carry`. A box-FiLM checkpoint given `--detector` / `--boxes` defaults to `--box-prompt detector`
+  (every window) instead of `firstonly`. Pass `--anchor carry` / `--box-prompt firstonly` for the old outputs.
 - Camera offsets were applied twice with aniposelib-pytorch >= 1.1.0 (offset-aware cameras): `triangulate_group` added `rig.offset` to the stored image-pixel labels before `cgroup.triangulate` and subtracted it again in its residual, so every 3D-annotated dataset with a crop offset reprojected about the offset away, failed the 0.05-body gate and gave no training windows. It now triangulates the stored pixels as they are. `Rig.offset` is kept in step with each camera's own `offset` (construction and assignment push it into the camera), `render.project` no longer subtracts the offset a second time, and the qdmouse4m / tuthill_fly converters pass image pixels.
 - `train` adds the single-view lift head by default (`[model].lift_head = true`, 8 layers x 256, `[training.losses].lift_loss_weight = 0.5`;
   report 83 §9): a set-lifter over each camera's own detached predicted 2D, trained per camera on every 3D item. A one-camera 3D
@@ -11,7 +19,7 @@
   default needs `lift_head = false`. A set-only model (`set_decoder = "only"`) lifts every set query against its matched target.
 - A warm start from a multi-root base (e.g. univ-mouse) now copies the identity rows of a single-root finetune: they were matched on
   the base's prefixed names (`allen-mouse-combined-nose`) against the run's unprefixed ones (`nose`), so every row started fresh.
-- `train` defaults to the v7 MoE (`[model].set_decoder = true`, `hard_frac = 0.5` when unset) in 2D AND 3D; `configs/moe.toml` is gone (it is the
+- (superseded by the box-FiLM default above) `train` defaulted to the v7 MoE (`[model].set_decoder = true`, `hard_frac = 0.5` when unset) in 2D AND 3D; `configs/moe.toml` is gone (it was the
   default). Explicit `set_decoder = false` / `"only"` and any written `hard_frac` win. A resume of an older plain run folder must now state
   `set_decoder = false`. A 3D MoE deploys `--moe-route contact` unless told otherwise (E1-only measured better in 3D, report 79).
 - `--identity-slot-chunk` defaults to auto (0): all decoded slots in one tracktail call, which is the identity-exact one (chunking changes births:

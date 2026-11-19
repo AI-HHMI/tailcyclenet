@@ -138,7 +138,7 @@ The overrides that are actually useful in practice:
 | `[training].n_iterations` | `60000` | Raise it (e.g. 100k–120k) for a large dataset, and to several hundred thousand when training one model across many datasets on several GPUs. |
 | `[training].checkpoint_path` | the pretrained tracker | Point it at an earlier pose run (or its `checkpoints/checkpoint_last.pth`) to finetune from your own model, e.g. a model already trained on the same species. If it holds the full training state and matches this config, training *continues* from its iteration; pass `--no-resume` (or use a packaged `.pth`) to start a fresh schedule from those weights. |
 | `[data].flip_2d_prob`, `[data].flip_2d_modes` | `0.0`, `["horizontal"]` | Set `0.5` to enable left/right flip augmentation; add `"vertical"` for top-down or bottom-up views. Requires `flip_pairs` in every `session.toml`. |
-| `[model].set_decoder` | `true` | The default model is the v7 mixture of experts, in 2D and 3D: the box-conditioned decoder (E1) plus a set decoder (E2) trained on its detached features, trained on a crowded-window-heavy stream (`[data].hard_frac` = 0.5 when unset). Inference routes between them by animal contact. Set `false` for the plain box-conditioned model (and `hard_frac` stays 0), or `"only"` for the 3D set-only model. Resuming a run folder trained with the older plain default needs `set_decoder = false`. |
+| `[model].set_decoder` | `false` | The default model is the plain box-conditioned (box-FiLM) decoder, in 2D and 3D (report 86/90). `true` is the v7 mixture of experts (box-FiLM E1 plus a set decoder E2 on its detached features, routed by animal contact), kept as an opt-in; `"only"` is the 3D set-only model (`configs/set3d.toml`, for crowded 3D roots such as social-dannce). `[data].hard_frac` (crowded-window share of the training stream) is derived when unset: 0.5 for `true` / `"only"`; for the plain model 0.0 on a 3D root and 0.5 on a 2D one (a folder of roots with mixed modes takes 0.0). Resuming a run folder trained with the older MoE default needs `set_decoder = true`. |
 | `[model].lift_head` | `true` | The single-view lift head (8 layers x 256): it lifts each camera's own predicted 2D to camera-frame 3D, is trained on every 3D item (`[training.losses].lift_loss_weight` 0.5), and gives the 3D of a one-camera 3D session (`infer --no-lift-head` keeps the stock output). Multiview output is unchanged. Resuming a run folder trained without it needs `lift_head = false`. |
 | `[model].intrinsic_embedding` | `true` | Set `false` to stop conditioning on camera intrinsics when your calibration's intrinsics are only approximate. |
 | `[data].num_workers` | `8` | Lower it if the host runs out of RAM (it is per GPU). |
@@ -255,8 +255,11 @@ Things to know:
   It changes speed, never the predictions.
 - The defaults are a reasonable starting point for both 2D and 3D. The flags most worth trying
   on a new dataset are `--overlap` (frames shared between consecutive windows), `--anchor`
-  (whether each window is seeded with the previous window's prediction: `carry`, the default, or
-  `none`), and `--refine` / `--refine-px` (a second, tighter crop; on by default in 3D).
+  (whether each window is seeded with the previous window's prediction: `carry`, the 2D default,
+  or `none`, the 3D default for a box-FiLM checkpoint), and `--refine` / `--refine-px` (a second,
+  tighter crop; off by default). With `--detector` or `--boxes`, a box-FiLM checkpoint gets the
+  box prompt in every window (`--box-prompt detector`); `--box-prompt firstonly` restores the
+  first-window-only prompt.
 
 ### Output
 

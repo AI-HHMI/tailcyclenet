@@ -129,7 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     win = ap.add_argument_group('window loop')
     win.add_argument('--anchor', default=None, choices=ANCHORS,
-                     help="default carry (none, and only none, for a set-only 3D checkpoint); "
+                     help="default: none for a plain (box-FiLM) checkpoint on a 3D session "
+                          "(report 86: -1.13 mm vs carry on 3dpop, OVC on), carry on a 2D one "
+                          "and for a MoE checkpoint; a set-only 3D checkpoint allows "
+                          "none only; "
                           "'labels' is an ORACLE, not a deployment number")
     win.add_argument('--overlap', type=int, default=4,
                      help='frames each window shares with its predecessor (sweep per root).')
@@ -212,8 +215,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help='box prompt for a box model: `auto` uses the detector/boxes file and '
                           "refuses without one; `firstonly` (default) gives it only at each "
                           "animal's first window; `labels` is an ORACLE; `none` forces it off. "
-                          'A checkpoint carrying the set decoder (v7 MoE) defaults to `detector` '
-                          '(every window), the setting every MX0e number was measured with.')
+                          'Given --detector / --boxes, a box-FiLM checkpoint (and a set-decoder '
+                          'one) defaults to `detector` (every window), the setting every report-86 '
+                          'and MX0e number was measured with; without them, `firstonly`.')
     win.add_argument('--moe-route', default=None, choices=('contact', 'e1', 'e2'),
                      help='v7 2D MoE checkpoints only (a set decoder, E2): `contact` (default) '
                           'routes each slot-frame to E2 by the contact rule with hysteresis; '

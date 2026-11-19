@@ -50,8 +50,8 @@ query_encoder = "wide"      # the only encoder; the two query terms are built if
 box_prompt = "film"
 # What the 3D residual is an offset FROM. No default: both values load the same tensors, so a mismatch silently mis-reads -- the key asserts what the weights were trained as (inert in 2D); "triangulated" is refuted with query = "prior".
 gridresid_offset = "query"
-# The v7 MoE, 2D AND 3D: E1 (box-FiLM) + E2 (set decoder on detached tokens); `train.py` derives hard_frac = 0.5 with it. false = the plain box-FiLM model, "only" = the 3D set-only model (PBM4); an explicit value always wins.
-set_decoder = true
+# false = the plain box-FiLM model (default since report 86); true = the v7 MoE (E1 box-FiLM + E2 set decoder, contact-routed), kept as an opt-in; "only" = PBM4, `configs/set3d.toml`. `train.py` derives [data].hard_frac when unset: 0.5 for true / "only", plain box-FiLM 0.0 on a 3D root and 0.5 on a 2D one; an explicit value always wins.
+set_decoder = false
 # The single-view lift head (report 83 §9): an 8 x 256 set-lifter over keypoint tokens built from the model's own DETACHED 2D (no decoder latent); trained per camera on every 3D item, it is the output of a ONE-camera 3D forward (multiview keeps triangulation, untouched). false = no head (byte-identical model).
 lift_head = true
 lift_head_layers = 8

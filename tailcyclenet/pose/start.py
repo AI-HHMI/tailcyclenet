@@ -232,7 +232,7 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
             model.load_state_dict(plan.state['model_state'])
         except RuntimeError as e:
             why = (f'its weights do not load into this model ({type(e).__name__}: '
-                   f'{str(e).splitlines()[0]})')
+                   f'{str(e).splitlines()[0]})') + set_decoder_hint(plan.state['model_state'], model)
             return _refused(plan, why, make_model, opt_cfg, model_cfg, device, names)
     elif plan.mode == 'warm':
         fresh = warm_start(model, plan.path,
@@ -252,6 +252,23 @@ def build_start(plan: StartPlan, make_model, opt_cfg: dict, model_cfg: dict | No
         opt.load_state_dict(plan.state['optimizer_state'])
         print(f'resuming {plan.path} at iteration {plan.start_it}; {_OVERWRITES}')
     return Started(model, opt, fresh, replace(plan, state=None))
+
+
+def set_decoder_hint(state: dict, model) -> str:
+    """The `[model].set_decoder` value a strict-load failure asks for, when the checkpoint and
+    the model disagree on having a set decoder (E2); '' otherwise. `configs/base.toml` flipped
+    the default twice (true on 2026-11-16, false since report 86/90), so an old run folder resumed
+    with the default config hits exactly this."""
+    held = any(k.startswith('set_decoder.') for k in state)
+    built = getattr(model, 'set_decoder', None) is not None
+    if held and not built:
+        return ('; it was trained WITH a set decoder (the v7 MoE, or PBM4) and this config '
+                '(the default since report 86) builds the plain box-FiLM model: state `set_decoder = true` to continue '
+                'it (`set_decoder = "only"` for a PBM4 run, configs/set3d.toml)')
+    if built and not held:
+        return ('; it was trained WITHOUT a set decoder: state `set_decoder = false` to continue '
+                'it')
+    return ''
 
 
 def _refused(plan, why, make_model, opt_cfg, model_cfg, device, names=None) -> Started:

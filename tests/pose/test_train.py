@@ -264,26 +264,66 @@ def _train_config(tmp_path, body=''):
     return tr.load_train_config(args)[0]
 
 
-def test_default_training_model_is_the_moe_in_both_modes(tmp_path):
-    """`set_decoder` defaults to true (E1 + E2) with the MoE's crowded-window stream; the config
-    never names the mode, so a 2D and a 3D root train the same architecture."""
+def _root(tmp, name, modes):
+    """A dataset root whose train sessions declare `modes` (only session.toml is read)."""
+    for i, m in enumerate(modes):
+        d = tmp / name / 'train' / f's{i}'
+        d.mkdir(parents=True)
+        (d / 'session.toml').write_text(f'mode = "{m}"\n')
+    return tmp / name
+
+
+def test_default_training_model_is_box_film(tmp_path):
+    """`set_decoder` defaults to false (report 86/90): the plain box-FiLM model, both modes."""
     cfg = _train_config(tmp_path)
-    assert cfg['model']['set_decoder'] is True
-    assert cfg['data']['hard_frac'] == 0.5
+    assert cfg['model']['set_decoder'] is False
+    assert cfg['model']['box_prompt'] == 'film'
 
 
-@pytest.mark.parametrize('model,data,decoder,hard_frac', [
-    ('set_decoder = false\n', '', False, 'unset'),
-    ('set_decoder = "only"\n', '', 'only', 'unset'),
-    ('set_decoder = "only"\n', 'hard_frac = 0.5\n', 'only', 0.5),
-    ('set_decoder = true\n', 'hard_frac = 0.0\n', True, 0.0),
-    ('', 'hard_frac = 0.25\n', True, 0.25),
+@pytest.mark.parametrize('model,data,modes,want', [
+    ('', 'hard_frac = 0.0\n', ['2d'], 0.0),                 # a written value wins, even 0
+    ('', 'hard_frac = 0.25\n', ['3d'], 0.25),
+    ('set_decoder = true\n', 'hard_frac = 0.0\n', ['2d'], 0.0),
+    ('set_decoder = true\n', '', ['3d'], 0.5),              # the MoE recipe
+    ('set_decoder = "only"\n', '', ['3d'], 0.5),            # PBM4
+    ('', '', ['3d', '3d'], 0.0),                              # plain box-FiLM 3D
+    ('', '', ['2d'], 0.5),                                    # plain box-FiLM 2D
+    ('set_decoder = false\n', '', ['2d'], 0.5),
 ])
-def test_explicit_set_decoder_and_hard_frac_win(tmp_path, model, data, decoder, hard_frac):
-    """An explicit value always wins; `set_decoder = false` is the plain recipe (no hard_frac)."""
-    cfg = _train_config(tmp_path, (f'{data}[model]\n{model}' if model else data))
-    assert cfg['model']['set_decoder'] == decoder
-    assert cfg['data'].get('hard_frac', 'unset') == hard_frac
+def test_default_hard_frac_truth_table(tmp_path, model, data, modes, want):
+    root = _root(tmp_path, 'root', modes)
+    body = f'[data]\n{data}' + (f'[model]\n{model}' if model else '')
+    p = tmp_path / 'run.toml'
+    p.write_text(body)
+    args = SimpleNamespace(config=p, data=root, iters=None, out=str(tmp_path / 'run'))
+    assert tr.load_train_config(args)[0]['data']['hard_frac'] == want
+
+
+def test_default_hard_frac_folder_of_roots(tmp_path, capsys):
+    """A folder of roots takes their mode when they agree; mixed modes take 0.0, one line."""
+    agree = tmp_path / 'agree'
+    _root(agree, 'a', ['2d']), _root(agree, 'b', ['2d', '2d'])
+    cfg = {'model': {'set_decoder': False}, 'data': {'path': str(agree)}}
+    tr.default_hard_frac(cfg)
+    assert cfg['data']['hard_frac'] == 0.5
+    mixed = tmp_path / 'mixed'
+    _root(mixed, 'a', ['2d']), _root(mixed, 'b', ['3d'])
+    cfg = {'model': {'set_decoder': False}, 'data': {'path': str(mixed)}}
+    capsys.readouterr()
+    tr.default_hard_frac(cfg)
+    assert cfg['data']['hard_frac'] == 0.0
+    out = capsys.readouterr().out
+    assert out.count('\n') == 1 and "mix modes ['2d', '3d']" in out
+
+
+def test_set_decoder_hint_names_the_value_that_resumes():
+    """The strict-load refusal of an old run folder names the `set_decoder` it was trained with."""
+    from tailcyclenet.pose.start import set_decoder_hint
+    moe_state = {'host.w': 0, 'set_decoder.inst': 0}
+    plain, moe = SimpleNamespace(set_decoder=None), SimpleNamespace(set_decoder=object())
+    assert 'state `set_decoder = true` to continue it' in set_decoder_hint(moe_state, plain)
+    assert 'state `set_decoder = false` to continue it' in set_decoder_hint({'host.w': 0}, moe)
+    assert set_decoder_hint(moe_state, moe) == set_decoder_hint({'host.w': 0}, plain) == ''
 
 
 def test_load_config_extends_is_deleted_and_raises(tmp_path):

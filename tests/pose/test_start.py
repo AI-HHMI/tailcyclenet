@@ -257,3 +257,15 @@ def test_a_resumed_sampler_continues_its_ordinal_on_a_new_stream():
     a = [i for _, i in StepSampler(1000, 20, sampler_generator(23, 0, 1, 50), start=50)]
     b = [i for _, i in StepSampler(1000, 20, sampler_generator(23, 0, 1, 60), start=60)]
     assert a != b
+
+
+def test_an_old_moe_run_folder_under_the_box_film_default_names_set_decoder_true(tmp_path):
+    """Report 90: base.toml flipped `set_decoder` to false, so resuming a MoE run folder with the
+    default config is refused by the strict load, and the refusal says how to continue it."""
+    run = tmp_path / 'run'
+    path = _trained(run)
+    ck = torch.load(path, weights_only=False)
+    ck['model_state']['set_decoder.inst'] = torch.zeros(8, 4)
+    torch.save(ck, path)
+    with pytest.raises(SystemExit, match=r'does not resume.*state `set_decoder = true` to continue'):
+        start.build_start(start.plan_start(run), _Factory(), _optim_cfg())

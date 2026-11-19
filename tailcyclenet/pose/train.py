@@ -208,21 +208,68 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-MOE_HARD_FRAC = 0.5
-"""The crowded-window share of the v7 MoE recipe (report 79 section 1)."""
+SET_HARD_FRAC = 0.5
+"""The crowded-window share of the set-decoder recipes (v7 MoE, PBM4; report 79 section 1)."""
+PLAIN_HARD_FRAC = {'3d': 0.0, '2d': 0.5}
+"""The plain box-FiLM model's share by dimensionality (report 86/90: 3D hf0 beat hf0.5 on two roots;
+2D 0.5 was the best 2D arm run, a 0 / 0.3 / 0.5 sweep is owed)."""
 
 
-def default_moe_hard_frac(config: dict) -> None:
-    """The MoE recipe's `[data].hard_frac` where the config left it unset.
+def training_modes(path) -> set[str]:
+    """The `mode` values ('2d' / '3d') of the train sessions under `path` (a dataset root or a
+    folder of roots, `format.discovery.load_datasets`' rule), read from each `session.toml`
+    alone -- no tables, no pixels. Empty when nothing is found (the loader refuses later)."""
+    import tomllib
 
-    `[model].set_decoder` defaults to true (`configs/base.toml`), and the MoE trains on a
-    crowded-window stream (`hard_frac = 0.5`, `configs/moe.toml` before it became the default).
-    The default is derived here, not written in base.toml, so `set_decoder = false` is exactly
-    the plain box-FiLM recipe (`hard_frac = 0`) and `"only"` keeps its own config's value. A
-    `hard_frac` the user wrote, including 0, is never touched.
+    from ..format import SPLITS
+
+    path = Path(path)
+    if not path.is_dir():
+        return set()
+    def is_root(p):
+        """Whether `p` holds a train/val/test split (`discovery._is_dataset_root`)."""
+        return any((p / s).is_dir() for s in SPLITS)
+
+    roots = [path] if is_root(path) else sorted(p for p in path.iterdir() if p.is_dir() and is_root(p))
+    modes = set()
+    for root in roots:
+        train = root / 'train'
+        if not train.is_dir():
+            continue
+        for sess in sorted(train.iterdir()):
+            f = sess / 'session.toml'
+            if f.is_file():
+                with open(f, 'rb') as fh:
+                    mode = tomllib.load(fh).get('mode')
+                if mode is not None:
+                    modes.add(str(mode))
+    return modes
+
+
+def default_hard_frac(config: dict) -> None:
+    """`[data].hard_frac` where the config left it unset; a value the user wrote, including 0,
+    is never touched.
+
+    A set-decoder model (`[model].set_decoder` true = the v7 MoE, "only" = PBM4) keeps its
+    recipe's 0.5. The plain box-FiLM model (the default since report 86/90) takes 0.0 on a 3D
+    root and 0.5 on a 2D one, read from the train sessions' `session.toml` `mode`; a folder of
+    roots whose modes disagree (or that cannot be read) takes 0.0, with one printed line.
     """
-    if config['model'].get('set_decoder') is True and 'hard_frac' not in config['data']:
-        config['data']['hard_frac'] = MOE_HARD_FRAC
+    data = config['data']
+    if 'hard_frac' in data:
+        return
+    set_mode = config['model'].get('set_decoder', False)
+    if set_mode is True or set_mode == 'only':
+        data['hard_frac'] = SET_HARD_FRAC
+        return
+    modes = training_modes(data.get('path', ''))
+    if len(modes) == 1 and next(iter(modes)) in PLAIN_HARD_FRAC:
+        data['hard_frac'] = PLAIN_HARD_FRAC[next(iter(modes))]
+        return
+    data['hard_frac'] = 0.0
+    why = f'its train sessions mix modes {sorted(modes)}' if modes else 'no train session mode was readable'
+    print(f'hard_frac: 0.0 for the plain box-FiLM model -- {why} (3D 0.0, 2D 0.5); write '
+          '[data].hard_frac to choose')
 
 
 def load_train_config(args) -> tuple[dict, Path]:
@@ -230,9 +277,9 @@ def load_train_config(args) -> tuple[dict, Path]:
     config = load_config(args.config or BASE_CONFIG)
     check_image_size(config)
     data_cfg, train_cfg = config['data'], config['training']
-    default_moe_hard_frac(config)
     if args.data:
         data_cfg['path'] = str(args.data)
+    default_hard_frac(config)
     if args.iters:
         train_cfg['n_iterations'] = args.iters
     run = Path(args.out or train_cfg['out'])

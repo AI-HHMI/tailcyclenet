@@ -1,6 +1,9 @@
 # The v7 3D set decoder (PBM4, report 76 crowd-detrq / detr3d-multi): E2 ALONE on the host decoder
 # (4 box-anchored queries, known assignment, presence head), trained end to end. Layers over
 # configs/base.toml. Deploy: --anchor none (the only allowed value), --box-prompt detector.
+# PBM4. Use on crowded 3D roots like social-dannce (report 86: -2.25 mm* held-out contact vs
+# box-FiLM); on 3dpop it is +1.28 mm* (MPJPE) worse. Deploy `--anchor none` only (infer refuses
+# carry for it, by design).
 
 [data]
 hard_frac = 0.5
